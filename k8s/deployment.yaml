@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mautic-unsubscribe-proxy
+  namespace: simplify-web
+  labels:
+    app.kubernetes.io/name: mautic-unsubscribe-proxy
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mautic-unsubscribe-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mautic-unsubscribe-proxy
+    spec:
+      imagePullSecrets:
+        - name: harbor-re-cloud
+      containers:
+        - name: mautic-unsubscribe-proxy
+          image: crepo.re-cloud.io/re-cloud/mautic-unsubscribe-proxy:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: mautic-unsubscribe-credentials
+          resources:
+            requests:
+              memory: "48Mi"
+              cpu: "25m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
