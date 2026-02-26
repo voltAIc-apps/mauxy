@@ -3,3 +3,4 @@ uvicorn[standard]>=0.34,<1.0
 httpx>=0.28,<1.0
 pydantic[email]>=2.10,<3.0
 slowapi>=0.1.9,<1.0
+aiosqlite>=0.20,<1.0

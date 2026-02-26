@@ -22,6 +22,10 @@ spec:
     spec:
       imagePullSecrets:
         - name: harbor-re-cloud
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mautic-unsubscribe-data
       containers:
         - name: mautic-unsubscribe-proxy
           image: crepo.re-cloud.io/re-cloud/mautic-unsubscribe-proxy:latest
@@ -32,6 +36,9 @@ spec:
           envFrom:
             - secretRef:
                 name: mautic-unsubscribe-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /data
           resources:
             requests:
               memory: "48Mi"
@@ -45,9 +52,12 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 3
             periodSeconds: 5
+            timeoutSeconds: 8

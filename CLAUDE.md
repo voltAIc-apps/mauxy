@@ -35,9 +35,15 @@ Public endpoint: `https://unsubscribe.engage.wapsol.de`
 
 All application logic is in `main.py` (single-file service):
 
-- **POST /api/unsubscribe** — accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Rate-limited via `slowapi` (default 5/min per IP).
-- **GET /health** — k8s liveness/readiness probe.
+- **POST /api/unsubscribe** — accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
+- **GET /api/actions** — admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Supports `email`, `result`, `limit`, `offset` query params. Disabled (403) if `ADMIN_API_KEY` is unset.
+- **GET /health** — k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
+- **GET /health/detail** — richer health endpoint showing degraded/ok status, Mautic detail, and cache age. Always returns HTTP 200.
 - CORS is restricted to `ALLOWED_ORIGINS` (defaults to simplify-erp.de).
+
+### Persistent storage
+
+Action log uses SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/data/actions.db`). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mautic-unsubscribe-data`). Apply `k8s/pvc.yaml` before the deployment.
 
 ## Environment Variables
 
@@ -48,3 +54,5 @@ All application logic is in `main.py` (single-file service):
 | `MAUTIC_PASSWORD` | Mautic API basic auth password |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
 | `RATE_LIMIT` | slowapi rate limit string (e.g. `5/minute`) |
+| `ACTION_LOG_DB` | SQLite database path (default `/data/actions.db`) |
+| `ADMIN_API_KEY` | Bearer token for `/api/actions` (disabled if unset) |
