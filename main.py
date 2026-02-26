@@ -66,42 +66,72 @@ async def unsubscribe(payload: UnsubscribeRequest, request: Request):
     """
     email = payload.email.lower()
     auth = (MAUTIC_USERNAME, MAUTIC_PASSWORD)
+    logger.info("UNSUBSCRIBE_START email=%s", email)
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            # Find contact by email
+            # Find contact by exact email match
             search_url = f"{MAUTIC_BASE_URL}/api/contacts"
             resp = await client.get(
                 search_url,
-                params={"search": f"email:{email}"},
+                params={
+                    "where[0][col]": "email",
+                    "where[0][expr]": "eq",
+                    "where[0][val]": email,
+                },
                 auth=auth,
             )
 
             if resp.status_code != 200:
-                logger.warning("Mautic search failed: %s %s", resp.status_code, resp.text[:200])
+                logger.warning("UNSUBSCRIBE_SEARCH_FAILED email=%s status=%s", email, resp.status_code)
                 return JSONResponse({"status": "ok"})
 
             contacts = resp.json().get("contacts", {})
             if not contacts:
-                logger.info("No Mautic contact found for %s", email)
+                logger.warning("UNSUBSCRIBE_NO_CONTACT email=%s", email)
                 return JSONResponse({"status": "ok"})
 
-            # Add first matching contact to DNC
-            contact_id = next(iter(contacts))
-            dnc_url = f"{MAUTIC_BASE_URL}/api/contacts/{contact_id}/dnc/email/add"
-            dnc_resp = await client.post(
-                dnc_url,
-                json={"reason": 3, "comments": "Unsubscribed via website"},
-                auth=auth,
-            )
+            # Defense in depth: verify exact email match among results
+            contact_id = None
+            for cid, cdata in contacts.items():
+                fields = cdata.get("fields", {}).get("core", {})
+                contact_email = (fields.get("email", {}).get("value") or "").lower()
+                if contact_email == email:
+                    contact_id = cid
+                    break
 
-            if dnc_resp.status_code in (200, 201):
-                logger.info("Contact %s added to DNC", contact_id)
-            else:
-                logger.warning("DNC add failed: %s %s", dnc_resp.status_code, dnc_resp.text[:200])
+            if contact_id is None:
+                candidates = list(contacts.keys())
+                logger.warning("UNSUBSCRIBE_NO_EXACT_MATCH email=%s candidates=%s", email, candidates)
+                return JSONResponse({"status": "ok"})
+
+            logger.info("UNSUBSCRIBE_CONTACT_FOUND email=%s contact_id=%s", email, contact_id)
+
+            # Add contact to DNC with retry (2 attempts)
+            dnc_url = f"{MAUTIC_BASE_URL}/api/contacts/{contact_id}/dnc/email/add"
+            dnc_ok = False
+            for attempt in range(1, 3):
+                dnc_resp = await client.post(
+                    dnc_url,
+                    json={"reason": 1, "comments": "Unsubscribed via website"},
+                    auth=auth,
+                )
+                if dnc_resp.status_code in (200, 201):
+                    logger.info("UNSUBSCRIBE_DNC_OK email=%s contact_id=%s", email, contact_id)
+                    dnc_ok = True
+                    break
+                logger.warning(
+                    "UNSUBSCRIBE_DNC_FAILED email=%s status=%s attempt=%d",
+                    email, dnc_resp.status_code, attempt,
+                )
+
+            if not dnc_ok:
+                logger.error("UNSUBSCRIBE_DNC_FAILED_RETRY_EXHAUSTED email=%s contact_id=%s", email, contact_id)
 
     except httpx.RequestError as exc:
-        logger.error("Mautic request error: %s", exc)
+        logger.error("UNSUBSCRIBE_REQUEST_ERROR email=%s error=%s", email, exc)
+    except Exception as exc:
+        logger.error("UNSUBSCRIBE_UNEXPECTED_ERROR email=%s error=%s", email, exc)
 
     # Always 200 -- no enumeration leak
     return JSONResponse({"status": "ok"})
