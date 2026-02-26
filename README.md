@@ -1,0 +1,174 @@
+# Mautic Unsubscribe Proxy
+
+Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from your website frontend and adds contacts to Mautic's Do-Not-Contact (DNC) list — without exposing any Mautic credentials to the browser.
+
+**Public endpoint:** `https://unsubscribe.engage.wapsol.de`
+
+**Key design property:** Every request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error. This prevents email enumeration attacks.
+
+---
+
+## For Developers — Integrating the Unsubscribe Endpoint
+
+### Endpoint
+
+```
+POST https://unsubscribe.engage.wapsol.de/api/unsubscribe
+Content-Type: application/json
+```
+
+### Request / Response
+
+Send a JSON body with the email address. The response is always the same:
+
+```json
+// Request
+{"email": "user@example.com"}
+
+// Response (always 200)
+{"status": "ok"}
+```
+
+### JavaScript Example
+
+Drop this into your unsubscribe page or form handler:
+
+```javascript
+async function unsubscribe(email) {
+  try {
+    const resp = await fetch(
+      "https://unsubscribe.engage.wapsol.de/api/unsubscribe",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      }
+    );
+
+    if (resp.status === 429) {
+      // Rate limit hit — ask the user to try again later
+      return { success: false, reason: "rate_limited" };
+    }
+
+    return { success: true };
+  } catch (err) {
+    // Network error — the proxy is unreachable
+    return { success: false, reason: "network_error" };
+  }
+}
+```
+
+### CORS
+
+Requests are only accepted from whitelisted origins. Currently allowed:
+
+- `https://simplify-erp.de`
+- `https://www.simplify-erp.de`
+
+To add a new origin (e.g. `https://re-cloud.io`), update the `ALLOWED_ORIGINS` environment variable in the Kubernetes secret and restart the deployment.
+
+### Rate Limiting
+
+The endpoint is rate-limited to **5 requests per minute per IP address**. When exceeded, the proxy returns HTTP `429 Too Many Requests`. Your frontend should handle this gracefully (e.g. show "Please try again in a minute").
+
+### Error Handling
+
+You only need to handle two failure cases in your frontend:
+
+| Scenario | What you see | What to do |
+|---|---|---|
+| **Network failure** | `fetch` throws | Show a generic error message |
+| **Rate limit exceeded** | HTTP 429 | Ask the user to wait and retry |
+
+All other outcomes (email found, not found, Mautic errors) are intentionally masked as `200 {"status": "ok"}`. Do not try to infer the result from the response.
+
+---
+
+## For Marketers — Action Log
+
+Every unsubscribe attempt is logged with a timestamp, the email address, the originating IP, and the outcome. You can query this log to audit compliance or debug issues.
+
+### Querying the Action Log
+
+The action log is available at `GET /api/actions` and requires a bearer token:
+
+```bash
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  "https://unsubscribe.engage.wapsol.de/api/actions"
+```
+
+Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment variable. If the key is not set, the endpoint returns `403 Forbidden`.
+
+### Query Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `email` | string | Filter by email address |
+| `result` | string | Filter by outcome: `ok`, `not_found`, or `error` |
+| `limit` | int | Number of records to return (1–500, default 50) |
+| `offset` | int | Skip this many records (for pagination) |
+
+### Example Queries
+
+**All recent actions (last 50):**
+
+```bash
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  "https://unsubscribe.engage.wapsol.de/api/actions"
+```
+
+**Actions for a specific email:**
+
+```bash
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  "https://unsubscribe.engage.wapsol.de/api/actions?email=user@example.com"
+```
+
+**Only successful unsubscribes:**
+
+```bash
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  "https://unsubscribe.engage.wapsol.de/api/actions?result=ok"
+```
+
+**Page 2 of results (records 51–100):**
+
+```bash
+curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  "https://unsubscribe.engage.wapsol.de/api/actions?limit=50&offset=50"
+```
+
+### Understanding Results
+
+| Result | Meaning |
+|---|---|
+| `ok` | Contact was found in Mautic and added to the Do-Not-Contact list. They will no longer receive marketing emails. |
+| `not_found` | No contact with that email exists in Mautic. Nothing was changed. This is normal for typos or people who were never subscribed. |
+| `error` | Something went wrong when talking to Mautic (e.g. timeout, API error). The `error_detail` field in the log entry has more information. |
+
+---
+
+## Health & Monitoring
+
+Two health endpoints are available. Both always return HTTP 200.
+
+| Endpoint | Purpose | Example response |
+|---|---|---|
+| `GET /health` | Kubernetes liveness/readiness probe. Also useful for a quick manual check. | `{"status": "ok", "mautic": "reachable"}` |
+| `GET /health/detail` | Richer status with `ok` / `degraded` indicator and cache age. | `{"status": "ok", "mautic": "reachable", "cache_age_seconds": 12.3}` |
+
+If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests will still return `{"status": "ok"}` to the user but will be logged as `error`.
+
+---
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `MAUTIC_BASE_URL` | Mautic instance URL | `https://engage.wapsol.de` |
+| `MAUTIC_USERNAME` | Mautic API basic-auth user | *(required)* |
+| `MAUTIC_PASSWORD` | Mautic API basic-auth password | *(required)* |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins | `https://simplify-erp.de,https://www.simplify-erp.de` |
+| `RATE_LIMIT` | slowapi rate-limit string | `5/minute` |
+| `ACTION_LOG_DB` | SQLite database path | `/data/actions.db` |
+| `ADMIN_API_KEY` | Bearer token for `/api/actions` | *(disabled if unset)* |
