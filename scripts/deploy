@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="crepo.re-cloud.io"
+IMAGE="${REPO}/re-cloud/mautic-unsubscribe-proxy:latest"
+NAMESPACE="simplify-web"
+SECRET_NAME="mautic-unsubscribe-credentials"
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+step() { echo -e "\n${GREEN}==>${NC} $1"; }
+warn() { echo -e "${YELLOW}WARNING:${NC} $1"; }
+die()  { echo -e "${RED}ERROR:${NC} $1" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# ── 1. Load .env ──────────────────────────────────────────────
+step "Loading .env"
+ENV_FILE="${PROJECT_DIR}/.env"
+[[ -f "$ENV_FILE" ]] || die ".env file not found at ${ENV_FILE}"
+set -a
+source "$ENV_FILE"
+set +a
+echo "  Loaded ${ENV_FILE}"
+
+# ── 2. Validate required vars ────────────────────────────────
+step "Validating environment"
+REQUIRED_VARS=(MAUTIC_USERNAME MAUTIC_PASSWORD)
+for var in "${REQUIRED_VARS[@]}"; do
+  [[ -n "${!var:-}" ]] || die "Required variable ${var} is not set in .env"
+done
+echo "  All required variables present"
+
+# Default ACTION_LOG_DB for k8s if not set
+export ACTION_LOG_DB="${ACTION_LOG_DB:-/data/actions.db}"
+
+# ── 3. Docker login ──────────────────────────────────────────
+step "Logging in to container registry"
+echo "bskSkOPLF4ziny5" | docker login "$REPO" -u cc --password-stdin
+echo "  Authenticated to ${REPO}"
+
+# ── 4. Build ──────────────────────────────────────────────────
+step "Building container image"
+docker build -t "$IMAGE" "$PROJECT_DIR"
+
+# ── 5. Push ───────────────────────────────────────────────────
+step "Pushing image"
+docker push "$IMAGE"
+
+# ── 6. Sync k8s secret ───────────────────────────────────────
+step "Syncing k8s secret (${SECRET_NAME})"
+kubectl create secret generic "$SECRET_NAME" \
+  --namespace="$NAMESPACE" \
+  --from-literal=MAUTIC_BASE_URL="${MAUTIC_BASE_URL:-https://engage.wapsol.de}" \
+  --from-literal=MAUTIC_USERNAME="$MAUTIC_USERNAME" \
+  --from-literal=MAUTIC_PASSWORD="$MAUTIC_PASSWORD" \
+  --from-literal=ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-https://simplify-erp.de,https://www.simplify-erp.de}" \
+  --from-literal=RATE_LIMIT="${RATE_LIMIT:-5/minute}" \
+  --from-literal=ACTION_LOG_DB="$ACTION_LOG_DB" \
+  --from-literal=ADMIN_API_KEY="${ADMIN_API_KEY:-}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "  Secret synced in namespace ${NAMESPACE}"
+
+# ── 7. Apply k8s manifests ────────────────────────────────────
+step "Applying k8s manifests"
+kubectl apply -f "${PROJECT_DIR}/k8s/"
+
+# ── 8. Rollout restart ───────────────────────────────────────
+step "Restarting deployment"
+kubectl rollout restart deployment/mautic-unsubscribe-proxy -n "$NAMESPACE"
+
+# ── 9. Wait & verify ─────────────────────────────────────────
+step "Waiting for rollout to complete"
+kubectl rollout status deployment/mautic-unsubscribe-proxy -n "$NAMESPACE" --timeout=120s
+
+echo -e "\n${GREEN}Deploy complete!${NC}"
