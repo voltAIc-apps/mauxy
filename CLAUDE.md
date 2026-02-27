@@ -20,26 +20,29 @@ No tests or linter are configured in this repo.
 
 ## Build & Deploy
 
-Container image: `crepo.re-cloud.io/re-cloud/mautic-unsubscribe-proxy`
-
 ```bash
-docker build -t crepo.re-cloud.io/re-cloud/mautic-unsubscribe-proxy:latest .
-docker push crepo.re-cloud.io/re-cloud/mautic-unsubscribe-proxy:latest
+docker build -t <your-registry>/mautic-unsubscribe-proxy:latest .
+docker push <your-registry>/mautic-unsubscribe-proxy:latest
 ```
 
-Deployed to Kubernetes namespace `simplify-web` with manifests in `k8s/`. The deployment pulls the image using `harbor-re-cloud` pull secret. Credentials are stored in a k8s Secret (`mautic-unsubscribe-credentials`), not committed — create via `kubectl create secret generic` (see `k8s/secret.yaml` for the template).
+Deployed to Kubernetes with manifests in `k8s/`. The manifests contain `${VAR}` placeholders -- use `scripts/deploy.py` to render them from `.env` values:
 
-Public endpoint: `https://unsubscribe.engage.wapsol.de`
+```bash
+python scripts/deploy.py --dry-run   # preview
+python scripts/deploy.py --apply     # render + kubectl apply
+```
+
+Credentials are stored in a k8s Secret (`mautic-unsubscribe-credentials`), not committed -- create via `kubectl create secret generic` (see `k8s/secret.yaml` for the template).
 
 ## Architecture
 
 All application logic is in `main.py` (single-file service):
 
-- **POST /api/unsubscribe** — accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Returns 503 when Mautic is unreachable (search phase); contact-specific outcomes always return 200. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
-- **GET /api/actions** — admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Supports `email`, `result`, `limit`, `offset` query params. Disabled (403) if `ADMIN_API_KEY` is unset.
-- **GET /health** — k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
-- **GET /health/detail** — richer health endpoint showing degraded/ok status, Mautic detail, and cache age. Always returns HTTP 200.
-- CORS is restricted to `ALLOWED_ORIGINS` (defaults to simplify-erp.de).
+- **POST /api/unsubscribe** -- accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Returns 503 when Mautic is unreachable (search phase); contact-specific outcomes always return 200. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
+- **GET /api/actions** -- admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Supports `email`, `result`, `limit`, `offset` query params. Disabled (403) if `ADMIN_API_KEY` is unset.
+- **GET /health** -- k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
+- **GET /health/detail** -- richer health endpoint showing degraded/ok status, Mautic detail, and cache age. Always returns HTTP 200.
+- CORS is restricted to `ALLOWED_ORIGINS` (must be set via env).
 
 ### Persistent storage
 

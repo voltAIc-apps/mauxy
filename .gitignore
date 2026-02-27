@@ -1,3 +1,4 @@
 .env
 *.db
 __pycache__/
+k8s/rendered/

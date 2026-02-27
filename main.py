@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # -- Config from env --------------------------------------------------------
-MAUTIC_BASE_URL = os.environ.get("MAUTIC_BASE_URL", "https://engage.wapsol.de")
+MAUTIC_BASE_URL = os.environ.get("MAUTIC_BASE_URL", "")
 MAUTIC_USERNAME = os.environ.get("MAUTIC_USERNAME", "")
 MAUTIC_PASSWORD = os.environ.get("MAUTIC_PASSWORD", "")
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "5/minute")
@@ -34,9 +34,15 @@ ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 # CORS origins (comma-separated)
 _raw_origins = os.environ.get(
     "ALLOWED_ORIGINS",
-    "https://simplify-erp.de,https://www.simplify-erp.de",
+    "",
 )
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+# -- Startup validation -------------------------------------------------------
+if not MAUTIC_BASE_URL:
+    logger.warning("MAUTIC_BASE_URL is not set -- all unsubscribe requests will fail")
+if not ALLOWED_ORIGINS:
+    logger.warning("ALLOWED_ORIGINS is not set -- CORS will block all browser requests")
 
 # -- Mautic health check cache -----------------------------------------------
 _mautic_health = {"ok": True, "checked_at": 0.0, "detail": "pending"}

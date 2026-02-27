@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mautic-unsubscribe-proxy
-  namespace: simplify-web
+  namespace: ${DEPLOY_NAMESPACE}
   labels:
     app.kubernetes.io/name: mautic-unsubscribe-proxy
 spec:
@@ -21,14 +21,14 @@ spec:
         app.kubernetes.io/name: mautic-unsubscribe-proxy
     spec:
       imagePullSecrets:
-        - name: harbor-re-cloud
+        - name: ${DEPLOY_IMAGE_PULL_SECRET}
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: mautic-unsubscribe-data
       containers:
         - name: mautic-unsubscribe-proxy
-          image: crepo.re-cloud.io/re-cloud/mautic-unsubscribe-proxy:latest
+          image: ${DEPLOY_IMAGE}
           imagePullPolicy: Always
           ports:
             - name: http

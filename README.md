@@ -1,19 +1,17 @@
 # Mautic Unsubscribe Proxy
 
-Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from your website frontend and adds contacts to Mautic's Do-Not-Contact (DNC) list — without exposing any Mautic credentials to the browser.
-
-**Public endpoint:** `https://unsubscribe.engage.wapsol.de`
+Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from your website frontend and adds contacts to Mautic's Do-Not-Contact (DNC) list -- without exposing any Mautic credentials to the browser.
 
 **Key design property:** Every request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error -- this prevents email enumeration attacks. Returns `503` when Mautic is unreachable so the frontend can prompt the user to retry.
 
 ---
 
-## For Developers — Integrating the Unsubscribe Endpoint
+## For Developers -- Integrating the Unsubscribe Endpoint
 
 ### Endpoint
 
 ```
-POST https://unsubscribe.engage.wapsol.de/api/unsubscribe
+POST https://unsubscribe.example.com/api/unsubscribe
 Content-Type: application/json
 ```
 
@@ -37,7 +35,7 @@ Drop this into your unsubscribe page or form handler:
 async function unsubscribe(email) {
   try {
     const resp = await fetch(
-      "https://unsubscribe.engage.wapsol.de/api/unsubscribe",
+      "https://unsubscribe.example.com/api/unsubscribe",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -59,7 +57,7 @@ async function unsubscribe(email) {
 
     return { success: true };
   } catch (err) {
-    // Network error — the proxy is unreachable
+    // Network error -- the proxy is unreachable
     return { success: false, reason: "network_error" };
   }
 }
@@ -67,12 +65,7 @@ async function unsubscribe(email) {
 
 ### CORS
 
-Requests are only accepted from whitelisted origins. Currently allowed:
-
-- `https://simplify-erp.de`
-- `https://www.simplify-erp.de`
-
-To add a new origin (e.g. `https://re-cloud.io`), update the `ALLOWED_ORIGINS` environment variable in the Kubernetes secret and restart the deployment.
+Requests are only accepted from whitelisted origins configured via the `ALLOWED_ORIGINS` environment variable. Update this variable and restart the deployment to add new origins.
 
 ### Rate Limiting
 
@@ -93,7 +86,7 @@ All other outcomes (email found, not found, Mautic errors) are intentionally mas
 
 ---
 
-## For Marketers — Action Log
+## For Marketers -- Action Log
 
 Every unsubscribe attempt is logged with a timestamp, the email address, the originating IP, and the outcome. You can query this log to audit compliance or debug issues.
 
@@ -103,7 +96,7 @@ The action log is available at `GET /api/actions` and requires a bearer token:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.engage.wapsol.de/api/actions"
+  "https://unsubscribe.example.com/api/actions"
 ```
 
 Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment variable. If the key is not set, the endpoint returns `403 Forbidden`.
@@ -114,7 +107,7 @@ Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment var
 |---|---|---|
 | `email` | string | Filter by email address |
 | `result` | string | Filter by outcome: `ok`, `not_found`, or `error` |
-| `limit` | int | Number of records to return (1–500, default 50) |
+| `limit` | int | Number of records to return (1-500, default 50) |
 | `offset` | int | Skip this many records (for pagination) |
 
 ### Example Queries
@@ -123,28 +116,28 @@ Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment var
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.engage.wapsol.de/api/actions"
+  "https://unsubscribe.example.com/api/actions"
 ```
 
 **Actions for a specific email:**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.engage.wapsol.de/api/actions?email=user@example.com"
+  "https://unsubscribe.example.com/api/actions?email=user@example.com"
 ```
 
 **Only successful unsubscribes:**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.engage.wapsol.de/api/actions?result=ok"
+  "https://unsubscribe.example.com/api/actions?result=ok"
 ```
 
-**Page 2 of results (records 51–100):**
+**Page 2 of results (records 51-100):**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.engage.wapsol.de/api/actions?limit=50&offset=50"
+  "https://unsubscribe.example.com/api/actions?limit=50&offset=50"
 ```
 
 ### Understanding Results
@@ -170,14 +163,70 @@ If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests w
 
 ---
 
+## Development
+
+```bash
+pip install -r requirements.txt
+
+# Set env vars (see .env.example), then:
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+---
+
+## Deployment
+
+### Build
+
+```bash
+docker build -t your-registry/mautic-unsubscribe-proxy:latest .
+docker push your-registry/mautic-unsubscribe-proxy:latest
+```
+
+### Configure
+
+Copy `.env.example` to `.env` and fill in all values, including the `DEPLOY_*` variables for k8s manifests.
+
+### Render & Apply k8s Manifests
+
+The k8s manifests in `k8s/` contain `${VAR}` placeholders. Use `scripts/deploy.py` to render them:
+
+```bash
+# Preview rendered manifests
+python scripts/deploy.py --dry-run
+
+# Render to k8s/rendered/
+python scripts/deploy.py
+
+# Render and apply in one step
+python scripts/deploy.py --apply
+```
+
+Create the credentials secret separately (values are not in .env):
+
+```bash
+kubectl create secret generic mautic-unsubscribe-credentials \
+  --from-literal=MAUTIC_BASE_URL=https://mautic.example.com \
+  --from-literal=MAUTIC_USERNAME=<user> \
+  --from-literal=MAUTIC_PASSWORD=<pass> \
+  --from-literal=ADMIN_API_KEY=<key> \
+  -n <your-namespace>
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `MAUTIC_BASE_URL` | Mautic instance URL | `https://engage.wapsol.de` |
+| `MAUTIC_BASE_URL` | Mautic instance URL | *(required)* |
 | `MAUTIC_USERNAME` | Mautic API basic-auth user | *(required)* |
 | `MAUTIC_PASSWORD` | Mautic API basic-auth password | *(required)* |
-| `ALLOWED_ORIGINS` | Comma-separated CORS origins | `https://simplify-erp.de,https://www.simplify-erp.de` |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins | *(required)* |
 | `RATE_LIMIT` | slowapi rate-limit string | `5/minute` |
 | `ACTION_LOG_DB` | SQLite database path | `/data/actions.db` |
 | `ADMIN_API_KEY` | Bearer token for `/api/actions` | *(disabled if unset)* |
+
+## License
+
+MIT -- see [LICENSE](LICENSE).

@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mautic-unsubscribe-proxy
-  namespace: simplify-web
+  namespace: ${DEPLOY_NAMESPACE}
   labels:
     app.kubernetes.io/name: mautic-unsubscribe-proxy
 spec:

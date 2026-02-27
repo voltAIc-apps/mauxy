@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: mautic-unsubscribe-proxy-ingress
-  namespace: simplify-web
+  namespace: ${DEPLOY_NAMESPACE}
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     kubernetes.io/tls-acme: "true"
@@ -13,10 +13,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - unsubscribe.engage.wapsol.de
+        - ${DEPLOY_DOMAIN}
       secretName: mautic-unsubscribe-proxy-tls
   rules:
-    - host: unsubscribe.engage.wapsol.de
+    - host: ${DEPLOY_DOMAIN}
       http:
         paths:
           - path: /

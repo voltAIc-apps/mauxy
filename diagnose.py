@@ -386,7 +386,7 @@ def main():
     parser.add_argument("--password", default=None, help="Mautic API password (default: env MAUTIC_PASSWORD)")
     args = parser.parse_args()
 
-    base_url = (args.base_url or os.environ.get("MAUTIC_BASE_URL", "https://engage.wapsol.de")).rstrip("/")
+    base_url = (args.base_url or os.environ.get("MAUTIC_BASE_URL", "")).rstrip("/")
     username = args.username or os.environ.get("MAUTIC_USERNAME", "")
     password = args.password or os.environ.get("MAUTIC_PASSWORD", "")
 
