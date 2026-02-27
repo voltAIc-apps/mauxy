@@ -1,12 +1,14 @@
 # Mauxy
 
-Centralized newsletter subscription + unsubscribe proxy for Mautic. Accepts subscribe/unsubscribe requests from multiple website frontends and manages contacts, segments, and DNC lists -- without exposing any Mautic credentials to the browser.
+Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from website frontends and adds contacts to the Do-Not-Contact (DNC) list -- without exposing Mautic credentials to the browser.
 
-**Key design property:** Every request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error -- this prevents email enumeration attacks. Returns `503` when Mautic is unreachable so the frontend can prompt the user to retry.
+**Key design property:** Every contact-specific request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error -- this prevents email enumeration attacks. Returns `503` when Mautic is unreachable so the frontend can prompt the user to retry.
 
 ---
 
 ## For Developers -- Integrating the Unsubscribe Endpoint
+
+See [API Reference](API.md) for full endpoint documentation.
 
 ### Endpoint
 
@@ -65,15 +67,13 @@ async function unsubscribe(email) {
 
 ### CORS
 
-Requests are only accepted from whitelisted origins configured via the `ALLOWED_ORIGINS` environment variable. Update this variable and restart the deployment to add new origins.
+Requests are restricted to whitelisted origins. If your domain is not yet allowed, contact the service operator to add it.
 
 ### Rate Limiting
 
 The endpoint is rate-limited to **5 requests per minute per IP address**. When exceeded, the proxy returns HTTP `429 Too Many Requests`. Your frontend should handle this gracefully (e.g. show "Please try again in a minute").
 
 ### Error Handling
-
-You only need to handle two failure cases in your frontend:
 
 | Scenario | What you see | What to do |
 |---|---|---|
@@ -83,6 +83,87 @@ You only need to handle two failure cases in your frontend:
 | **Network failure** | `fetch` throws | Show a generic error message |
 
 All other outcomes (email found, not found, Mautic errors) are intentionally masked as `200 {"status": "ok"}`. Do not try to infer the result from the response.
+
+#### 422 Response Body
+
+FastAPI returns a structured validation error on `422`:
+
+```json
+{"detail": [{"loc": ["body", "email"], "msg": "value is not a valid email address", "type": "value_error"}]}
+```
+
+---
+
+## For Operators -- Deployment & Configuration
+
+### Development
+
+```bash
+pip install -r requirements.txt
+
+# Set env vars (see .env.example), then:
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Build
+
+```bash
+docker build -t your-registry/mauxy:latest .
+docker push your-registry/mauxy:latest
+```
+
+### Configure
+
+Copy `.env.example` to `.env` and fill in all values, including the `DEPLOY_*` variables for k8s manifests.
+
+### Render & Apply k8s Manifests
+
+The k8s manifests in `k8s/` contain `${VAR}` placeholders. Use `scripts/deploy.py` to render them:
+
+```bash
+# Preview rendered manifests
+python scripts/deploy.py --dry-run
+
+# Render to k8s/rendered/
+python scripts/deploy.py
+
+# Render and apply in one step
+python scripts/deploy.py --apply
+```
+
+Create the credentials secret separately (values are not in .env):
+
+```bash
+kubectl create secret generic mauxy-credentials \
+  --from-literal=MAUTIC_BASE_URL=https://mautic.example.com \
+  --from-literal=MAUTIC_USERNAME=<user> \
+  --from-literal=MAUTIC_PASSWORD=<pass> \
+  --from-literal=ADMIN_API_KEY=<key> \
+  -n <your-namespace>
+```
+
+### Environment Variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `MAUTIC_BASE_URL` | Mautic instance URL | *(required)* |
+| `MAUTIC_USERNAME` | Mautic API basic-auth user | *(required)* |
+| `MAUTIC_PASSWORD` | Mautic API basic-auth password | *(required)* |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins | *(required)* |
+| `RATE_LIMIT` | slowapi rate-limit string | `5/minute` |
+| `ACTION_LOG_DB` | SQLite database path | `/data/actions.db` |
+| `ADMIN_API_KEY` | Bearer token for `/api/actions` | *(disabled if unset)* |
+
+### Health & Monitoring
+
+Two health endpoints are available. Both always return HTTP 200.
+
+| Endpoint | Purpose | Example response |
+|---|---|---|
+| `GET /health` | Kubernetes liveness/readiness probe. Also useful for a quick manual check. | `{"status": "ok", "mautic": "reachable"}` |
+| `GET /health/detail` | Richer status with `ok` / `degraded` indicator and cache age. | `{"status": "ok", "mautic": "reachable", "cache_age_seconds": 12.3}` |
+
+If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests will return `503 {"status": "service_unavailable"}` and the attempt is logged as `mautic_unreachable`.
 
 ---
 
@@ -150,82 +231,16 @@ curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
 
 ---
 
-## Health & Monitoring
+## Roadmap
 
-Two health endpoints are available. Both always return HTTP 200.
+Planned features (see [issue #8](https://github.com/voltAIc-apps/mauxy/issues/8)):
 
-| Endpoint | Purpose | Example response |
-|---|---|---|
-| `GET /health` | Kubernetes liveness/readiness probe. Also useful for a quick manual check. | `{"status": "ok", "mautic": "reachable"}` |
-| `GET /health/detail` | Richer status with `ok` / `degraded` indicator and cache age. | `{"status": "ok", "mautic": "reachable", "cache_age_seconds": 12.3}` |
-
-If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests will return `503 {"status": "service_unavailable"}` and the attempt is logged as `mautic_unreachable`.
+- `POST /api/subscribe` -- newsletter subscription with multi-site support
+- GDPR double opt-in via confirmation emails
+- Per-site segment mapping via `sites.yaml`
+- Per-site unsubscribe (segment removal instead of global DNC)
 
 ---
-
-## Development
-
-```bash
-pip install -r requirements.txt
-
-# Set env vars (see .env.example), then:
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
----
-
-## Deployment
-
-### Build
-
-```bash
-docker build -t your-registry/mauxy:latest .
-docker push your-registry/mauxy:latest
-```
-
-### Configure
-
-Copy `.env.example` to `.env` and fill in all values, including the `DEPLOY_*` variables for k8s manifests.
-
-### Render & Apply k8s Manifests
-
-The k8s manifests in `k8s/` contain `${VAR}` placeholders. Use `scripts/deploy.py` to render them:
-
-```bash
-# Preview rendered manifests
-python scripts/deploy.py --dry-run
-
-# Render to k8s/rendered/
-python scripts/deploy.py
-
-# Render and apply in one step
-python scripts/deploy.py --apply
-```
-
-Create the credentials secret separately (values are not in .env):
-
-```bash
-kubectl create secret generic mauxy-credentials \
-  --from-literal=MAUTIC_BASE_URL=https://mautic.example.com \
-  --from-literal=MAUTIC_USERNAME=<user> \
-  --from-literal=MAUTIC_PASSWORD=<pass> \
-  --from-literal=ADMIN_API_KEY=<key> \
-  -n <your-namespace>
-```
-
----
-
-## Environment Variables
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `MAUTIC_BASE_URL` | Mautic instance URL | *(required)* |
-| `MAUTIC_USERNAME` | Mautic API basic-auth user | *(required)* |
-| `MAUTIC_PASSWORD` | Mautic API basic-auth password | *(required)* |
-| `ALLOWED_ORIGINS` | Comma-separated CORS origins | *(required)* |
-| `RATE_LIMIT` | slowapi rate-limit string | `5/minute` |
-| `ACTION_LOG_DB` | SQLite database path | `/data/actions.db` |
-| `ADMIN_API_KEY` | Bearer token for `/api/actions` | *(disabled if unset)* |
 
 ## License
 
