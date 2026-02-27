@@ -1,7 +1,7 @@
 """
-Mautic DNC (Do Not Contact) proxy microservice.
-Accepts unsubscribe requests from the SPA frontend and adds contacts
-to Mautic's DNC list via Basic Auth -- credentials never exposed to browser.
+mauxy -- centralized newsletter subscription + unsubscribe proxy for Mautic.
+Manages contacts, segments, and DNC lists via Basic Auth -- credentials never
+exposed to browser.
 """
 import os
 import time

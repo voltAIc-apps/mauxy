@@ -1,6 +1,6 @@
 # Mauxy
 
-Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from your website frontend and adds contacts to Mautic's Do-Not-Contact (DNC) list -- without exposing any Mautic credentials to the browser.
+Centralized newsletter subscription + unsubscribe proxy for Mautic. Accepts subscribe/unsubscribe requests from multiple website frontends and manages contacts, segments, and DNC lists -- without exposing any Mautic credentials to the browser.
 
 **Key design property:** Every request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error -- this prevents email enumeration attacks. Returns `503` when Mautic is unreachable so the frontend can prompt the user to retry.
 
@@ -11,7 +11,7 @@ Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests fr
 ### Endpoint
 
 ```
-POST https://unsubscribe.example.com/api/unsubscribe
+POST https://newsletter.example.com/api/unsubscribe
 Content-Type: application/json
 ```
 
@@ -35,7 +35,7 @@ Drop this into your unsubscribe page or form handler:
 async function unsubscribe(email) {
   try {
     const resp = await fetch(
-      "https://unsubscribe.example.com/api/unsubscribe",
+      "https://newsletter.example.com/api/unsubscribe",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -96,7 +96,7 @@ The action log is available at `GET /api/actions` and requires a bearer token:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.example.com/api/actions"
+  "https://newsletter.example.com/api/actions"
 ```
 
 Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment variable. If the key is not set, the endpoint returns `403 Forbidden`.
@@ -116,28 +116,28 @@ Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment var
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.example.com/api/actions"
+  "https://newsletter.example.com/api/actions"
 ```
 
 **Actions for a specific email:**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.example.com/api/actions?email=user@example.com"
+  "https://newsletter.example.com/api/actions?email=user@example.com"
 ```
 
 **Only successful unsubscribes:**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.example.com/api/actions?result=ok"
+  "https://newsletter.example.com/api/actions?result=ok"
 ```
 
 **Page 2 of results (records 51-100):**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://unsubscribe.example.com/api/actions?limit=50&offset=50"
+  "https://newsletter.example.com/api/actions?limit=50&offset=50"
 ```
 
 ### Understanding Results

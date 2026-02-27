@@ -1,6 +1,6 @@
 # API Reference
 
-Base URL: `https://unsubscribe.example.com` (set via `DEPLOY_DOMAIN`)
+Base URL: `https://newsletter.example.com` (set via `DEPLOY_DOMAIN`)
 
 ---
 
@@ -50,7 +50,7 @@ Returned when the proxy cannot reach the Mautic API (connection error or non-200
 **curl**
 
 ```bash
-curl -X POST https://unsubscribe.example.com/api/unsubscribe \
+curl -X POST https://newsletter.example.com/api/unsubscribe \
   -H "Content-Type: application/json" \
   -d '{"email": "user@example.com"}'
 ```
@@ -58,7 +58,7 @@ curl -X POST https://unsubscribe.example.com/api/unsubscribe \
 **fetch (browser)**
 
 ```js
-await fetch("https://unsubscribe.example.com/api/unsubscribe", {
+await fetch("https://newsletter.example.com/api/unsubscribe", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ email: "user@example.com" }),
@@ -112,7 +112,7 @@ Returns HTTP 401 if the token is missing or incorrect.
 ### Example
 
 ```bash
-curl https://unsubscribe.example.com/api/actions?limit=10 \
+curl https://newsletter.example.com/api/actions?limit=10 \
   -H "Authorization: Bearer YOUR_ADMIN_KEY"
 ```
 
