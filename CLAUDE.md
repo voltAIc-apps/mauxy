@@ -21,8 +21,8 @@ No tests or linter are configured in this repo.
 ## Build & Deploy
 
 ```bash
-docker build -t <your-registry>/mautic-unsubscribe-proxy:latest .
-docker push <your-registry>/mautic-unsubscribe-proxy:latest
+docker build -t <your-registry>/mauxy:latest .
+docker push <your-registry>/mauxy:latest
 ```
 
 Deployed to Kubernetes with manifests in `k8s/`. The manifests contain `${VAR}` placeholders -- use `scripts/deploy.py` to render them from `.env` values:
@@ -32,7 +32,7 @@ python scripts/deploy.py --dry-run   # preview
 python scripts/deploy.py --apply     # render + kubectl apply
 ```
 
-Credentials are stored in a k8s Secret (`mautic-unsubscribe-credentials`), not committed -- create via `kubectl create secret generic` (see `k8s/secret.yaml` for the template).
+Credentials are stored in a k8s Secret (`mauxy-credentials`), not committed -- create via `kubectl create secret generic` (see `k8s/secret.yaml` for the template).
 
 ## Architecture
 
@@ -46,7 +46,7 @@ All application logic is in `main.py` (single-file service):
 
 ### Persistent storage
 
-Action log uses SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/data/actions.db`). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mautic-unsubscribe-data`). Apply `k8s/pvc.yaml` before the deployment.
+Action log uses SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/data/actions.db`). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment.
 
 ## Environment Variables
 

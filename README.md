@@ -1,4 +1,4 @@
-# Mautic Unsubscribe Proxy
+# Mauxy
 
 Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from your website frontend and adds contacts to Mautic's Do-Not-Contact (DNC) list -- without exposing any Mautic credentials to the browser.
 
@@ -179,8 +179,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ### Build
 
 ```bash
-docker build -t your-registry/mautic-unsubscribe-proxy:latest .
-docker push your-registry/mautic-unsubscribe-proxy:latest
+docker build -t your-registry/mauxy:latest .
+docker push your-registry/mauxy:latest
 ```
 
 ### Configure
@@ -205,7 +205,7 @@ python scripts/deploy.py --apply
 Create the credentials secret separately (values are not in .env):
 
 ```bash
-kubectl create secret generic mautic-unsubscribe-credentials \
+kubectl create secret generic mauxy-credentials \
   --from-literal=MAUTIC_BASE_URL=https://mautic.example.com \
   --from-literal=MAUTIC_USERNAME=<user> \
   --from-literal=MAUTIC_PASSWORD=<pass> \

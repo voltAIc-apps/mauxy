@@ -1,20 +1,20 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: mautic-unsubscribe-proxy-ingress
+  name: mauxy-ingress
   namespace: ${DEPLOY_NAMESPACE}
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     kubernetes.io/tls-acme: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
   labels:
-    app.kubernetes.io/name: mautic-unsubscribe-proxy
+    app.kubernetes.io/name: mauxy
 spec:
   ingressClassName: nginx
   tls:
     - hosts:
         - ${DEPLOY_DOMAIN}
-      secretName: mautic-unsubscribe-proxy-tls
+      secretName: mauxy-tls
   rules:
     - host: ${DEPLOY_DOMAIN}
       http:
@@ -23,6 +23,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: mautic-unsubscribe-proxy
+                name: mauxy
                 port:
                   number: 80
