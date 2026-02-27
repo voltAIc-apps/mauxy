@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Single-file Python (FastAPI) proxy microservice that accepts unsubscribe requests from an SPA frontend and adds contacts to Mautic's Do-Not-Contact (DNC) list via the Mautic REST API. Mautic Basic Auth credentials stay server-side and are never exposed to the browser. All responses return `{"status": "ok"}` to prevent email enumeration.
+Single-file Python (FastAPI) proxy microservice that accepts unsubscribe requests from an SPA frontend and adds contacts to Mautic's Do-Not-Contact (DNC) list via the Mautic REST API. Mautic Basic Auth credentials stay server-side and are never exposed to the browser. Contact-specific responses return `{"status": "ok"}` to prevent email enumeration; returns 503 when Mautic is unreachable.
 
 ## Development
 
@@ -35,7 +35,7 @@ Public endpoint: `https://unsubscribe.engage.wapsol.de`
 
 All application logic is in `main.py` (single-file service):
 
-- **POST /api/unsubscribe** — accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
+- **POST /api/unsubscribe** — accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Returns 503 when Mautic is unreachable (search phase); contact-specific outcomes always return 200. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
 - **GET /api/actions** — admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Supports `email`, `result`, `limit`, `offset` query params. Disabled (403) if `ADMIN_API_KEY` is unset.
 - **GET /health** — k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
 - **GET /health/detail** — richer health endpoint showing degraded/ok status, Mautic detail, and cache age. Always returns HTTP 200.

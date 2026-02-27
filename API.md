@@ -27,11 +27,21 @@ Add an email address to the Mautic Do-Not-Contact (DNC) list.
 
 ### Response
 
-Always returns HTTP 200 with the same body regardless of whether the contact was found, already unsubscribed, or doesn't exist. This prevents email enumeration.
+Returns HTTP 200 with the same body regardless of whether the contact was found, already unsubscribed, or doesn't exist -- this prevents email enumeration. Returns HTTP 503 when Mautic is unreachable.
 
 ```json
 {
   "status": "ok"
+}
+```
+
+### Response (503 — Mautic unreachable)
+
+Returned when the proxy cannot reach the Mautic API (connection error or non-200 from Mautic search endpoint). The request was not processed -- the frontend should prompt the user to retry.
+
+```json
+{
+  "status": "service_unavailable"
 }
 ```
 
@@ -151,3 +161,4 @@ Detailed health status for operator debugging. Always returns HTTP 200.
 | 403    | `ADMIN_API_KEY` not configured (admin endpoint disabled) |
 | 422    | Invalid request body (e.g. malformed email on `/api/unsubscribe`) |
 | 429    | Rate limit exceeded — retry after the period resets |
+| 503    | Mautic API unreachable — request was not processed, retry later |

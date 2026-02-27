@@ -178,16 +178,17 @@ async def health_detail():
 async def unsubscribe(payload: UnsubscribeRequest, request: Request):
     """
     Add email to Mautic DNC list.
-    Always returns {"status": "ok"} to prevent email enumeration.
+    Returns 200 {"status":"ok"} for all contact-specific outcomes (prevents enumeration).
+    Returns 503 {"status":"service_unavailable"} when Mautic cannot be reached at all.
     """
     email = payload.email.lower()
     auth = (MAUTIC_USERNAME, MAUTIC_PASSWORD)
     logger.info("UNSUBSCRIBE_START email=%s", email)
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # Find contact by exact email match
-            search_url = f"{MAUTIC_BASE_URL}/api/contacts"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Phase 1: Search for contact -- failures here are email-independent, return 503
+        search_url = f"{MAUTIC_BASE_URL}/api/contacts"
+        try:
             resp = await client.get(
                 search_url,
                 params={
@@ -197,12 +198,18 @@ async def unsubscribe(payload: UnsubscribeRequest, request: Request):
                 },
                 auth=auth,
             )
+        except httpx.RequestError as exc:
+            logger.error("UNSUBSCRIBE_MAUTIC_UNREACHABLE email=%s error=%s", email, exc)
+            await log_action(request, email, "mautic_unreachable", error_detail=f"httpx_error: {exc}")
+            return JSONResponse({"status": "service_unavailable"}, status_code=503)
 
-            if resp.status_code != 200:
-                logger.warning("UNSUBSCRIBE_SEARCH_FAILED email=%s status=%s", email, resp.status_code)
-                await log_action(request, email, "error", error_detail=f"search_status={resp.status_code}")
-                return JSONResponse({"status": "ok"})
+        if resp.status_code != 200:
+            logger.warning("UNSUBSCRIBE_SEARCH_FAILED email=%s status=%s", email, resp.status_code)
+            await log_action(request, email, "mautic_error", error_detail=f"search_status={resp.status_code}")
+            return JSONResponse({"status": "service_unavailable"}, status_code=503)
 
+        # Phase 2: Contact-specific logic -- always 200 to prevent enumeration
+        try:
             contacts = resp.json().get("contacts", {})
             if not contacts:
                 logger.warning("UNSUBSCRIBE_NO_CONTACT email=%s", email)
@@ -250,14 +257,14 @@ async def unsubscribe(payload: UnsubscribeRequest, request: Request):
                 logger.error("UNSUBSCRIBE_DNC_FAILED_RETRY_EXHAUSTED email=%s contact_id=%s", email, contact_id)
                 await log_action(request, email, "error", contact_id=str(contact_id), error_detail="dnc_retry_exhausted")
 
-    except httpx.RequestError as exc:
-        logger.error("UNSUBSCRIBE_REQUEST_ERROR email=%s error=%s", email, exc)
-        await log_action(request, email, "error", error_detail=f"httpx_error: {exc}")
-    except Exception as exc:
-        logger.error("UNSUBSCRIBE_UNEXPECTED_ERROR email=%s error=%s", email, exc)
-        await log_action(request, email, "error", error_detail=f"unexpected: {exc}")
+        except httpx.RequestError as exc:
+            logger.error("UNSUBSCRIBE_DNC_REQUEST_ERROR email=%s error=%s", email, exc)
+            await log_action(request, email, "error", error_detail=f"httpx_error: {exc}")
+        except Exception as exc:
+            logger.error("UNSUBSCRIBE_UNEXPECTED_ERROR email=%s error=%s", email, exc)
+            await log_action(request, email, "error", error_detail=f"unexpected: {exc}")
 
-    # Always 200 -- no enumeration leak
+    # 200 for all contact-specific outcomes -- no enumeration leak
     return JSONResponse({"status": "ok"})
 
 

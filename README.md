@@ -4,7 +4,7 @@ Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests fr
 
 **Public endpoint:** `https://unsubscribe.engage.wapsol.de`
 
-**Key design property:** Every request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error. This prevents email enumeration attacks.
+**Key design property:** Every request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error -- this prevents email enumeration attacks. Returns `503` when Mautic is unreachable so the frontend can prompt the user to retry.
 
 ---
 
@@ -25,7 +25,7 @@ Send a JSON body with the email address. The response is always the same:
 // Request
 {"email": "user@example.com"}
 
-// Response (always 200)
+// Response (200 on success, 422/429/503 on error)
 {"status": "ok"}
 ```
 
@@ -45,9 +45,16 @@ async function unsubscribe(email) {
       }
     );
 
+    if (resp.status === 422) {
+      return { success: false, reason: "invalid_email" };
+    }
+
     if (resp.status === 429) {
-      // Rate limit hit — ask the user to try again later
       return { success: false, reason: "rate_limited" };
+    }
+
+    if (resp.status === 503) {
+      return { success: false, reason: "service_unavailable" };
     }
 
     return { success: true };
@@ -77,8 +84,10 @@ You only need to handle two failure cases in your frontend:
 
 | Scenario | What you see | What to do |
 |---|---|---|
-| **Network failure** | `fetch` throws | Show a generic error message |
+| **Invalid email format** | HTTP 422 | Show validation error |
 | **Rate limit exceeded** | HTTP 429 | Ask the user to wait and retry |
+| **Mautic unreachable** | HTTP 503 | Show "try again later" message |
+| **Network failure** | `fetch` throws | Show a generic error message |
 
 All other outcomes (email found, not found, Mautic errors) are intentionally masked as `200 {"status": "ok"}`. Do not try to infer the result from the response.
 
@@ -157,7 +166,7 @@ Two health endpoints are available. Both always return HTTP 200.
 | `GET /health` | Kubernetes liveness/readiness probe. Also useful for a quick manual check. | `{"status": "ok", "mautic": "reachable"}` |
 | `GET /health/detail` | Richer status with `ok` / `degraded` indicator and cache age. | `{"status": "ok", "mautic": "reachable", "cache_age_seconds": 12.3}` |
 
-If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests will still return `{"status": "ok"}` to the user but will be logged as `error`.
+If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests will return `503 {"status": "service_unavailable"}` and the attempt is logged as `mautic_unreachable`.
 
 ---
 
