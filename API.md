@@ -1,164 +1,131 @@
 # API Reference
 
-Base URL: `https://newsletter.example.com` (set via `DEPLOY_DOMAIN`)
+Base URL: `https://mauxy.engage.wapsol.de` (set via `DEPLOY_DOMAIN`)
+
+Mauxy is the single newsletter (un)subscribe authority in front of Mautic. Every
+`/api/subscribe` and `/api/unsubscribe` call needs **two** things:
+
+1. **A per-site key** — `Authorization: Bearer <site-key>`. Each site is configured
+   in `MAUXY_SITES` with its own key, Mautic `segment` and quiz `topic`. Send it
+   over HTTPS (TLS is the MITM defence). Unknown/missing key → `401`.
+2. **A bot-defence answer** — fetch a question from `GET /api/challenge`, then echo
+   the `challenge` token and the correct `answer` index back. Wrong/expired → `409`.
+
+The honeypot field `company_website` must stay empty; if set, the request is
+accepted-looking but silently dropped.
 
 ---
 
-## POST /api/unsubscribe
+## GET /api/challenge
 
-Add an email address to the Mautic Do-Not-Contact (DNC) list.
+Return a multiple-choice question for the calling site's topic plus a signed,
+expiring token. The correct answer is never sent to the client.
 
-**CORS:** Restricted to configured origins (`ALLOWED_ORIGINS` env var).
-**Rate limit:** 5 requests per minute per IP (configurable). Exceeding the limit returns HTTP 429.
-
-### Request
-
-| Header         | Value              |
-|----------------|--------------------|
-| Content-Type   | application/json   |
-
-```json
-{
-  "email": "user@example.com"
-}
-```
-
-`email` must be a valid email address.
-
-### Response
-
-Returns HTTP 200 with the same body regardless of whether the contact was found, already unsubscribed, or doesn't exist -- this prevents email enumeration. Returns HTTP 503 when Mautic is unreachable.
-
-```json
-{
-  "status": "ok"
-}
-```
-
-### Response (503 -- Mautic unreachable)
-
-Returned when the proxy cannot reach the Mautic API (connection error or non-200 from Mautic search endpoint). The request was not processed -- the frontend should prompt the user to retry.
-
-```json
-{
-  "status": "service_unavailable"
-}
-```
-
-### Examples
-
-**curl**
-
-```bash
-curl -X POST https://newsletter.example.com/api/unsubscribe \
-  -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com"}'
-```
-
-**fetch (browser)**
-
-```js
-await fetch("https://newsletter.example.com/api/unsubscribe", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ email: "user@example.com" }),
-});
-```
-
----
-
-## GET /api/actions
-
-Query the action log. Admin-only endpoint protected by a Bearer token.
-
-Returns HTTP 403 if `ADMIN_API_KEY` is not configured on the server.
-Returns HTTP 401 if the token is missing or incorrect.
-
-### Request
-
-| Header          | Value                      |
-|-----------------|----------------------------|
-| Authorization   | Bearer `<ADMIN_API_KEY>`   |
-
-### Query parameters
-
-| Param    | Type   | Default | Description                           |
-|----------|--------|---------|---------------------------------------|
-| `email`  | string | --      | Filter by email address               |
-| `result` | string | --      | Filter by result (`ok`, `not_found`, `error`) |
-| `limit`  | int    | 50      | Rows to return (1-500)                |
-| `offset` | int    | 0       | Pagination offset                     |
+**Auth:** `Authorization: Bearer <site-key>`. **Rate limit:** 30/min per IP.
 
 ### Response (200)
 
 ```json
 {
-  "actions": [
-    {
-      "id": 1,
-      "ts": "2026-02-26T12:00:00+00:00",
-      "email": "user@example.com",
-      "source_origin": "https://your-app.example.com",
-      "source_ip": "203.0.113.1",
-      "result": "ok",
-      "contact_id": "42",
-      "error_detail": null
-    }
-  ],
-  "count": 1
+  "challenge": "odoo.editions.1764500000.6f1c…",
+  "question": "Which two editions does Odoo come in?",
+  "choices": ["Community & Enterprise", "Bronze & Gold", "Lite & Pro", "Home & Away"]
 }
 ```
+
+`answer` (sent later) is the 0-based index into `choices`. Token expires after
+`CHALLENGE_TTL` seconds (default 600). `401` if the key is unknown; `503` if the
+quiz is unconfigured (`CHALLENGE_SECRET` unset or no questions for the topic).
+
+---
+
+## POST /api/subscribe
+
+Find/create the Mautic contact and add it to the site's segment. Mautic runs the
+double-opt-in campaign, so a new signup returns `pending_confirmation`.
+
+**Auth:** `Authorization: Bearer <site-key>`. **Rate limit:** 60/min per IP.
+
+### Request
+
+| Header        | Value                  |
+|---------------|------------------------|
+| Content-Type  | application/json       |
+| Authorization | Bearer `<site-key>`    |
+
+```json
+{
+  "email": "user@example.com",
+  "challenge": "odoo.editions.1764500000.6f1c…",
+  "answer": 0,
+  "company_website": ""
+}
+```
+
+`source`, `consent`, `consentedAt`, `pageUrl`, `locale` are accepted but advisory —
+the target segment comes from the site key, never the body.
+
+### Responses
+
+| Status | Body | Meaning |
+|--------|------|---------|
+| 200 | `{"status":"pending_confirmation"}` | Added to segment; Mautic will send the opt-in mail. (Also returned for a dropped honeypot.) |
+| 401 | `{"error":"unauthorized"}` | Missing/unknown site key |
+| 409 | `{"status":"quiz_failed"}` | Wrong/expired bot-defence answer — re-fetch a challenge and retry |
+| 502 | `{"status":"error"}` | Mautic reachable but a sub-step (create / segment) failed |
+| 503 | `{"status":"service_unavailable"}` | Mautic unreachable — retry later |
 
 ### Example
 
 ```bash
-curl https://newsletter.example.com/api/actions?limit=10 \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+curl -X POST https://mauxy.engage.wapsol.de/api/subscribe \
+  -H "Authorization: Bearer YOUR_SITE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","challenge":"<token>","answer":0}'
 ```
 
 ---
 
-## GET /health
+## POST /api/unsubscribe
 
-Kubernetes liveness/readiness probe. Always returns HTTP 200.
+Add an email to the Mautic Do-Not-Contact (DNC) list.
 
-### Response
+**Auth:** `Authorization: Bearer <site-key>`. **Rate limit:** `RATE_LIMIT` (default 5/min per IP).
+
+### Request
 
 ```json
 {
-  "status": "ok",
-  "mautic": "reachable"
+  "email": "user@example.com",
+  "challenge": "odoo.editions.1764500000.6f1c…",
+  "answer": 0,
+  "company_website": ""
 }
 ```
 
-`mautic` may also be `"pending"`, `"HTTP <code>"`, or `"connection error: ..."` when Mautic is unreachable.
+### Responses
+
+| Status | Body | Meaning |
+|--------|------|---------|
+| 200 | `{"status":"ok"}` | Applied — or contact not found. Same body either way (no enumeration leak). |
+| 401 | `{"error":"unauthorized"}` | Missing/unknown site key |
+| 409 | `{"status":"quiz_failed"}` | Wrong/expired bot-defence answer (email-independent → still no leak) |
+| 503 | `{"status":"service_unavailable"}` | Mautic unreachable |
 
 ---
 
-## GET /health/detail
+## GET /api/actions
 
-Detailed health status for operator debugging. Always returns HTTP 200.
-
-### Response
-
-```json
-{
-  "status": "ok",
-  "mautic": "reachable",
-  "cache_age_seconds": 12.3
-}
-```
-
-`status` is `"ok"` when Mautic is reachable, `"degraded"` otherwise. The Mautic connectivity result is cached for 30 seconds; `cache_age_seconds` shows how stale the check is.
+Query the action log. Admin-only, `Authorization: Bearer <ADMIN_API_KEY>`. `403` if
+`ADMIN_API_KEY` unset, `401` if wrong. Query params: `email`, `result`, `limit`
+(1–500, default 50), `offset`. Each row now also carries `action`
+(`subscribe`|`unsubscribe`) and `site`. `result` values include `ok`, `not_found`,
+`quiz_failed`, `honeypot`, `mautic_unreachable`, `error`.
 
 ---
 
-## Error responses
+## GET /health · GET /health/detail
 
-| Status | Cause |
-|--------|-------|
-| 401    | Missing or invalid Bearer token on `/api/actions` |
-| 403    | `ADMIN_API_KEY` not configured (admin endpoint disabled) |
-| 422    | Invalid request body (e.g. malformed email on `/api/unsubscribe`) |
-| 429    | Rate limit exceeded -- retry after the period resets |
-| 503    | Mautic API unreachable -- request was not processed, retry later |
+Kubernetes probes, always HTTP 200. `/health` → `{"status":"ok","mautic":"reachable"}`
+(`mautic` may be `pending` / `HTTP <code>` / `connection error: …`). `/health/detail`
+adds `status: ok|degraded` and `cache_age_seconds` (Mautic check cached 30s).

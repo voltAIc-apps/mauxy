@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-**mauxy** -- centralized newsletter subscription + unsubscribe proxy for Mautic. Python (FastAPI) microservice that accepts subscribe/unsubscribe requests from SPA frontends and manages contacts via the Mautic REST API. Mautic Basic Auth credentials stay server-side and are never exposed to the browser. Contact-specific responses return `{"status": "ok"}` to prevent email enumeration; returns 503 when Mautic is unreachable. Multi-site config via `sites.yaml`, GDPR double opt-in via SMTP confirmation emails.
+**mauxy** -- the single newsletter (un)subscribe authority in front of Mautic. Python (FastAPI) microservice that accepts subscribe/unsubscribe requests and manages contacts/segments/DNC via the Mautic REST API. Mautic Basic Auth credentials stay server-side, never exposed to the browser. Every (un)subscribe is gated by (1) a **per-site Bearer key** (`MAUXY_SITES` registry maps key → site, Mautic segment, quiz topic) and (2) a **centralized bot-defence quiz** (`GET /api/challenge` issues a signed, expiring question per the site's topic; the answer is verified server-side). Unsubscribe stays enumeration-safe (`{"status":"ok"}` regardless); 503 when Mautic is unreachable. GDPR double-opt-in is owned by Mautic (campaign on the segment).
 
 ## Development
 
@@ -20,26 +20,31 @@ No tests or linter are configured in this repo.
 
 ## Build & Deploy
 
-```bash
-docker build -t <your-registry>/mauxy:latest .
-docker push <your-registry>/mauxy:latest
-```
-
-Deployed to Kubernetes with manifests in `k8s/`. The manifests contain `${VAR}` placeholders -- use `scripts/deploy.py` to render them from `.env` values:
+`scripts/deploy.py` is the single deploy tool — it reads everything from `.env`
+(gitignored; no secrets in the repo) and runs into its own `mauxy` namespace:
 
 ```bash
-python scripts/deploy.py --dry-run   # preview
-python scripts/deploy.py --apply     # render + kubectl apply
+python scripts/deploy.py --dry-run                  # preview manifests
+python scripts/deploy.py --build                    # docker login + build + push
+python scripts/deploy.py --secret                   # sync mauxy-credentials Secret
+python scripts/deploy.py --apply                    # render + kubectl apply
+python scripts/deploy.py --build --secret --apply   # full deploy
 ```
 
-Credentials are stored in a k8s Secret (`mauxy-credentials`), not committed -- create via `kubectl create secret generic` (see `k8s/secret.yaml` for the template).
+`--build` uses `REGISTRY_URL/USER/PASSWORD`; `--secret` writes the runtime config
+(Mautic creds, `ALLOWED_ORIGINS`, `MAUXY_SITES`, `CHALLENGE_SECRET`, …) into the
+`mauxy-credentials` Secret that the deployment is `envFrom`. `k8s/secret.yaml` is a
+documentation template only. The Dockerfile must ship both `main.py` and
+`quiz_bank.json`.
 
 ## Architecture
 
 All application logic is in `main.py` (single-file service):
 
-- **POST /api/unsubscribe** -- accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Returns 503 when Mautic is unreachable (search phase); contact-specific outcomes always return 200. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
-- **GET /api/actions** -- admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Supports `email`, `result`, `limit`, `offset` query params. Disabled (403) if `ADMIN_API_KEY` is unset.
+- **GET /api/challenge** -- per-site-keyed; returns a multiple-choice question for the site's topic (`quiz_bank.json`) + a signed HMAC token. The correct answer never leaves the server.
+- **POST /api/subscribe** -- per-site-keyed + quiz-gated. Find/create the contact, add it to the site's segment (creating it by alias if needed). Returns `pending_confirmation` (Mautic runs the opt-in); `409 quiz_failed` / `401` / `502` / `503` otherwise. Honeypot `company_website` drops bots.
+- **POST /api/unsubscribe** -- per-site-keyed + quiz-gated. Adds the contact to the DNC list. Contact-specific outcomes always 200 (no enumeration); 503 when Mautic is unreachable.
+- **GET /api/actions** -- admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Rows carry `action` + `site`. Supports `email`, `result`, `limit`, `offset`. Disabled (403) if `ADMIN_API_KEY` unset.
 - **GET /health** -- k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
 - **GET /health/detail** -- richer health endpoint showing degraded/ok status, Mautic detail, and cache age. Always returns HTTP 200.
 - CORS is restricted to `ALLOWED_ORIGINS` (must be set via env).
@@ -56,6 +61,9 @@ Action log uses SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/dat
 | `MAUTIC_USERNAME` | Mautic API basic auth user |
 | `MAUTIC_PASSWORD` | Mautic API basic auth password |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
+| `MAUXY_SITES` | JSON array of `{key, site, segment, topic}` — per-site key registry |
+| `CHALLENGE_SECRET` | HMAC secret for bot-defence challenge tokens (quiz disabled if unset) |
+| `CHALLENGE_TTL` | Challenge token lifetime in seconds (default 600) |
 | `RATE_LIMIT` | slowapi rate limit string (e.g. `5/minute`) |
 | `ACTION_LOG_DB` | SQLite database path (default `/data/actions.db`) |
 | `ADMIN_API_KEY` | Bearer token for `/api/actions` (disabled if unset) |
