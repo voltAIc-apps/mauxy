@@ -1,73 +1,59 @@
 # Mauxy
 
-Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from website frontends and adds contacts to the Do-Not-Contact (DNC) list -- without exposing Mautic credentials to the browser.
+The single newsletter (un)subscribe authority in front of Mautic -- Mautic
+credentials never reach the browser. Double-opt-in + sending live in Mautic.
 
-**Key design property:** Every contact-specific request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error -- this prevents email enumeration attacks. Returns `503` when Mautic is unreachable so the frontend can prompt the user to retry.
+- **Subscribe** (`POST /api/subscribe`): find/create the contact, add it to the
+  calling site's Mautic segment. Mautic sends the opt-in mail → `pending_confirmation`.
+- **Unsubscribe** (`POST /api/unsubscribe`): add the contact to the Do-Not-Contact (DNC) list.
+- **Challenge** (`GET /api/challenge`): a bot-defence question both flows must answer.
+
+Two guards in front of every (un)subscribe:
+
+1. **Per-site key** — `Authorization: Bearer <site-key>`. Each calling site is
+   configured in `MAUXY_SITES` with its own key, `segment` and quiz `topic`. Sent
+   over HTTPS (TLS = the MITM defence). The segment is chosen by the key, not the body.
+2. **Bot-defence quiz** — fetch a question from `GET /api/challenge`, send back the
+   `challenge` token + correct `answer` index. Wrong/expired → `409`. A honeypot field
+   (`company_website`) silently drops bots.
+
+**Enumeration-safe:** unsubscribe returns `{"status":"ok"}` whether or not the
+contact exists; key/quiz failures are email-independent (`401`/`409`).
 
 ---
 
-## For Developers -- Integrating the Unsubscribe Endpoint
+## For Developers -- Integrating
 
-See [API Reference](API.md) for full endpoint documentation.
-
-### Endpoint
-
-```
-POST https://newsletter.example.com/api/unsubscribe
-Content-Type: application/json
-```
-
-### Request / Response
-
-Send a JSON body with the email address. The response is always the same:
-
-```json
-// Request
-{"email": "user@example.com"}
-
-// Response (200 on success, 422/429/503 on error)
-{"status": "ok"}
-```
-
-### JavaScript Example
-
-Drop this into your unsubscribe page or form handler:
+See [API Reference](API.md) for full endpoint documentation. The flow is the same
+for subscribe and unsubscribe: **challenge → answer**.
 
 ```javascript
-async function unsubscribe(email) {
-  try {
-    const resp = await fetch(
-      "https://newsletter.example.com/api/unsubscribe",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
-      }
-    );
+const BASE = "https://mauxy.engage.wapsol.de";
+const KEY = "<your-site-key>";            // server-side secret; static sites embed a per-site key
 
-    if (resp.status === 422) {
-      return { success: false, reason: "invalid_email" };
-    }
+// 1) Fetch a question, show choices, let the user pick an index.
+const ch = await fetch(`${BASE}/api/challenge`, {
+  headers: { Authorization: `Bearer ${KEY}` },
+}).then((r) => r.json());          // { challenge, question, choices }
 
-    if (resp.status === 429) {
-      return { success: false, reason: "rate_limited" };
-    }
-
-    if (resp.status === 503) {
-      return { success: false, reason: "service_unavailable" };
-    }
-
-    return { success: true };
-  } catch (err) {
-    // Network error -- the proxy is unreachable
-    return { success: false, reason: "network_error" };
-  }
+// 2) Submit with the chosen answer index.
+async function subscribe(email, answerIndex) {
+  const resp = await fetch(`${BASE}/api/subscribe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ email, challenge: ch.challenge, answer: answerIndex, company_website: "" }),
+  });
+  if (resp.status === 409) return { ok: false, reason: "quiz_failed" };   // re-ask the question
+  if (resp.status === 401) return { ok: false, reason: "unauthorized" };
+  if (resp.status === 503) return { ok: false, reason: "service_unavailable" };
+  return { ok: true, ...(await resp.json()) };   // { status: "pending_confirmation" }
 }
 ```
 
 ### CORS
 
-Requests are restricted to whitelisted origins. If your domain is not yet allowed, contact the service operator to add it.
+Browser requests are restricted to whitelisted origins (`ALLOWED_ORIGINS`). If your
+domain is not yet allowed, contact the service operator to add it.
 
 ### Rate Limiting
 
@@ -105,42 +91,29 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Build
-
-```bash
-docker build -t your-registry/mauxy:latest .
-docker push your-registry/mauxy:latest
-```
-
 ### Configure
 
-Copy `.env.example` to `.env` and fill in all values, including the `DEPLOY_*` variables for k8s manifests.
+Copy `.env.example` to `.env` and fill in every value: the `DEPLOY_*` vars, the
+`REGISTRY_*` creds, the Mautic creds, `MAUXY_SITES`, and `CHALLENGE_SECRET`
+(`openssl rand -hex 32`). `.env` is gitignored — no secret belongs in the repo.
 
-### Render & Apply k8s Manifests
+### Deploy with `scripts/deploy.py`
 
-The k8s manifests in `k8s/` contain `${VAR}` placeholders. Use `scripts/deploy.py` to render them:
-
-```bash
-# Preview rendered manifests
-python scripts/deploy.py --dry-run
-
-# Render to k8s/rendered/
-python scripts/deploy.py
-
-# Render and apply in one step
-python scripts/deploy.py --apply
-```
-
-Create the credentials secret separately (values are not in .env):
+One tool drives the whole rollout from `.env` (no secrets in git):
 
 ```bash
-kubectl create secret generic mauxy-credentials \
-  --from-literal=MAUTIC_BASE_URL=https://mautic.example.com \
-  --from-literal=MAUTIC_USERNAME=<user> \
-  --from-literal=MAUTIC_PASSWORD=<pass> \
-  --from-literal=ADMIN_API_KEY=<key> \
-  -n <your-namespace>
+python scripts/deploy.py --dry-run            # preview rendered manifests
+python scripts/deploy.py --build              # docker login + build + push DEPLOY_IMAGE
+python scripts/deploy.py --secret             # sync the mauxy-credentials Secret
+python scripts/deploy.py --apply              # render to k8s/rendered/ + kubectl apply
+python scripts/deploy.py --build --secret --apply   # full deploy in one shot
 ```
+
+`--secret` writes `mauxy-credentials` (Mautic creds, `ALLOWED_ORIGINS`,
+`MAUXY_SITES`, `CHALLENGE_SECRET`, …) into `$DEPLOY_NAMESPACE` (default `mauxy`,
+its own namespace). The deployment is `envFrom` that Secret, so all runtime config
+lives there. Ensure the namespace + `DEPLOY_IMAGE_PULL_SECRET` exist first, and
+that DNS for `DEPLOY_DOMAIN` points at the ingress.
 
 ### Environment Variables
 
@@ -150,9 +123,15 @@ kubectl create secret generic mauxy-credentials \
 | `MAUTIC_USERNAME` | Mautic API basic-auth user | *(required)* |
 | `MAUTIC_PASSWORD` | Mautic API basic-auth password | *(required)* |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins | *(required)* |
-| `RATE_LIMIT` | slowapi rate-limit string | `5/minute` |
+| `MAUXY_SITES` | JSON array of `{key, site, segment, topic}` — the per-site key registry | `[]` (all calls 401) |
+| `CHALLENGE_SECRET` | HMAC secret for signing bot-defence challenge tokens | *(quiz disabled if unset)* |
+| `CHALLENGE_TTL` | Challenge token lifetime, seconds | `600` |
+| `RATE_LIMIT` | slowapi rate-limit string (unsubscribe) | `5/minute` |
 | `ACTION_LOG_DB` | SQLite database path | `/data/actions.db` |
 | `ADMIN_API_KEY` | Bearer token for `/api/actions` | *(disabled if unset)* |
+
+Quiz questions live in `quiz_bank.json`, keyed by topic (e.g. `odoo`). Add a topic
+there and point a site at it via `MAUXY_SITES`.
 
 ### Health & Monitoring
 
@@ -177,7 +156,7 @@ The action log is available at `GET /api/actions` and requires a bearer token:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://newsletter.example.com/api/actions"
+  "https://mauxy.engage.wapsol.de/api/actions"
 ```
 
 Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment variable. If the key is not set, the endpoint returns `403 Forbidden`.
@@ -197,28 +176,28 @@ Replace `YOUR_ADMIN_TOKEN` with the value of the `ADMIN_API_KEY` environment var
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://newsletter.example.com/api/actions"
+  "https://mauxy.engage.wapsol.de/api/actions"
 ```
 
 **Actions for a specific email:**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://newsletter.example.com/api/actions?email=user@example.com"
+  "https://mauxy.engage.wapsol.de/api/actions?email=user@example.com"
 ```
 
 **Only successful unsubscribes:**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://newsletter.example.com/api/actions?result=ok"
+  "https://mauxy.engage.wapsol.de/api/actions?result=ok"
 ```
 
 **Page 2 of results (records 51-100):**
 
 ```bash
 curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  "https://newsletter.example.com/api/actions?limit=50&offset=50"
+  "https://mauxy.engage.wapsol.de/api/actions?limit=50&offset=50"
 ```
 
 ### Understanding Results
@@ -235,10 +214,12 @@ curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
 
 Planned features (see [issue #8](https://github.com/voltAIc-apps/mauxy/issues/8)):
 
-- `POST /api/subscribe` -- newsletter subscription with multi-site support
-- GDPR double opt-in via confirmation emails
-- Per-site segment mapping via `sites.yaml`
 - Per-site unsubscribe (segment removal instead of global DNC)
+- Single-use challenge tokens (today: short expiry + rate-limit + honeypot)
+
+Done: `POST /api/subscribe` (segment add) · per-site key registry (`MAUXY_SITES`) ·
+centralized bot-defence quiz (`GET /api/challenge`, per-topic). GDPR double-opt-in is
+owned by Mautic (campaign on the segment).
 
 ---
 

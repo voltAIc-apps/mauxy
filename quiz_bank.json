@@ -1,0 +1,12 @@
+{
+  "_comment": "Bot-defence question banks, keyed by topic. Each site (see MAUXY_SITES) maps to one topic. Questions are easy for a human in the site's audience, hard for a generic bot. 'answer' is the 0-based index of the correct choice. Add topics freely (e.g. 're-cloud'); a site with an unknown/empty topic cannot issue challenges.",
+  "odoo": [
+    { "id": "what-is-odoo", "q": "What kind of software is Odoo?", "choices": ["A business / ERP suite", "A video game", "A web browser", "A coffee machine"], "answer": 0 },
+    { "id": "editions", "q": "Which two editions does Odoo come in?", "choices": ["Community & Enterprise", "Bronze & Gold", "Lite & Pro", "Home & Away"], "answer": 0 },
+    { "id": "language", "q": "Odoo's backend is mainly written in which language?", "choices": ["Python", "COBOL", "Swift", "Rust"], "answer": 0 },
+    { "id": "is-app", "q": "Which of these is a real Odoo app?", "choices": ["CRM", "Photoshop", "Spotify", "Minesweeper"], "answer": 0 },
+    { "id": "erp-meaning", "q": "What does the 'ERP' in Odoo's category stand for?", "choices": ["Enterprise Resource Planning", "Electronic Routing Protocol", "Extra Rapid Pizza", "Easy Repair Program"], "answer": 0 },
+    { "id": "community-license", "q": "Odoo Community edition is…", "choices": ["Open source", "Closed source", "Hardware only", "A mobile game"], "answer": 0 },
+    { "id": "migration", "q": "When you 'migrate' Odoo, you move it to a…", "choices": ["Newer version", "Different planet", "Spreadsheet", "Fax machine"], "answer": 0 }
+  ]
+}
