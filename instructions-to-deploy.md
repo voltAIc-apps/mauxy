@@ -62,9 +62,12 @@ Configure a **double-opt-in campaign on the `ludo` segment** so contacts added b
 the segment but no opt-in mail is sent.
 
 ## Notes
-- The Dockerfile ships `main.py` **and** `quiz_bank.json` — both are required (the quiz
-  bank powers `/api/challenge`).
-- Add a new calling site by appending to `MAUXY_SITES` (+ a new topic in `quiz_bank.json`
-  if needed) and re-running `--secret --apply`.
+- The Dockerfile ships `main.py`, `db_migrate.py`, the `db-patches/` schema patches and
+  `scripts/{deploy,sqlite_db}.py`. Schema is applied by an initContainer
+  (`sqlite_db.py --migrate`) before the app starts; the app refuses to start if the DB is
+  behind the shipped patches (`MIGRATE_STRICT=false` to warn instead).
+- Add a new calling site at runtime via `POST /api/admin/sites` (+ quiz questions via
+  `POST /api/admin/quiz`), or seed keys by appending to `MAUXY_SITES` and re-running
+  `--secret --apply`. Schema changes ship as new `db-patches/NNNN_*.sql`.
 - The legacy `unsubscribe.engage.wapsol.de` / `mautic-unsubscribe-proxy` deployment can
   keep running during the transition; retire it once consumers point at `mauxy.engage`.

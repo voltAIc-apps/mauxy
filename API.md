@@ -129,8 +129,9 @@ Query the action log. Admin-only, `Authorization: Bearer <ADMIN_API_KEY>`. `403`
 The site registry, the quiz bank and the target Mautic version live in SQLite and are
 managed at runtime — no rebuild/redeploy. All endpoints require
 `Authorization: Bearer <ADMIN_API_KEY>` (`403` if unset, `401` if wrong). Every write
-reloads the in-memory caches, so changes are live on the next request. `MAUXY_SITES` /
-`quiz_bank.json` only **seed an empty DB** on first boot; the DB is authoritative after.
+reloads the in-memory caches, so changes are live on the next request. `MAUXY_SITES` seeds
+the site keys and `db-patches/0002_seed_quiz.sql` seeds the quiz on first boot; the DB is
+authoritative after.
 
 ### Sites — `/api/admin/sites`
 - `GET` — list all sites (`{key, site, segment, topic, created_at}`).

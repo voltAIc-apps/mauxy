@@ -136,9 +136,10 @@ that DNS for `DEPLOY_DOMAIN` points at the ingress.
 
 The site registry, quiz bank and target Mautic version live in the SQLite DB and are
 managed at runtime via admin CRUD (Bearer `ADMIN_API_KEY`) — no rebuild/redeploy.
-`MAUXY_SITES` and `quiz_bank.json` only **seed an empty DB** on first boot; the DB is
-authoritative afterwards. Each site maps to its own quiz topic
-(`ludo`, `simplify-erp`, `re-cloud`; `odoo` is a generic fallback).
+Quiz content is seeded by a SQL patch (`db-patches/0002_seed_quiz.sql`); `MAUXY_SITES`
+seeds the site keys (secrets) on first boot. The DB is authoritative afterwards. Each
+site maps to its own quiz topic (`ludo`, `simplify-erp`, `re-cloud`; `odoo` is a generic
+fallback).
 
 To onboard a new site:
 
@@ -162,6 +163,26 @@ Both are live on the next request (no restart). See `API.md` for the full admin 
 
 > Site Bearer keys are stored in **plaintext** in SQLite (deliberate decision; TLS on the
 > wire + RBAC on the PVC are the controls).
+
+### Schema migrations (db-patches/)
+
+The `actions.db` schema is a versioned artifact: each change ships as an integer-numbered
+SQL patch in `db-patches/` (`NNNN_name.sql`), committed to git. Deployers apply pending
+patches; the app only checks the version at startup and refuses to start if it's behind
+(`MIGRATE_STRICT=false` downgrades that to a warning). In k8s an initContainer runs the
+apply step before the app container, so first boot creates the schema automatically.
+
+```bash
+python scripts/sqlite_db.py --status          # current vs shipped schema version
+python scripts/sqlite_db.py --migrate         # apply pending patches (deployer step)
+python scripts/sqlite_db.py --generate NAME   # dev: auto-write the next patch from a schema diff
+python scripts/sqlite_db.py --new NAME        # dev: scaffold an empty patch (content/DML)
+python scripts/sqlite_db.py --pull            # copy the live PVC DB to a local data/actions.db
+```
+
+Dev loop: change your local DB schema, run `--generate <name>`, review the emitted patch
+(additive changes are auto; drops/retypes are flagged for manual editing), commit it. The
+deployer applies it on the next rollout.
 
 ### Health & Monitoring
 
