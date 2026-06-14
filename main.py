@@ -45,39 +45,62 @@ logger = logging.getLogger(__name__)
 MAUTIC_BASE_URL = os.environ.get("MAUTIC_BASE_URL", "")
 MAUTIC_USERNAME = os.environ.get("MAUTIC_USERNAME", "")
 MAUTIC_PASSWORD = os.environ.get("MAUTIC_PASSWORD", "")
+# Target Mautic version (manual). Persisted in SQLite and exposed via get_mautic_version()
+# so future REST calls can branch on it. Empty = unknown (no version-specific branching).
+MAUTIC_VERSION = os.environ.get("MAUTIC_VERSION", "")
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "5/minute")
 ACTION_LOG_DB = os.environ.get("ACTION_LOG_DB", "/data/actions.db")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
-# Per-site registry. MAUXY_SITES is a JSON array, one object per calling site:
-#   [{"key": "<secret>", "site": "ludo", "segment": "ludo", "topic": "odoo"}, …]
-# The Bearer key identifies the site; its segment + quiz topic come from here, NOT
-# from the request body (so a caller can never target another site's segment).
+# Per-site registry + bot-defence question bank now live in SQLite (managed at runtime
+# via the /api/admin/* CRUD endpoints — no rebuild/redeploy to onboard a site or edit a
+# quiz). Both caches below are EMPTY at import and filled from the DB at startup by
+# reload_config(); the MAUXY_SITES env var and quiz_bank.json are kept ONLY as a one-time
+# seed source for an empty DB (see _seed_if_empty).
+#
+# A site record: {"site": ..., "segment": ..., "topic": ...} keyed by its Bearer key.
+# The key identifies the site; its segment + quiz topic come from here, NOT from the
+# request body (so a caller can never target another site's segment).
 _SITES_BY_KEY: dict[str, dict] = {}
-try:
-    for _s in json.loads(os.environ.get("MAUXY_SITES", "[]")):
-        if _s.get("key"):
-            _SITES_BY_KEY[_s["key"]] = {
-                "site": _s.get("site", "unknown"),
-                "segment": _s.get("segment", ""),
-                "topic": _s.get("topic", ""),
-            }
-except json.JSONDecodeError as _e:
-    logger.error("MAUXY_SITES is not valid JSON -- all sites disabled: %s", _e)
+# Question bank keyed by topic: {topic: [{"id", "q", "choices", "answer"}, ...]}.
+QUIZ_BANK: dict[str, list] = {}
 
 # Secret for signing bot-defence challenge tokens (stateless HMAC). Required for
 # the quiz to function; if unset, challenges cannot be issued or verified.
 CHALLENGE_SECRET = os.environ.get("CHALLENGE_SECRET", "")
 CHALLENGE_TTL = int(os.environ.get("CHALLENGE_TTL", "600"))  # seconds (10 min)
 
-# Bot-defence question bank, keyed by topic. Shipped as quiz_bank.json next to this
-# module; per-topic so each site asks audience-appropriate questions.
-QUIZ_BANK: dict[str, list] = {}
-try:
-    _bank_path = Path(__file__).with_name("quiz_bank.json")
-    QUIZ_BANK = {k: v for k, v in json.loads(_bank_path.read_text()).items() if isinstance(v, list)}
-except Exception as _e:  # missing/broken bank → no quizzes (challenges 503)
-    logger.error("quiz_bank.json could not be loaded: %s", _e)
+
+def _now() -> str:
+    """UTC timestamp as ISO-8601 string (shared by log + config writers)."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_seed_sites() -> list[dict]:
+    """Parse MAUXY_SITES (JSON array) into site dicts. Seed source for an empty DB only."""
+    sites: list[dict] = []
+    try:
+        for _s in json.loads(os.environ.get("MAUXY_SITES", "[]")):
+            if _s.get("key"):
+                sites.append({
+                    "key": _s["key"],
+                    "site": _s.get("site", "unknown"),
+                    "segment": _s.get("segment", ""),
+                    "topic": _s.get("topic", ""),
+                })
+    except json.JSONDecodeError as _e:
+        logger.error("MAUXY_SITES is not valid JSON -- cannot seed sites: %s", _e)
+    return sites
+
+
+def _parse_seed_quiz() -> dict:
+    """Parse quiz_bank.json into {topic: [questions]}. Seed source for an empty DB only."""
+    try:
+        _bank_path = Path(__file__).with_name("quiz_bank.json")
+        return {k: v for k, v in json.loads(_bank_path.read_text()).items() if isinstance(v, list)}
+    except Exception as _e:  # missing/broken bank → nothing to seed
+        logger.error("quiz_bank.json could not be loaded for seeding: %s", _e)
+        return {}
 
 # CORS origins (comma-separated)
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
@@ -88,8 +111,6 @@ if not MAUTIC_BASE_URL:
     logger.warning("MAUTIC_BASE_URL is not set -- all Mautic requests will fail")
 if not ALLOWED_ORIGINS:
     logger.warning("ALLOWED_ORIGINS is not set -- CORS will block all browser requests")
-if not _SITES_BY_KEY:
-    logger.warning("MAUXY_SITES is empty -- every subscribe/unsubscribe will 401")
 if not CHALLENGE_SECRET:
     logger.warning("CHALLENGE_SECRET is not set -- the bot-defence quiz is disabled")
 
@@ -97,6 +118,104 @@ if not CHALLENGE_SECRET:
 _mautic_health = {"ok": True, "checked_at": 0.0, "detail": "pending"}
 HEALTH_CHECK_CACHE_TTL = 30
 HEALTH_CHECK_TIMEOUT = 5.0
+
+# Cached identity of the target Mautic instance (the single mautic_instance row). The
+# version here is the one branch point for future version-specific REST calls.
+_mautic_instance = {"base_url": "", "version": "", "source": ""}
+
+
+def get_mautic_version() -> str:
+    """Single resolver for the active Mautic version. Empty string = unknown. Future
+    version-specific call sites branch on this; today nothing branches (no behavior
+    change while the version is unknown)."""
+    return _mautic_instance.get("version", "")
+
+
+# -- Runtime config: load / seed / refresh from SQLite -----------------------
+async def reload_config(db: aiosqlite.Connection):
+    """Reload the in-memory site registry + quiz bank from SQLite. Called at startup and
+    after every admin write so the request path always sees current config. Preserves the
+    legacy lookup shapes so _site_for_request / _verify_challenge / challenge are unchanged."""
+    global _SITES_BY_KEY, QUIZ_BANK
+    sites: dict[str, dict] = {}
+    async with db.execute("SELECT key, site, segment, topic FROM sites") as cur:
+        async for row in cur:
+            sites[row[0]] = {"site": row[1], "segment": row[2], "topic": row[3]}
+    bank: dict[str, list] = {}
+    async with db.execute("SELECT topic, qid, question, choices_json, answer FROM quiz_questions") as cur:
+        async for row in cur:
+            topic, qid, question, choices_json, answer = row
+            try:
+                choices = json.loads(choices_json)
+            except (json.JSONDecodeError, TypeError):
+                logger.error("QUIZ_BAD_CHOICES topic=%s qid=%s -- skipped", topic, qid)
+                continue
+            bank.setdefault(topic, []).append(
+                {"id": qid, "q": question, "choices": choices, "answer": answer})
+    _SITES_BY_KEY = sites
+    QUIZ_BANK = bank
+
+
+async def _seed_if_empty(db: aiosqlite.Connection):
+    """One-time seed for an empty DB: sites from MAUXY_SITES, quiz from quiz_bank.json.
+    Skipped once the tables hold rows (DB is then authoritative)."""
+    cur = await db.execute("SELECT COUNT(*) FROM sites")
+    if (await cur.fetchone())[0] == 0:
+        seed_sites = _parse_seed_sites()
+        for s in seed_sites:
+            await db.execute(
+                "INSERT OR IGNORE INTO sites (key, site, segment, topic, created_at) VALUES (?,?,?,?,?)",
+                (s["key"], s["site"], s["segment"], s["topic"], _now()),
+            )
+        if seed_sites:
+            logger.info("SEED_SITES_FROM_ENV count=%d", len(seed_sites))
+
+    cur = await db.execute("SELECT COUNT(*) FROM quiz_questions")
+    if (await cur.fetchone())[0] == 0:
+        seeded = 0
+        for topic, questions in _parse_seed_quiz().items():
+            for q in questions:
+                await db.execute(
+                    "INSERT OR IGNORE INTO quiz_questions (topic, qid, question, choices_json, answer) VALUES (?,?,?,?,?)",
+                    (topic, q.get("id"), q.get("q"), json.dumps(q.get("choices", [])), int(q.get("answer", -1))),
+                )
+                seeded += 1
+        if seeded:
+            logger.info("SEED_QUIZ_FROM_FILE count=%d", seeded)
+    await db.commit()
+
+
+async def _refresh_mautic_instance(db: aiosqlite.Connection):
+    """Refresh the in-memory Mautic instance cache from the single SQLite row."""
+    global _mautic_instance
+    cur = await db.execute("SELECT base_url, version, source FROM mautic_instance WHERE id = 1")
+    row = await cur.fetchone()
+    if row:
+        _mautic_instance = {"base_url": row[0] or "", "version": row[1] or "", "source": row[2] or ""}
+
+
+async def _init_mautic_instance(db: aiosqlite.Connection):
+    """Persist the target Mautic instance (manual). MAUTIC_VERSION env (when set) is
+    authoritative and upserts the row; when unset, an existing admin-set value is left
+    intact, and a missing row is created with an unknown version."""
+    if MAUTIC_VERSION:
+        await db.execute(
+            """INSERT INTO mautic_instance (id, base_url, version, source, updated_at)
+               VALUES (1, ?, ?, 'manual', ?)
+               ON CONFLICT(id) DO UPDATE SET base_url=excluded.base_url,
+                   version=excluded.version, source='manual', updated_at=excluded.updated_at""",
+            (MAUTIC_BASE_URL, MAUTIC_VERSION, _now()),
+        )
+        await db.commit()
+    else:
+        cur = await db.execute("SELECT 1 FROM mautic_instance WHERE id = 1")
+        if await cur.fetchone() is None:
+            await db.execute(
+                "INSERT INTO mautic_instance (id, base_url, version, source, updated_at) VALUES (1, ?, '', 'unset', ?)",
+                (MAUTIC_BASE_URL, _now()),
+            )
+            await db.commit()
+    await _refresh_mautic_instance(db)
 
 
 # -- SQLite lifespan --------------------------------------------------------
@@ -127,9 +246,49 @@ async def lifespan(app: FastAPI):
         await db.execute("ALTER TABLE action_log ADD COLUMN site TEXT NOT NULL DEFAULT ''")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_action ON action_log(action)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_site ON action_log(site)")
+
+    # Runtime config tables (created alongside action_log). sites holds the per-site
+    # Bearer key + segment + quiz topic; quiz_questions the bot-defence bank; the single
+    # mautic_instance row the target Mautic identity + version.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS sites (
+            key        TEXT PRIMARY KEY,
+            site       TEXT NOT NULL,
+            segment    TEXT NOT NULL,
+            topic      TEXT NOT NULL,
+            created_at TEXT
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS quiz_questions (
+            topic        TEXT    NOT NULL,
+            qid          TEXT    NOT NULL,
+            question     TEXT    NOT NULL,
+            choices_json TEXT    NOT NULL,
+            answer       INTEGER NOT NULL,
+            PRIMARY KEY (topic, qid)
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mautic_instance (
+            id         INTEGER PRIMARY KEY CHECK (id = 1),
+            base_url   TEXT,
+            version    TEXT,
+            source     TEXT,
+            updated_at TEXT
+        )
+    """)
     await db.commit()
+
+    # First-boot seed from env/file, then load everything into the in-memory caches.
+    await _seed_if_empty(db)
+    await _init_mautic_instance(db)
+    await reload_config(db)
     app.state.db = db
-    logger.info("ACTION_LOG_DB opened: %s", ACTION_LOG_DB)
+    logger.info("ACTION_LOG_DB opened: %s sites=%d topics=%d mautic_version=%s",
+                ACTION_LOG_DB, len(_SITES_BY_KEY), len(QUIZ_BANK), get_mautic_version() or "unknown")
+    if not _SITES_BY_KEY:
+        logger.warning("No sites configured (sites table empty) -- every subscribe/unsubscribe will 401")
     yield
     await db.close()
     logger.info("ACTION_LOG_DB closed")
@@ -156,6 +315,17 @@ def _site_for_request(request: Request) -> Optional[dict]:
     if not header.startswith("Bearer "):
         return None
     return _SITES_BY_KEY.get(header[len("Bearer "):])
+
+
+def _require_admin(request: Request) -> Optional[JSONResponse]:
+    """Gate admin endpoints behind Bearer ADMIN_API_KEY. Returns an error response if the
+    endpoint is disabled (no key set) or the caller is unauthorized, else None. Shared by
+    /api/actions and all /api/admin/* routes (constant-time key compare)."""
+    if not ADMIN_API_KEY:
+        return JSONResponse({"error": "admin endpoint disabled"}, status_code=403)
+    if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {ADMIN_API_KEY}"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return None
 
 
 def _sign_challenge(topic: str, qid: str, exp: int) -> str:
@@ -236,6 +406,33 @@ class UnsubscribeRequest(BaseModel):
     company_website: str = ""     # honeypot
 
 
+# -- Admin CRUD models ------------------------------------------------------
+class SiteCreate(BaseModel):
+    key: str                      # per-site Bearer key (stored plaintext in SQLite)
+    site: str
+    segment: str
+    topic: str
+
+
+class SiteUpdate(BaseModel):      # all optional — only provided fields are changed
+    site: Optional[str] = None
+    segment: Optional[str] = None
+    topic: Optional[str] = None
+
+
+class QuizQuestionModel(BaseModel):
+    topic: str
+    id: str
+    q: str
+    choices: list[str]
+    answer: int                   # 0-based index into choices
+
+
+class MauticInstanceUpdate(BaseModel):
+    version: str
+    base_url: Optional[str] = None   # defaults to MAUTIC_BASE_URL when omitted
+
+
 # -- Mautic connectivity check -----------------------------------------------
 async def _check_mautic() -> dict:
     """Check Mautic API reachability; cache result for HEALTH_CHECK_CACHE_TTL seconds."""
@@ -303,6 +500,7 @@ async def health_detail():
     return {
         "status": "ok" if result["ok"] else "degraded",
         "mautic": result["detail"],
+        "mautic_version": get_mautic_version() or "unknown",
         "cache_age_seconds": round(time.monotonic() - result["checked_at"], 1),
     }
 
@@ -518,10 +716,8 @@ async def get_actions(
     offset: int = Query(0, ge=0),
 ):
     """Admin endpoint: query the action log. Requires Bearer ADMIN_API_KEY."""
-    if not ADMIN_API_KEY:
-        return JSONResponse({"error": "admin endpoint disabled"}, status_code=403)
-    if request.headers.get("authorization", "") != f"Bearer {ADMIN_API_KEY}":
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if (err := _require_admin(request)) is not None:
+        return err
 
     clauses, params = [], []
     if email:
@@ -538,3 +734,183 @@ async def get_actions(
     db.row_factory = aiosqlite.Row
     rows = await db.execute_fetchall(query, params)
     return JSONResponse({"actions": [dict(r) for r in rows], "count": len(rows)})
+
+
+# -- Admin: site registry CRUD ----------------------------------------------
+# All require Bearer ADMIN_API_KEY. Every write calls reload_config() so the change is
+# live on the next request without a restart.
+@app.get("/api/admin/sites")
+async def admin_list_sites(request: Request):
+    """List all configured sites (incl. their Bearer keys — admin already holds the key)."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    db: aiosqlite.Connection = request.app.state.db
+    db.row_factory = aiosqlite.Row
+    rows = await db.execute_fetchall(
+        "SELECT key, site, segment, topic, created_at FROM sites ORDER BY site")
+    return JSONResponse({"sites": [dict(r) for r in rows], "count": len(rows)})
+
+
+@app.post("/api/admin/sites")
+async def admin_create_site(payload: SiteCreate, request: Request):
+    """Onboard a site. 409 if the key already exists."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    db: aiosqlite.Connection = request.app.state.db
+    try:
+        await db.execute(
+            "INSERT INTO sites (key, site, segment, topic, created_at) VALUES (?,?,?,?,?)",
+            (payload.key, payload.site, payload.segment, payload.topic, _now()),
+        )
+        await db.commit()
+    except aiosqlite.IntegrityError:
+        return JSONResponse({"error": "site key already exists"}, status_code=409)
+    await reload_config(db)
+    logger.info("ADMIN_SITE_CREATED site=%s", payload.site)
+    return JSONResponse({"status": "created", "site": payload.site}, status_code=201)
+
+
+@app.put("/api/admin/sites/{key}")
+async def admin_update_site(key: str, payload: SiteUpdate, request: Request):
+    """Update a site's site/segment/topic by its key. The key itself is immutable."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not fields:
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+    db: aiosqlite.Connection = request.app.state.db
+    sets = ", ".join(f"{col} = ?" for col in fields)   # cols are fixed model fields, not user input
+    cur = await db.execute(f"UPDATE sites SET {sets} WHERE key = ?", [*fields.values(), key])
+    await db.commit()
+    if cur.rowcount == 0:
+        return JSONResponse({"error": "site not found"}, status_code=404)
+    await reload_config(db)
+    return JSONResponse({"status": "updated"})
+
+
+@app.delete("/api/admin/sites/{key}")
+async def admin_delete_site(key: str, request: Request):
+    """Remove a site by its key."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    db: aiosqlite.Connection = request.app.state.db
+    cur = await db.execute("DELETE FROM sites WHERE key = ?", (key,))
+    await db.commit()
+    if cur.rowcount == 0:
+        return JSONResponse({"error": "site not found"}, status_code=404)
+    await reload_config(db)
+    return JSONResponse({"status": "deleted"})
+
+
+# -- Admin: quiz question CRUD ----------------------------------------------
+@app.get("/api/admin/quiz")
+async def admin_list_quiz(request: Request, topic: Optional[str] = Query(None)):
+    """List quiz questions, optionally filtered by topic."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    db: aiosqlite.Connection = request.app.state.db
+    db.row_factory = aiosqlite.Row
+    if topic:
+        rows = await db.execute_fetchall(
+            "SELECT topic, qid, question, choices_json, answer FROM quiz_questions WHERE topic = ? ORDER BY qid",
+            (topic,))
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT topic, qid, question, choices_json, answer FROM quiz_questions ORDER BY topic, qid")
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["choices"] = json.loads(d.pop("choices_json"))
+        except (json.JSONDecodeError, TypeError):
+            d.pop("choices_json", None)
+            d["choices"] = []
+        out.append(d)
+    return JSONResponse({"questions": out, "count": len(out)})
+
+
+@app.post("/api/admin/quiz")
+async def admin_create_quiz(payload: QuizQuestionModel, request: Request):
+    """Add a quiz question. 409 if (topic, id) already exists; 400 if answer out of range."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    if not 0 <= payload.answer < len(payload.choices):
+        return JSONResponse({"error": "answer index out of range"}, status_code=400)
+    db: aiosqlite.Connection = request.app.state.db
+    try:
+        await db.execute(
+            "INSERT INTO quiz_questions (topic, qid, question, choices_json, answer) VALUES (?,?,?,?,?)",
+            (payload.topic, payload.id, payload.q, json.dumps(payload.choices), payload.answer),
+        )
+        await db.commit()
+    except aiosqlite.IntegrityError:
+        return JSONResponse({"error": "question (topic, id) already exists"}, status_code=409)
+    await reload_config(db)
+    return JSONResponse({"status": "created"}, status_code=201)
+
+
+@app.put("/api/admin/quiz/{topic}/{qid}")
+async def admin_update_quiz(topic: str, qid: str, payload: QuizQuestionModel, request: Request):
+    """Replace a question's text/choices/answer. The (topic, qid) in the path locates it."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    if not 0 <= payload.answer < len(payload.choices):
+        return JSONResponse({"error": "answer index out of range"}, status_code=400)
+    db: aiosqlite.Connection = request.app.state.db
+    cur = await db.execute(
+        "UPDATE quiz_questions SET question = ?, choices_json = ?, answer = ? WHERE topic = ? AND qid = ?",
+        (payload.q, json.dumps(payload.choices), payload.answer, topic, qid),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return JSONResponse({"error": "question not found"}, status_code=404)
+    await reload_config(db)
+    return JSONResponse({"status": "updated"})
+
+
+@app.delete("/api/admin/quiz/{topic}/{qid}")
+async def admin_delete_quiz(topic: str, qid: str, request: Request):
+    """Remove a quiz question by (topic, qid)."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    db: aiosqlite.Connection = request.app.state.db
+    cur = await db.execute("DELETE FROM quiz_questions WHERE topic = ? AND qid = ?", (topic, qid))
+    await db.commit()
+    if cur.rowcount == 0:
+        return JSONResponse({"error": "question not found"}, status_code=404)
+    await reload_config(db)
+    return JSONResponse({"status": "deleted"})
+
+
+# -- Admin: Mautic instance (version) ---------------------------------------
+@app.get("/api/admin/mautic-instance")
+async def admin_get_mautic_instance(request: Request):
+    """Read the persisted target Mautic instance (base_url, version, source)."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    db: aiosqlite.Connection = request.app.state.db
+    db.row_factory = aiosqlite.Row
+    rows = await db.execute_fetchall(
+        "SELECT base_url, version, source, updated_at FROM mautic_instance WHERE id = 1")
+    return JSONResponse({"mautic_instance": dict(rows[0]) if rows else None})
+
+
+@app.put("/api/admin/mautic-instance")
+async def admin_set_mautic_instance(payload: MauticInstanceUpdate, request: Request):
+    """Manually set the target Mautic version (and optionally base_url). Updates the
+    resolver cache immediately so get_mautic_version() reflects the new value."""
+    if (err := _require_admin(request)) is not None:
+        return err
+    db: aiosqlite.Connection = request.app.state.db
+    base_url = payload.base_url if payload.base_url is not None else MAUTIC_BASE_URL
+    await db.execute(
+        """INSERT INTO mautic_instance (id, base_url, version, source, updated_at)
+           VALUES (1, ?, ?, 'manual', ?)
+           ON CONFLICT(id) DO UPDATE SET base_url=excluded.base_url,
+               version=excluded.version, source='manual', updated_at=excluded.updated_at""",
+        (base_url, payload.version, _now()),
+    )
+    await db.commit()
+    await _refresh_mautic_instance(db)
+    logger.info("ADMIN_MAUTIC_VERSION_SET version=%s", payload.version)
+    return JSONResponse({"status": "updated", "version": payload.version})
