@@ -154,9 +154,13 @@ authoritative after.
 
 ---
 
-## GET /health · GET /health/detail
+## GET /health · GET /ready · GET /health/detail
 
-Kubernetes probes, always HTTP 200. `/health` → `{"status":"ok","mautic":"reachable"}`
-(`mautic` may be `pending` / `HTTP <code>` / `connection error: …`). `/health/detail`
-adds `status: ok|degraded`, `mautic_version` (`unknown` if unset) and `cache_age_seconds`
-(Mautic check cached 30s).
+Kubernetes probes. `/health` is the **liveness** probe — always HTTP 200,
+`{"status":"ok"}`, independent of Mautic (so a downstream outage never restarts pods).
+`/ready` is the **readiness** probe — `{"status":"ready","mautic":"reachable"}` with
+HTTP 200 when Mautic is reachable, or `{"status":"degraded","mautic":"…"}` with HTTP 503
+when not (`mautic` may be `pending` / `HTTP <code>` / `connection error: …`). It reads a
+cached value (refreshed in the background, never a live call on the probe path).
+`/health/detail` (operator, always HTTP 200) adds `status: ok|degraded`, `mautic_version`
+(`unknown` if unset) and `cache_age_seconds` (Mautic check cached / refreshed every 120s).
