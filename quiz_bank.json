@@ -1,5 +1,36 @@
 {
-  "_comment": "Bot-defence question banks, keyed by topic. Each site (see MAUXY_SITES) maps to one topic. Questions are easy for a human in the site's audience, hard for a generic bot. 'answer' is the 0-based index of the correct choice. Add topics freely (e.g. 're-cloud'); a site with an unknown/empty topic cannot issue challenges.",
+  "_comment": "SEED ONLY. At runtime the quiz bank lives in SQLite (quiz_questions table) and is managed via /api/admin/quiz; this file only seeds an empty DB on first boot. Banks are keyed by topic; each site (see MAUXY_SITES / sites table) maps to one topic. Questions are easy for that site's human audience, hard for a generic bot. 'answer' is the 0-based index of the correct choice. German for the German sites; 'odoo' kept as a generic English fallback.",
+
+  "ludo": [
+    { "id": "was-ist-odoo", "q": "Was ist Odoo?", "choices": ["Eine Business-/ERP-Software", "Ein Videospiel", "Ein Webbrowser", "Eine Kaffeemaschine"], "answer": 0 },
+    { "id": "ludo-leistung", "q": "Wobei unterstützt Sie LUDO?", "choices": ["Bei der Migration auf Odoo", "Beim Pizzabacken", "Bei der Steuererklärung des Nachbarn", "Beim Möbelaufbau"], "answer": 0 },
+    { "id": "migration-bedeutung", "q": "Was bedeutet 'Migration' im IT-Kontext?", "choices": ["Umzug von Daten/System auf eine neue Plattform", "Der Vogelzug im Herbst", "Ein Tanzstil", "Eine Diätform"], "answer": 0 },
+    { "id": "odoo-sprache", "q": "In welcher Programmiersprache ist Odoo hauptsächlich geschrieben?", "choices": ["Python", "COBOL", "Swift", "Latein"], "answer": 0 },
+    { "id": "odoo-editionen", "q": "Welche zwei Editionen gibt es bei Odoo?", "choices": ["Community & Enterprise", "Bronze & Gold", "Lite & Pro", "Tag & Nacht"], "answer": 0 },
+    { "id": "erp-bedeutung", "q": "Wofür steht die Abkürzung 'ERP'?", "choices": ["Enterprise Resource Planning", "Extra Rapid Pizza", "Elektronisches Routing-Protokoll", "Einfaches Reparatur-Programm"], "answer": 0 },
+    { "id": "migration-ziel", "q": "Worauf migriert LUDO Ihr bestehendes System typischerweise?", "choices": ["Auf Odoo bzw. eine neuere Odoo-Version", "Auf einen Faxserver", "Auf eine Diskette", "Auf einen anderen Planeten"], "answer": 0 }
+  ],
+
+  "simplify-erp": [
+    { "id": "angebot", "q": "Was bietet simplify-erp an?", "choices": ["Professionelle Odoo-Dienstleistungen & Entwicklung", "Pizzalieferung", "Autoreparaturen", "Reisebuchungen"], "answer": 0 },
+    { "id": "odoo-zweck", "q": "Odoo ist eine Software für…", "choices": ["Unternehmensverwaltung (ERP/CRM)", "Videobearbeitung", "Wetterforschung", "Musikstreaming"], "answer": 0 },
+    { "id": "echte-app", "q": "Welche dieser Odoo-Apps gibt es wirklich?", "choices": ["CRM", "Photoshop", "Spotify", "Minesweeper"], "answer": 0 },
+    { "id": "community-lizenz", "q": "Die Odoo Community Edition ist…", "choices": ["Open Source", "Nur Hardware", "Ein Mobile Game", "Closed Source"], "answer": 0 },
+    { "id": "erp-bedeutung", "q": "Wofür steht das 'ERP' in Odoos Kategorie?", "choices": ["Enterprise Resource Planning", "Easy Repair Program", "Electronic Routing Protocol", "Extra Rapid Pizza"], "answer": 0 },
+    { "id": "odoo-sprache", "q": "In welcher Sprache wird Odoo hauptsächlich entwickelt?", "choices": ["Python", "Rust", "COBOL", "Swift"], "answer": 0 },
+    { "id": "consultant", "q": "Was macht ein Odoo-Consultant?", "choices": ["Berät und passt Odoo für Unternehmen an", "Backt Brot", "Repariert Fahrräder", "Komponiert Musik"], "answer": 0 }
+  ],
+
+  "re-cloud": [
+    { "id": "was-ist-recloud", "q": "Was beschreibt 're-cloud' am besten?", "choices": ["Ein Cloud-Betriebssystem / eine Cloud-Plattform", "Ein Wetterdienst für Wolken", "Ein Gartenschlauch", "Ein Brettspiel"], "answer": 0 },
+    { "id": "cloud-bedeutung", "q": "Was bedeutet 'Cloud' in der IT?", "choices": ["Bereitstellung von IT-Ressourcen über das Internet", "Eine echte Regenwolke", "Ein anderes Wort für Festplatte", "Ein Smartphone-Modell"], "answer": 0 },
+    { "id": "cloud-vorteil", "q": "Was ist ein typischer Vorteil von Cloud-Diensten?", "choices": ["Skalierbarkeit und Zugriff von überall", "Man braucht kein Internet", "Daten verschwinden automatisch", "Es wird kein Strom benötigt"], "answer": 0 },
+    { "id": "saas", "q": "Wofür steht die Abkürzung 'SaaS'?", "choices": ["Software as a Service", "Sausage and Salad", "Secure Automatic Server", "System and Storage"], "answer": 0 },
+    { "id": "datenspeicher", "q": "Wo werden Daten in der Cloud gespeichert?", "choices": ["In entfernten Rechenzentren", "Im Inneren der Tastatur", "Auf dem Mond", "In der Mikrowelle"], "answer": 0 },
+    { "id": "betriebssystem", "q": "Was ist ein Betriebssystem?", "choices": ["Software, die Hardware und Programme verwaltet", "Eine Tabellenkalkulation", "Ein Druckerkabel", "Ein USB-Stick"], "answer": 0 },
+    { "id": "abrechnung", "q": "Cloud-Ressourcen werden meist abgerechnet…", "choices": ["Nutzungsbasiert (pay as you go)", "Pro Mondphase", "Nach Körpergröße", "Gar nicht"], "answer": 0 }
+  ],
+
   "odoo": [
     { "id": "what-is-odoo", "q": "What kind of software is Odoo?", "choices": ["A business / ERP suite", "A video game", "A web browser", "A coffee machine"], "answer": 0 },
     { "id": "editions", "q": "Which two editions does Odoo come in?", "choices": ["Community & Enterprise", "Bronze & Gold", "Lite & Pro", "Home & Away"], "answer": 0 },

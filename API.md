@@ -124,8 +124,38 @@ Query the action log. Admin-only, `Authorization: Bearer <ADMIN_API_KEY>`. `403`
 
 ---
 
+## Admin: runtime config CRUD
+
+The site registry, the quiz bank and the target Mautic version live in SQLite and are
+managed at runtime — no rebuild/redeploy. All endpoints require
+`Authorization: Bearer <ADMIN_API_KEY>` (`403` if unset, `401` if wrong). Every write
+reloads the in-memory caches, so changes are live on the next request. `MAUXY_SITES` /
+`quiz_bank.json` only **seed an empty DB** on first boot; the DB is authoritative after.
+
+### Sites — `/api/admin/sites`
+- `GET` — list all sites (`{key, site, segment, topic, created_at}`).
+- `POST` `{key, site, segment, topic}` — onboard a site. `201` / `409` if key exists.
+- `PUT /api/admin/sites/{key}` `{site?, segment?, topic?}` — update; `404` if unknown.
+- `DELETE /api/admin/sites/{key}` — remove; `404` if unknown.
+
+> Site Bearer keys are stored in **plaintext** in SQLite (deliberate; TLS + RBAC on the
+> PVC are the controls). `GET` returns them so an admin can manage them.
+
+### Quiz — `/api/admin/quiz`
+- `GET [?topic=…]` — list questions (`{topic, qid, question, choices, answer}`).
+- `POST` `{topic, id, q, choices, answer}` — add. `201` / `409` if `(topic,id)` exists / `400` if `answer` out of range.
+- `PUT /api/admin/quiz/{topic}/{qid}` `{topic, id, q, choices, answer}` — replace text/choices/answer; `404` if unknown.
+- `DELETE /api/admin/quiz/{topic}/{qid}` — remove; `404` if unknown.
+
+### Mautic instance — `/api/admin/mautic-instance`
+- `GET` — `{base_url, version, source, updated_at}` (source `manual`|`unset`).
+- `PUT` `{version, base_url?}` — set the version manually (`source=manual`); takes effect immediately.
+
+---
+
 ## GET /health · GET /health/detail
 
 Kubernetes probes, always HTTP 200. `/health` → `{"status":"ok","mautic":"reachable"}`
 (`mautic` may be `pending` / `HTTP <code>` / `connection error: …`). `/health/detail`
-adds `status: ok|degraded` and `cache_age_seconds` (Mautic check cached 30s).
+adds `status: ok|degraded`, `mautic_version` (`unknown` if unset) and `cache_age_seconds`
+(Mautic check cached 30s).
