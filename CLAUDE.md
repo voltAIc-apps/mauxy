@@ -47,8 +47,9 @@ All application logic is in `main.py` (single-file service):
 - **POST /api/unsubscribe** -- per-site-keyed + quiz-gated. Adds the contact to the DNC list. Contact-specific outcomes always 200 (no enumeration); 503 when Mautic is unreachable.
 - **GET /api/actions** -- admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Rows carry `action` + `site`. Supports `email`, `result`, `limit`, `offset`. Disabled (403) if `ADMIN_API_KEY` unset.
 - **/api/admin/sites, /api/admin/quiz, /api/admin/mautic-instance** -- admin CRUD (Bearer `ADMIN_API_KEY`) over the SQLite-backed site registry, quiz bank and target Mautic version. Every write reloads the in-memory caches (`reload_config`), so changes are live without a restart. See `API.md`.
-- **GET /health** -- k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
-- **GET /health/detail** -- richer health endpoint showing degraded/ok status, Mautic detail, `mautic_version`, and cache age. Always returns HTTP 200.
+- **GET /health** -- k8s **liveness** probe. Mautic-independent (always HTTP 200, body `{"status":"ok"}`): only confirms the app/event loop is alive, so a Mautic outage never restarts healthy pods.
+- **GET /ready** -- k8s **readiness** probe. Reflects cached Mautic connectivity (no live call — the cache is refreshed by a background task); 200 when reachable, 503 when not, so a pod whose Mautic is down is pulled from the Service.
+- **GET /health/detail** -- richer health endpoint for operators showing degraded/ok status, Mautic detail, `mautic_version`, and cache age (reads the same background-refreshed cache). Always returns HTTP 200.
 - CORS is restricted to `ALLOWED_ORIGINS` (must be set via env).
 
 ### Persistent storage

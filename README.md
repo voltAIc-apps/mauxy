@@ -190,7 +190,8 @@ Two health endpoints are available. Both always return HTTP 200.
 
 | Endpoint | Purpose | Example response |
 |---|---|---|
-| `GET /health` | Kubernetes liveness/readiness probe. Also useful for a quick manual check. | `{"status": "ok", "mautic": "reachable"}` |
+| `GET /health` | Kubernetes **liveness** probe (Mautic-independent — only checks the app is alive). | `{"status": "ok"}` |
+| `GET /ready` | Kubernetes **readiness** probe. 200 when Mautic is reachable, 503 when not (cached; no live call on the probe path). | `{"status": "ready", "mautic": "reachable"}` |
 | `GET /health/detail` | Richer status with `ok` / `degraded` indicator, target Mautic version and cache age. | `{"status": "ok", "mautic": "reachable", "mautic_version": "5.1.1", "cache_age_seconds": 12.3}` |
 
 If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests will return `503 {"status": "service_unavailable"}` and the attempt is logged as `mautic_unreachable`.

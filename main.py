@@ -19,6 +19,7 @@ Two protections sit in front of every (un)subscribe:
 import os
 import time
 import json
+import asyncio
 import hmac
 import random
 import hashlib
@@ -114,8 +115,8 @@ if not CHALLENGE_SECRET:
 
 # -- Mautic health check cache -----------------------------------------------
 _mautic_health = {"ok": True, "checked_at": 0.0, "detail": "pending"}
-HEALTH_CHECK_CACHE_TTL = 30
-HEALTH_CHECK_TIMEOUT = 5.0
+HEALTH_CHECK_CACHE_TTL = 120
+HEALTH_CHECK_TIMEOUT = 15.0
 
 # Cached identity of the target Mautic instance (the single mautic_instance row). The
 # version here is the one branch point for future version-specific REST calls.
@@ -234,7 +235,20 @@ async def lifespan(app: FastAPI):
                 ACTION_LOG_DB, len(_SITES_BY_KEY), len(QUIZ_BANK), get_mautic_version() or "unknown")
     if not _SITES_BY_KEY:
         logger.warning("No sites configured (sites table empty) -- every subscribe/unsubscribe will 401")
+
+    # Refresh the Mautic connectivity cache off the request path so probes never block on
+    # a live Mautic call. /ready (readiness) and /health/detail read this cache; liveness
+    # (/health) ignores Mautic entirely.
+    refresher = asyncio.create_task(_health_refresh_loop())
+    app.state.health_refresher = refresher
+
     yield
+
+    refresher.cancel()
+    try:
+        await refresher
+    except asyncio.CancelledError:
+        pass
     await db.close()
     logger.info("ACTION_LOG_DB closed")
 
@@ -407,6 +421,17 @@ async def _check_mautic() -> dict:
     return _mautic_health
 
 
+async def _health_refresh_loop():
+    """Background task: refresh _mautic_health every HEALTH_CHECK_CACHE_TTL seconds so the
+    readiness probe reads a warm in-memory cache instead of triggering a live Mautic call."""
+    while True:
+        try:
+            await _check_mautic()
+        except Exception as exc:  # never let the loop die
+            logger.error("HEALTH_REFRESH_ERROR error=%s", exc)
+        await asyncio.sleep(HEALTH_CHECK_CACHE_TTL)
+
+
 async def _resolve_segment_id(client: httpx.AsyncClient, alias: str, auth) -> tuple:
     """Resolve a Mautic segment by alias, creating it if absent.
     Returns (segment_id, None) on success or (None, error_detail) on failure."""
@@ -433,15 +458,27 @@ async def _resolve_segment_id(client: httpx.AsyncClient, alias: str, auth) -> tu
 # -- Routes -----------------------------------------------------------------
 @app.get("/health")
 async def health():
-    """k8s liveness / readiness probe — always 200, includes Mautic status."""
-    result = await _check_mautic()
-    return {"status": "ok", "mautic": result["detail"]}
+    """k8s liveness probe — confirms the app/event loop is alive. Independent of Mautic
+    on purpose: a downstream outage must not restart otherwise-healthy pods."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    """k8s readiness probe — reflects cached Mautic connectivity (no live call; the cache is
+    refreshed by the background _health_refresh_loop). 503 when Mautic is unreachable so the
+    pod is pulled from the Service."""
+    ok = _mautic_health["ok"]
+    return JSONResponse(
+        {"status": "ready" if ok else "degraded", "mautic": _mautic_health["detail"]},
+        status_code=200 if ok else 503,
+    )
 
 
 @app.get("/health/detail")
 async def health_detail():
     """Richer health endpoint for operator debugging."""
-    result = await _check_mautic()
+    result = _mautic_health
     return {
         "status": "ok" if result["ok"] else "degraded",
         "mautic": result["detail"],
