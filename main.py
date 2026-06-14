@@ -25,7 +25,6 @@ import hashlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import aiosqlite
@@ -37,6 +36,8 @@ import httpx
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+
+import db_migrate  # schema patches live in db-patches/; this is the shared runner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,12 +52,15 @@ MAUTIC_VERSION = os.environ.get("MAUTIC_VERSION", "")
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "5/minute")
 ACTION_LOG_DB = os.environ.get("ACTION_LOG_DB", "/data/actions.db")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+# If true (default), refuse to start when the DB is behind the shipped schema patches.
+# Set false to start with a warning instead (e.g. transient dev convenience).
+MIGRATE_STRICT = os.environ.get("MIGRATE_STRICT", "true").lower() not in ("false", "0", "no")
 
 # Per-site registry + bot-defence question bank now live in SQLite (managed at runtime
 # via the /api/admin/* CRUD endpoints — no rebuild/redeploy to onboard a site or edit a
 # quiz). Both caches below are EMPTY at import and filled from the DB at startup by
-# reload_config(); the MAUXY_SITES env var and quiz_bank.json are kept ONLY as a one-time
-# seed source for an empty DB (see _seed_if_empty).
+# reload_config(). Sites are seeded from MAUXY_SITES (secret keys) on first boot; quiz
+# content is seeded by a SQL patch (db-patches/0002_seed_quiz.sql).
 #
 # A site record: {"site": ..., "segment": ..., "topic": ...} keyed by its Bearer key.
 # The key identifies the site; its segment + quiz topic come from here, NOT from the
@@ -93,14 +97,8 @@ def _parse_seed_sites() -> list[dict]:
     return sites
 
 
-def _parse_seed_quiz() -> dict:
-    """Parse quiz_bank.json into {topic: [questions]}. Seed source for an empty DB only."""
-    try:
-        _bank_path = Path(__file__).with_name("quiz_bank.json")
-        return {k: v for k, v in json.loads(_bank_path.read_text()).items() if isinstance(v, list)}
-    except Exception as _e:  # missing/broken bank → nothing to seed
-        logger.error("quiz_bank.json could not be loaded for seeding: %s", _e)
-        return {}
+# Quiz content is seeded by a SQL patch (db-patches/0002_seed_quiz.sql), not from a JSON
+# file -- single source of truth, no drift. Runtime edits go through the admin CRUD.
 
 # CORS origins (comma-separated)
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
@@ -157,8 +155,9 @@ async def reload_config(db: aiosqlite.Connection):
 
 
 async def _seed_if_empty(db: aiosqlite.Connection):
-    """One-time seed for an empty DB: sites from MAUXY_SITES, quiz from quiz_bank.json.
-    Skipped once the tables hold rows (DB is then authoritative)."""
+    """One-time seed of the sites table from MAUXY_SITES (secret keys, kept out of git).
+    Skipped once the table holds rows (DB is then authoritative). Quiz content is seeded by
+    a SQL patch, not here."""
     cur = await db.execute("SELECT COUNT(*) FROM sites")
     if (await cur.fetchone())[0] == 0:
         seed_sites = _parse_seed_sites()
@@ -169,19 +168,6 @@ async def _seed_if_empty(db: aiosqlite.Connection):
             )
         if seed_sites:
             logger.info("SEED_SITES_FROM_ENV count=%d", len(seed_sites))
-
-    cur = await db.execute("SELECT COUNT(*) FROM quiz_questions")
-    if (await cur.fetchone())[0] == 0:
-        seeded = 0
-        for topic, questions in _parse_seed_quiz().items():
-            for q in questions:
-                await db.execute(
-                    "INSERT OR IGNORE INTO quiz_questions (topic, qid, question, choices_json, answer) VALUES (?,?,?,?,?)",
-                    (topic, q.get("id"), q.get("q"), json.dumps(q.get("choices", [])), int(q.get("answer", -1))),
-                )
-                seeded += 1
-        if seeded:
-            logger.info("SEED_QUIZ_FROM_FILE count=%d", seeded)
     await db.commit()
 
 
@@ -221,66 +207,25 @@ async def _init_mautic_instance(db: aiosqlite.Connection):
 # -- SQLite lifespan --------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Schema is owned by db-patches/ and applied by the deployer (sqlite_db.py --migrate).
+    # At startup we only CHECK the version: if the DB is behind the shipped patches we refuse
+    # to start (MIGRATE_STRICT=false downgrades to a warning) so a half-migrated DB never
+    # serves traffic. check() does not create the DB file.
+    state = db_migrate.check(ACTION_LOG_DB)
+    if state["pending"]:
+        missing = ", ".join(f"{v:04d}_{n}" for v, n in state["pending"])
+        msg = (f"DB schema behind shipped patches (current={state['current']} "
+               f"latest={state['latest']}); pending: {missing}. Run "
+               f"`python scripts/sqlite_db.py --migrate`.")
+        if MIGRATE_STRICT:
+            logger.error("MIGRATION_REQUIRED %s", msg)
+            raise RuntimeError(msg)
+        logger.warning("MIGRATION_PENDING (MIGRATE_STRICT=false) %s", msg)
+
     db = await aiosqlite.connect(ACTION_LOG_DB)
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS action_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts          TEXT    NOT NULL,
-            email       TEXT    NOT NULL,
-            source_origin TEXT,
-            source_ip   TEXT,
-            result      TEXT    NOT NULL,
-            contact_id  TEXT,
-            error_detail TEXT
-        )
-    """)
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_email ON action_log(email)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_result ON action_log(result)")
-    # Idempotent column migrations (SQLite has no ADD COLUMN IF NOT EXISTS). `action`
-    # distinguishes subscribe|unsubscribe; `site` records the calling site.
-    cur = await db.execute("PRAGMA table_info(action_log)")
-    cols = [row[1] for row in await cur.fetchall()]
-    if "action" not in cols:
-        await db.execute("ALTER TABLE action_log ADD COLUMN action TEXT NOT NULL DEFAULT 'unsubscribe'")
-    if "site" not in cols:
-        await db.execute("ALTER TABLE action_log ADD COLUMN site TEXT NOT NULL DEFAULT ''")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_action ON action_log(action)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_site ON action_log(site)")
 
-    # Runtime config tables (created alongside action_log). sites holds the per-site
-    # Bearer key + segment + quiz topic; quiz_questions the bot-defence bank; the single
-    # mautic_instance row the target Mautic identity + version.
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS sites (
-            key        TEXT PRIMARY KEY,
-            site       TEXT NOT NULL,
-            segment    TEXT NOT NULL,
-            topic      TEXT NOT NULL,
-            created_at TEXT
-        )
-    """)
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS quiz_questions (
-            topic        TEXT    NOT NULL,
-            qid          TEXT    NOT NULL,
-            question     TEXT    NOT NULL,
-            choices_json TEXT    NOT NULL,
-            answer       INTEGER NOT NULL,
-            PRIMARY KEY (topic, qid)
-        )
-    """)
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS mautic_instance (
-            id         INTEGER PRIMARY KEY CHECK (id = 1),
-            base_url   TEXT,
-            version    TEXT,
-            source     TEXT,
-            updated_at TEXT
-        )
-    """)
-    await db.commit()
-
-    # First-boot seed from env/file, then load everything into the in-memory caches.
+    # First-boot seed of sites from MAUXY_SITES (secret keys -- never committed to a patch),
+    # then load everything into the in-memory caches. Quiz content is seeded by a SQL patch.
     await _seed_if_empty(db)
     await _init_mautic_instance(db)
     await reload_config(db)

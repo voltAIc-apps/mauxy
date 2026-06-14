@@ -34,8 +34,9 @@ python scripts/deploy.py --build --secret --apply   # full deploy
 `--build` uses `REGISTRY_URL/USER/PASSWORD`; `--secret` writes the runtime config
 (Mautic creds, `ALLOWED_ORIGINS`, `MAUXY_SITES`, `CHALLENGE_SECRET`, …) into the
 `mauxy-credentials` Secret that the deployment is `envFrom`. `k8s/secret.yaml` is a
-documentation template only. The Dockerfile must ship both `main.py` and
-`quiz_bank.json`.
+documentation template only. The Dockerfile ships `main.py`, `db_migrate.py`, the
+`db-patches/` schema patches and `scripts/{deploy,sqlite_db}.py`. The deployment runs
+`sqlite_db.py --migrate` as an initContainer to apply pending patches before the app starts.
 
 ## Architecture
 
@@ -52,14 +53,24 @@ All application logic is in `main.py` (single-file service):
 
 ### Persistent storage
 
-SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/data/actions.db`). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment. Tables (all created idempotently in `lifespan`):
+SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/data/actions.db`). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment. Tables:
 
 - `action_log` -- every (un)subscribe attempt (`action`, `site`, `result`, …).
-- `sites` -- per-site Bearer key registry (`key`, `site`, `segment`, `topic`). **Source of truth at runtime.** Keys stored **plaintext** (deliberate decision; TLS + PVC RBAC are the controls — not hashed). Seeded from `MAUXY_SITES` on first boot.
-- `quiz_questions` -- bot-defence bank (`topic`, `qid`, `question`, `choices_json`, `answer`). Seeded from `quiz_bank.json` on first boot.
+- `sites` -- per-site Bearer key registry (`key`, `site`, `segment`, `topic`). **Source of truth at runtime.** Keys stored **plaintext** (deliberate decision; TLS + PVC RBAC are the controls — not hashed). Seeded from `MAUXY_SITES` on first boot (secret keys — kept out of git).
+- `quiz_questions` -- bot-defence bank (`topic`, `qid`, `question`, `choices_json`, `answer`). Seeded by the SQL patch `db-patches/0002_seed_quiz.sql`.
 - `mautic_instance` -- single row holding the target Mautic `base_url` + `version` (manual; `MAUTIC_VERSION` env or admin endpoint). `get_mautic_version()` is the resolver for future version-specific Mautic calls.
+- `schema_migrations` -- which numbered patches have been applied (managed by `db_migrate.py`).
 
-`MAUXY_SITES` and `quiz_bank.json` are **seed-only** (empty DB on first boot); the DB is authoritative thereafter. Onboard a site / edit a quiz at runtime via the admin CRUD — no redeploy.
+Onboard a site / edit a quiz at runtime via the admin CRUD — no redeploy.
+
+### Schema as a versioned artifact (db-patches/)
+
+The schema is **not** created at runtime. It is owned by integer-numbered SQL patches in `db-patches/` (`NNNN_name.sql`), committed to git. `db_migrate.py` is the shared runner (used by `main.py` startup + `scripts/sqlite_db.py`); `schema_migrations` records what's applied so patches run once, in order, idempotently.
+
+- **Deployers apply** patches: `python scripts/sqlite_db.py --migrate` (k8s does this in an initContainer before the app container). First boot creates the schema this way.
+- **App startup only checks**: if the DB is behind the shipped patches it refuses to start (set `MIGRATE_STRICT=false` to warn instead).
+- **Dev workflow**: change the dev DB schema, then `python scripts/sqlite_db.py --generate <name>` auto-writes the next patch from a schema diff (additive changes auto; drops/retypes flagged for manual edit). `--new <name>` scaffolds an empty patch (for content/DML, e.g. new quiz questions); `--status` shows current vs shipped; `--dump-quiz` emits the quiz as `INSERT OR IGNORE` SQL.
+- The local `data/actions.db` is git-ignored (`*.db`); rebuild it from patches with `--migrate`, or pull the live one with `--pull`.
 
 ## Environment Variables
 
@@ -69,6 +80,7 @@ SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/data/actions.db`). 
 | `MAUTIC_USERNAME` | Mautic API basic auth user |
 | `MAUTIC_PASSWORD` | Mautic API basic auth password |
 | `MAUTIC_VERSION` | Target Mautic version (manual). Seeds the `mautic_instance` row; surfaced in `/health/detail`. Empty = unknown |
+| `MIGRATE_STRICT` | Refuse to start if the DB is behind `db-patches/` (default true; false = warn only) |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
 | `MAUXY_SITES` | JSON array of `{key, site, segment, topic}` — **seed-only** for the `sites` table (runtime source: SQLite) |
 | `CHALLENGE_SECRET` | HMAC secret for bot-defence challenge tokens (quiz disabled if unset) |

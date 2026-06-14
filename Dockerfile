@@ -5,8 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
-COPY quiz_bank.json .
+COPY main.py db_migrate.py ./
+COPY db-patches/ ./db-patches/
+COPY scripts/deploy.py scripts/sqlite_db.py ./scripts/
 
 RUN mkdir -p /data
 

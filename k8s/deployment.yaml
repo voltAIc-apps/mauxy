@@ -26,6 +26,19 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: mauxy-data
+      # Deployer's schema-apply step: run pending db-patches/ against the PVC DB before the
+      # app starts. Idempotent (records applied patches); first boot creates the schema.
+      initContainers:
+        - name: migrate
+          image: ${DEPLOY_IMAGE}
+          imagePullPolicy: Always
+          command: ["python", "scripts/sqlite_db.py", "--migrate"]
+          envFrom:
+            - secretRef:
+                name: mauxy-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /data
       containers:
         - name: mauxy
           image: ${DEPLOY_IMAGE}
