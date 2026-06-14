@@ -33,8 +33,9 @@ python scripts/deploy.py --build --secret --apply   # full deploy
 
 `--build` uses `REGISTRY_URL/USER/PASSWORD`; `--secret` writes the runtime config
 (Mautic creds, `ALLOWED_ORIGINS`, `MAUXY_SITES`, `CHALLENGE_SECRET`, …) into the
-`mauxy-credentials` Secret that the deployment is `envFrom`. `k8s/secret.yaml` is a
-documentation template only. The Dockerfile ships `main.py`, `db_migrate.py`, the
+`mauxy-credentials` Secret that the deployment is `envFrom`. `k8s/secret.yaml.example`
+is a documentation template only — the `.example` suffix keeps it out of the `k8s/*.yaml`
+glob that `--apply` applies, so it can never clobber the real Secret. The Dockerfile ships `main.py`, `db_migrate.py`, the
 `db-patches/` schema patches and `scripts/{deploy,sqlite_db}.py`. The deployment runs
 `sqlite_db.py --migrate` as an initContainer to apply pending patches before the app starts.
 

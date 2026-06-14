@@ -114,6 +114,9 @@ def do_secret(variables: dict):
 def do_render(variables: dict, *, dry_run: bool, apply: bool):
     """Render k8s manifests, then write to k8s/rendered/ (and apply if asked)."""
     _require(variables, RENDER_REQUIRED, "apply" if apply else "render")
+    # Only *.yaml is applied. The Secret is synced separately by --secret (do_secret);
+    # the documentation template lives at k8s/secret.yaml.example (note the .example
+    # suffix) so it is NOT matched here and can never clobber the real mauxy-credentials.
     templates = sorted((PROJECT_ROOT / "k8s").glob("*.yaml"))
     if not templates:
         _die("No .yaml templates found in k8s/")
