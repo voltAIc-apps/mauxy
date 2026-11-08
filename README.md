@@ -150,9 +150,16 @@ kubectl create secret generic mauxy-credentials \
 | `MAUTIC_USERNAME` | Mautic API basic-auth user | *(required)* |
 | `MAUTIC_PASSWORD` | Mautic API basic-auth password | *(required)* |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins | *(required)* |
-| `RATE_LIMIT` | slowapi rate-limit string | `5/minute` |
+| `RATE_LIMIT` | slowapi rate-limit for subscribe/unsubscribe | `5/minute` |
+| `CONFIRM_RATE_LIMIT` | slowapi rate-limit for `/api/confirm` | `30/minute` |
 | `ACTION_LOG_DB` | SQLite database path | `/data/actions.db` |
 | `ADMIN_API_KEY` | Bearer token for `/api/actions` | *(disabled if unset)* |
+| `CONFIRM_TOKEN_SECRET` | HMAC secret signing the double opt-in token | *(required for subscribe)* |
+| `CONFIRM_TOKEN_MAX_AGE` | Token lifetime in seconds | `86400` |
+| `PUBLIC_BASE_URL` | Public URL of this mauxy (used inside the Mautic email link) | *(required for subscribe)* |
+| `PUBLIC_WEBSITE_BASE_URL` | Public URL of the website; confirm redirects here | *(required for subscribe)* |
+| `MAUTIC_CONFIRM_EMAIL_ID_EN` | Numeric Mautic email template ID, English | *(required for subscribe)* |
+| `MAUTIC_CONFIRM_EMAIL_ID_DE` | Numeric Mautic email template ID, German | *(required for subscribe)* |
 
 ### Health & Monitoring
 
@@ -231,12 +238,50 @@ curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
 
 ---
 
+## Newsletter Signup (Double Opt-In)
+
+`POST /api/subscribe` accepts a JSON signup from a browser (see
+`website/src/config/api.ts` for the canonical payload) and starts a double
+opt-in flow:
+
+1. Search the contact in Mautic. If it already carries the
+   `newsletter_confirmed` tag, return `200 {"status": "already_subscribed"}`.
+   If the email is on the DNC list, return
+   `200 {"status": "already_unsubscribed_no_email_sent"}`.
+2. Sign a self-contained 24h token (`email`, `locale`) with `itsdangerous`.
+3. Upsert the contact with the token + source metadata and tag
+   `newsletter_pending`.
+4. Trigger Mautic's transactional send for the locale-specific email template
+   (`MAUTIC_CONFIRM_EMAIL_ID_{EN,DE}`). The template resolves the confirm link
+   via `{contactfield=confirmation_token}`.
+5. Respond `200 {"status": "pending_confirmation"}`.
+
+`GET /api/confirm?token=...` validates the token, flips the contact from
+`newsletter_pending` to `newsletter_confirmed`, clears the token field, and
+issues a `302` redirect to `${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed`
+(or `.../newsletter/confirm-error?reason=...` on failure).
+
+### One-time Mautic setup
+
+Before deploying, create the following in Mautic (or the endpoints will fail):
+
+- **Custom contact fields** (text unless noted):
+  - `confirmation_token`
+  - `newsletter_locale`
+  - `newsletter_source`
+  - `newsletter_consented_at` (date/time)
+  - `newsletter_page_url`
+- **Tags**: `newsletter_pending`, `newsletter_confirmed`
+- **Two email templates**, one per locale (EN / DE). Each confirm button must
+  link to:
+  `${PUBLIC_BASE_URL}/api/confirm?token={contactfield=confirmation_token}`.
+  Record the numeric IDs in `MAUTIC_CONFIRM_EMAIL_ID_EN` and
+  `MAUTIC_CONFIRM_EMAIL_ID_DE`.
+
 ## Roadmap
 
 Planned features (see [issue #8](https://github.com/voltAIc-apps/mauxy/issues/8)):
 
-- `POST /api/subscribe` -- newsletter subscription with multi-site support
-- GDPR double opt-in via confirmation emails
 - Per-site segment mapping via `sites.yaml`
 - Per-site unsubscribe (segment removal instead of global DNC)
 
