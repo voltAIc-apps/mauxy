@@ -1,25 +1,36 @@
 """
-mauxy -- centralized newsletter subscription + unsubscribe proxy for Mautic.
-Manages contacts, segments, and DNC lists via Basic Auth -- credentials never
-exposed to browser.
+mauxy -- centralized newsletter subscription + unsubscribe proxy for Mautic, and the public
+consent service of the simplify-erp.de Selbst-Check (selfcheck_api.py, flywheel SPEC-020).
+Manages contacts, segments, and DNC lists via Basic Auth -- credentials never exposed to browser.
+
+Double opt-in (newsletter and self-check) keeps ALL pending data server-side in SQLite and
+changes nothing in Mautic before the confirmation link is clicked; confirmation tokens are
+signed, time-limited and single-use (stored as SHA-256, compared in constant time).
 """
-import os
-import time
+import hashlib
+import hmac
+import json
 import logging
+import os
+import secrets
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import aiosqlite
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
-import httpx
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+import mailer
+import selfcheck_api
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,15 +49,14 @@ CONFIRM_TOKEN_SECRET = os.environ.get("CONFIRM_TOKEN_SECRET", "")
 CONFIRM_TOKEN_MAX_AGE = int(os.environ.get("CONFIRM_TOKEN_MAX_AGE", "86400"))  # 24h
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 PUBLIC_WEBSITE_BASE_URL = os.environ.get("PUBLIC_WEBSITE_BASE_URL", "").rstrip("/")
-MAUTIC_CONFIRM_EMAIL_ID_EN = os.environ.get("MAUTIC_CONFIRM_EMAIL_ID_EN", "")
-MAUTIC_CONFIRM_EMAIL_ID_DE = os.environ.get("MAUTIC_CONFIRM_EMAIL_ID_DE", "")
+# Unconfirmed newsletter requests are deleted after this many days (data minimisation)
+NEWSLETTER_PENDING_DAYS = int(os.environ.get("NEWSLETTER_PENDING_DAYS", "7"))
+# Max. DOI mails per address and 24h (stops mail-bombing a victim through the form)
+MAX_PENDING_PER_EMAIL = int(os.environ.get("MAX_PENDING_PER_EMAIL", "3"))
 
-# CORS origins (comma-separated)
-_raw_origins = os.environ.get(
-    "ALLOWED_ORIGINS",
-    "",
-)
-ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+# CORS origins (comma-separated). Also the allowlist for the newsletter page_url field.
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _raw_origins.split(",") if o.strip()]
 
 # -- Startup validation -------------------------------------------------------
 if not MAUTIC_BASE_URL:
@@ -57,14 +67,12 @@ if not CONFIRM_TOKEN_SECRET:
     logger.warning("CONFIRM_TOKEN_SECRET is not set -- newsletter subscribe + confirm will fail")
 if not PUBLIC_WEBSITE_BASE_URL:
     logger.warning("PUBLIC_WEBSITE_BASE_URL is not set -- confirm redirects will be broken")
-if not (MAUTIC_CONFIRM_EMAIL_ID_EN and MAUTIC_CONFIRM_EMAIL_ID_DE):
-    logger.warning(
-        "MAUTIC_CONFIRM_EMAIL_ID_{EN,DE} not both set -- subscribe will fail for missing locale"
-    )
+if not PUBLIC_BASE_URL:
+    logger.warning("PUBLIC_BASE_URL is not set -- confirmation links in mails will be broken")
 
 # -- Token signer -----------------------------------------------------------
-# Self-contained signed token for /api/confirm. Payload: {email, locale}.
-# Expiry enforced via max_age on loads(); no server-side state needed.
+# Signed token for /api/confirm. Payload: {"p": <pending id>} only -- no e-mail address in the
+# URL. The pending row (SQLite) holds the data; its SHA-256 token hash makes the token single-use.
 _token_signer: URLSafeTimedSerializer | None = (
     URLSafeTimedSerializer(CONFIRM_TOKEN_SECRET, salt="mauxy-newsletter-confirm")
     if CONFIRM_TOKEN_SECRET
@@ -77,10 +85,28 @@ HEALTH_CHECK_CACHE_TTL = 30
 HEALTH_CHECK_TIMEOUT = 5.0
 
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def tokens_equal(stored_hash: str | None, token: str) -> bool:
+    """Constant-time comparison of the stored hash with the presented token."""
+    return bool(stored_hash) and hmac.compare_digest(stored_hash, token_hash(token))
+
+
+def admin_ok(request: Request) -> bool:
+    """Bearer ADMIN_API_KEY, constant-time compare (False when the key is unset)."""
+    if not ADMIN_API_KEY:
+        return False
+    return hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {ADMIN_API_KEY}")
+
+
 # -- SQLite lifespan --------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    db = await aiosqlite.connect(ACTION_LOG_DB)
+async def init_db(db: aiosqlite.Connection) -> None:
     await db.execute("""
         CREATE TABLE IF NOT EXISTS action_log (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,13 +119,39 @@ async def lifespan(app: FastAPI):
             error_detail TEXT
         )
     """)
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_action_log_email ON action_log(email)"
-    )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_action_log_result ON action_log(result)"
-    )
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_email ON action_log(email)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_result ON action_log(result)")
+    # Newsletter DOI: pending signups live here, NOT in Mautic, until confirmed.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS newsletter_pending (
+            id          TEXT PRIMARY KEY,
+            token_hash  TEXT,
+            email       TEXT NOT NULL,
+            locale      TEXT NOT NULL,
+            source      TEXT NOT NULL,
+            page_url    TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            used_at     TEXT
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_nl_pending_email ON newsletter_pending(email)")
+    await selfcheck_api.init_db(db)
     await db.commit()
+
+
+async def purge_newsletter_pending(db: aiosqlite.Connection) -> None:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=NEWSLETTER_PENDING_DAYS)).isoformat(timespec="seconds")
+    await db.execute("DELETE FROM newsletter_pending WHERE created_at < ?", (cutoff,))
+    await db.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db = await aiosqlite.connect(ACTION_LOG_DB)
+    db.row_factory = aiosqlite.Row
+    await init_db(db)
+    await purge_newsletter_pending(db)
+    await selfcheck_api.purge(db)
     app.state.db = db
     logger.info("ACTION_LOG_DB opened: %s", ACTION_LOG_DB)
     yield
@@ -150,6 +202,11 @@ async def log_action(
         logger.error("ACTION_LOG_WRITE_ERROR error=%s", exc)
 
 
+def page_url_allowed(url: str) -> bool:
+    """page_url must belong to one of the allowed site origins (no foreign URLs stored)."""
+    return any(url == o or url.startswith(o + "/") or url.startswith(o + "?") for o in ALLOWED_ORIGINS)
+
+
 # -- Models -----------------------------------------------------------------
 class UnsubscribeRequest(BaseModel):
     email: EmailStr
@@ -161,20 +218,43 @@ class SubscribeRequest(BaseModel):
 
     email: EmailStr
     locale: Literal["en", "de"]
-    source: str
-    consent: bool
-    consented_at: str = Field(alias="consentedAt")
-    page_url: str = Field(alias="pageUrl")
+    source: str = Field(min_length=1, max_length=40, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    # Consent must be explicitly true (False -> 422)
+    consent: Literal[True]
+    # Client clock is not evidence: accepted for compatibility, length-limited, never stored.
+    # The consent timestamp is the server time of the confirmation click.
+    consented_at: Optional[str] = Field(default=None, alias="consentedAt", max_length=40)
+    page_url: str = Field(alias="pageUrl", min_length=1, max_length=500)
     # Honeypot -- must be empty. Any non-empty value silently succeeds.
-    company_website: str | None = None
+    company_website: str | None = Field(default=None, max_length=200)
+
+    @field_validator("page_url")
+    @classmethod
+    def _page_url_on_site(cls, v: str) -> str:
+        if not page_url_allowed(v):
+            raise ValueError("page_url must be on an allowed site origin")
+        return v
 
 
 class SubscribeResponse(BaseModel):
-    status: Literal[
-        "pending_confirmation",
-        "already_subscribed",
-        "already_unsubscribed_no_email_sent",
-    ]
+    # Uniform for every contact-specific outcome (no enumeration).
+    status: Literal["pending_confirmation"]
+
+
+NEWSLETTER_DOI = {
+    "de": (
+        "Bitte bestätigen Sie Ihre Newsletter-Anmeldung",
+        "Guten Tag,\n\nbitte bestätigen Sie Ihre Anmeldung zum Newsletter mit diesem Link:\n{link}\n\n"
+        "Der Link gilt {hours} Stunden und kann einmal verwendet werden. Wenn Sie sich nicht angemeldet haben, "
+        "ignorieren Sie diese Mail; wir speichern dann nichts weiter und löschen die Anfrage nach {days} Tagen.\n",
+    ),
+    "en": (
+        "Please confirm your newsletter subscription",
+        "Hello,\n\nplease confirm your newsletter subscription with this link:\n{link}\n\n"
+        "The link is valid for {hours} hours and can be used once. If you did not subscribe, simply ignore "
+        "this mail; we then store nothing further and delete the request after {days} days.\n",
+    ),
+}
 
 
 # -- Mautic connectivity check -----------------------------------------------
@@ -296,21 +376,6 @@ async def _upsert_contact(
     return resp.status_code, resp.json().get("contact")
 
 
-async def _send_mautic_email(client: httpx.AsyncClient, email_id: str, contact_id: str) -> int:
-    """
-    Trigger a transactional send of Mautic email template to a specific contact.
-    Returns HTTP status code.
-    """
-    auth = (MAUTIC_USERNAME, MAUTIC_PASSWORD)
-    resp = await client.post(
-        f"{MAUTIC_BASE_URL}/api/emails/{email_id}/contact/{contact_id}/send",
-        auth=auth,
-    )
-    return resp.status_code
-
-
-def _confirm_email_id(locale: str) -> str:
-    return MAUTIC_CONFIRM_EMAIL_ID_DE if locale == "de" else MAUTIC_CONFIRM_EMAIL_ID_EN
 
 
 def _website_redirect(locale: str, path: str, reason: str | None = None) -> str:
@@ -319,6 +384,178 @@ def _website_redirect(locale: str, path: str, reason: str | None = None) -> str:
     base = PUBLIC_WEBSITE_BASE_URL or ""
     qs = f"?reason={reason}" if reason else ""
     return f"{base}/{lang}/{path}{qs}"
+
+
+PENDING = {"status": "pending_confirmation"}
+
+
+@app.post("/api/subscribe")
+@limiter.limit(RATE_LIMIT)
+async def subscribe(payload: SubscribeRequest, request: Request):
+    """
+    Newsletter signup with double opt-in. Nothing is written to Mautic here.
+
+    Flow:
+      1. Honeypot filled -> uniform 200, nothing stored.
+      2. Search Mautic (read only). Unreachable / 5xx -> 503 (not contact-specific).
+      3. Already confirmed or DNC -> uniform 200, no mail (no enumeration: the HTTP answer is
+         the same for every address).
+      4. More than MAX_PENDING_PER_EMAIL requests for this address in 24h -> uniform 200, no mail.
+      5. Store the request in SQLite (newsletter_pending) with the SHA-256 of a signed token
+         ({"p": id}, CONFIRM_TOKEN_MAX_AGE) and mail the confirmation link via SMTP.
+      6. Uniform 200 {"status": "pending_confirmation"}.
+    """
+    email = payload.email.lower()
+    db: aiosqlite.Connection = request.app.state.db
+
+    if payload.company_website:
+        await log_action(request, email, "subscribe_honeypot")
+        return JSONResponse(PENDING)
+
+    if not _token_signer or not PUBLIC_BASE_URL or not mailer.configured():
+        await log_action(request, email, "subscribe_error", error_detail="doi_not_configured")
+        return JSONResponse({"status": "service_unavailable"}, status_code=503)
+
+    logger.info("SUBSCRIBE_START locale=%s source=%s", payload.locale, payload.source)
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            status, contact = await _search_mautic_contact(client, email)
+        except httpx.RequestError as exc:
+            logger.error("SUBSCRIBE_MAUTIC_UNREACHABLE error=%s", exc)
+            await log_action(request, email, "mautic_unreachable", error_detail=f"httpx_error: {exc}")
+            return JSONResponse({"status": "service_unavailable"}, status_code=503)
+    if status != 200:
+        await log_action(request, email, "mautic_error", error_detail=f"search_status={status}")
+        return JSONResponse({"status": "service_unavailable"}, status_code=503)
+
+    if contact and _contact_has_tag(contact, "newsletter_confirmed"):
+        await log_action(request, email, "subscribe_already_confirmed", contact_id=str(contact["id"]))
+        return JSONResponse(PENDING)
+    if contact and _contact_is_dnc(contact):
+        await log_action(request, email, "subscribe_dnc_skip", contact_id=str(contact["id"]))
+        return JSONResponse(PENDING)
+
+    await purge_newsletter_pending(db)
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+    async with db.execute(
+        "SELECT COUNT(*) FROM newsletter_pending WHERE email = ? AND created_at >= ?", (email, since)
+    ) as cur:
+        (recent,) = await cur.fetchone()
+    if recent >= MAX_PENDING_PER_EMAIL:
+        await log_action(request, email, "subscribe_throttled")
+        return JSONResponse(PENDING)
+
+    pid = secrets.token_urlsafe(16)
+    token = _token_signer.dumps({"p": pid})
+    await db.execute(
+        "INSERT INTO newsletter_pending (id, token_hash, email, locale, source, page_url, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (pid, token_hash(token), email, payload.locale, payload.source, payload.page_url, now_iso()),
+    )
+    await db.commit()
+
+    subject, body = NEWSLETTER_DOI[payload.locale]
+    ok = await mailer.send(email, subject, body.format(
+        link=f"{PUBLIC_BASE_URL}/api/confirm?token={token}",
+        hours=CONFIRM_TOKEN_MAX_AGE // 3600, days=NEWSLETTER_PENDING_DAYS,
+    ))
+    if not ok:
+        await db.execute("DELETE FROM newsletter_pending WHERE id = ?", (pid,))
+        await db.commit()
+        await log_action(request, email, "subscribe_error", error_detail="mail_failed")
+        return JSONResponse({"status": "service_unavailable"}, status_code=503)
+
+    await log_action(request, email, "subscribe_ok")
+    return JSONResponse(PENDING)
+
+
+@app.get("/api/confirm")
+@limiter.limit(CONFIRM_RATE_LIMIT)
+async def confirm(request: Request, token: str = Query(..., min_length=1, max_length=1000)):
+    """
+    Double opt-in landing (link in the DOI mail). Always a 302 back to the website.
+
+    Checks, in order: signature + max_age; pending row exists; stored token hash equals the
+    presented token (constant time) and is unused (single use); contact not DNC in Mautic.
+    Only then the contact is created/updated in Mautic (tag newsletter_confirmed, server-side
+    consent timestamp) and the token is burnt.
+    """
+    db: aiosqlite.Connection = request.app.state.db
+
+    def fail(locale: str, reason: str) -> RedirectResponse:
+        return RedirectResponse(_website_redirect(locale, "newsletter/confirm-error", reason=reason), status_code=302)
+
+    if not _token_signer or not PUBLIC_WEBSITE_BASE_URL:
+        logger.error("CONFIRM_MISCONFIGURED signer=%s site=%s", bool(_token_signer), bool(PUBLIC_WEBSITE_BASE_URL))
+        return fail("en", "server_misconfigured")
+
+    try:
+        data = _token_signer.loads(token, max_age=CONFIRM_TOKEN_MAX_AGE)
+    except SignatureExpired:
+        await log_action(request, "", "confirm_expired")
+        return fail("en", "invalid_or_expired")
+    except BadSignature:
+        await log_action(request, "", "confirm_invalid")
+        return fail("en", "invalid_or_expired")
+
+    pid = data.get("p") if isinstance(data, dict) else None
+    row = None
+    if isinstance(pid, str):
+        async with db.execute("SELECT * FROM newsletter_pending WHERE id = ?", (pid,)) as cur:
+            row = await cur.fetchone()
+    # Legacy tokens ({email, locale}) and replays both end here: no pending row / hash burnt.
+    if row is None or row["used_at"] or not tokens_equal(row["token_hash"], token):
+        await log_action(request, row["email"] if row else "", "confirm_invalid", error_detail="not_pending_or_used")
+        return fail(row["locale"] if row else "en", "invalid_or_expired")
+
+    email, locale = row["email"], row["locale"]
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            status, contact = await _search_mautic_contact(client, email)
+        except httpx.RequestError as exc:
+            await log_action(request, email, "confirm_error", error_detail=f"search_httpx: {exc}")
+            return fail(locale, "service_unavailable")  # token stays valid, user can retry
+        if status != 200:
+            await log_action(request, email, "confirm_error", error_detail=f"search_status={status}")
+            return fail(locale, "service_unavailable")
+
+        async def burn():
+            await db.execute("UPDATE newsletter_pending SET used_at = ?, token_hash = NULL WHERE id = ?", (now_iso(), pid))
+            await db.commit()
+
+        if contact and _contact_is_dnc(contact):
+            await burn()
+            await log_action(request, email, "confirm_dnc_refused", contact_id=str(contact["id"]))
+            return fail(locale, "unavailable")
+
+        existing_id = str(contact["id"]) if contact else None
+        try:
+            upsert_status, upserted = await _upsert_contact(
+                client,
+                existing_id=existing_id,
+                email=email,
+                payload_fields={
+                    "confirmation_token": "",  # clears tokens of the pre-2026-11 flow
+                    "newsletter_locale": locale,
+                    "newsletter_source": row["source"],
+                    "newsletter_consented_at": now_iso(),
+                    "newsletter_page_url": row["page_url"],
+                },
+                add_tags=["newsletter_confirmed"],
+                remove_tags=["newsletter_pending"],
+            )
+        except httpx.RequestError as exc:
+            await log_action(request, email, "confirm_error", contact_id=existing_id, error_detail=f"upsert_httpx: {exc}")
+            return fail(locale, "service_unavailable")
+        if not upserted:
+            await log_action(request, email, "confirm_error", contact_id=existing_id, error_detail=f"upsert_status={upsert_status}")
+            return fail(locale, "service_unavailable")
+
+    await burn()
+    await log_action(request, email, "confirm_ok", contact_id=str(upserted.get("id") or existing_id or ""))
+    return RedirectResponse(_website_redirect(locale, "newsletter/confirmed"), status_code=302)
 
 
 # -- Routes -----------------------------------------------------------------
@@ -435,231 +672,6 @@ async def unsubscribe(payload: UnsubscribeRequest, request: Request):
     return JSONResponse({"status": "ok"})
 
 
-@app.post("/api/subscribe")
-@limiter.limit(RATE_LIMIT)
-async def subscribe(payload: SubscribeRequest, request: Request):
-    """
-    Newsletter signup with Mautic double opt-in.
-
-    Flow:
-      1. Honeypot filled? -> 200 pending_confirmation, no Mautic call.
-      2. Search Mautic for contact.
-         - Mautic unreachable -> 503.
-         - Already confirmed (tag 'newsletter_confirmed') -> 200 already_subscribed.
-         - DNC on email channel -> 200 already_unsubscribed_no_email_sent.
-      3. Sign a self-contained confirmation token (email+locale, 24h).
-      4. Upsert contact with token, locale, source, consented_at, page_url
-         + tag 'newsletter_pending'.
-      5. Trigger Mautic transactional send of the locale-specific confirm email.
-      6. 200 pending_confirmation.
-    """
-    email = payload.email.lower()
-
-    # Honeypot -- FE already short-circuits; this is defence in depth.
-    if payload.company_website:
-        await log_action(request, email, "subscribe_honeypot")
-        return JSONResponse({"status": "pending_confirmation"})
-
-    if not _token_signer:
-        await log_action(request, email, "subscribe_error", error_detail="token_secret_unset")
-        return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-    confirm_email_id = _confirm_email_id(payload.locale)
-    if not confirm_email_id:
-        await log_action(
-            request, email, "subscribe_error",
-            error_detail=f"confirm_email_id_missing locale={payload.locale}",
-        )
-        return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-    logger.info("SUBSCRIBE_START email=%s locale=%s source=%s", email, payload.locale, payload.source)
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # Phase 1: find existing contact (if any)
-        try:
-            status, contact = await _search_mautic_contact(client, email)
-        except httpx.RequestError as exc:
-            logger.error("SUBSCRIBE_MAUTIC_UNREACHABLE email=%s error=%s", email, exc)
-            await log_action(request, email, "mautic_unreachable", error_detail=f"httpx_error: {exc}")
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        if status != 200:
-            logger.warning("SUBSCRIBE_SEARCH_FAILED email=%s status=%s", email, status)
-            await log_action(request, email, "mautic_error", error_detail=f"search_status={status}")
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        # Phase 2: short-circuit on already-confirmed / DNC
-        existing_id: str | None = None
-        if contact:
-            existing_id = str(contact["id"])
-            if _contact_has_tag(contact, "newsletter_confirmed"):
-                logger.info("SUBSCRIBE_ALREADY_CONFIRMED email=%s contact_id=%s", email, existing_id)
-                await log_action(request, email, "subscribe_already_confirmed", contact_id=existing_id)
-                return JSONResponse({"status": "already_subscribed"})
-            if _contact_is_dnc(contact):
-                logger.info("SUBSCRIBE_DNC_SKIP email=%s contact_id=%s", email, existing_id)
-                await log_action(request, email, "subscribe_dnc_skip", contact_id=existing_id)
-                return JSONResponse({"status": "already_unsubscribed_no_email_sent"})
-
-        # Phase 3: sign token + upsert contact
-        token = _token_signer.dumps({"email": email, "locale": payload.locale})
-        fields = {
-            "confirmation_token": token,
-            "newsletter_locale": payload.locale,
-            "newsletter_source": payload.source,
-            "newsletter_consented_at": payload.consented_at,
-            "newsletter_page_url": payload.page_url,
-        }
-
-        try:
-            upsert_status, upsert_contact = await _upsert_contact(
-                client,
-                existing_id=existing_id,
-                email=email,
-                payload_fields=fields,
-                add_tags=["newsletter_pending"],
-            )
-        except httpx.RequestError as exc:
-            logger.error("SUBSCRIBE_UPSERT_UNREACHABLE email=%s error=%s", email, exc)
-            await log_action(request, email, "mautic_unreachable", error_detail=f"upsert_httpx: {exc}")
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        if not upsert_contact:
-            logger.error("SUBSCRIBE_UPSERT_FAILED email=%s status=%s", email, upsert_status)
-            await log_action(
-                request, email, "subscribe_error",
-                error_detail=f"upsert_status={upsert_status}",
-            )
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        contact_id = str(upsert_contact.get("id") or existing_id or "")
-        logger.info("SUBSCRIBE_UPSERT_OK email=%s contact_id=%s", email, contact_id)
-
-        # Phase 4: send confirm email via Mautic
-        try:
-            send_status = await _send_mautic_email(client, confirm_email_id, contact_id)
-        except httpx.RequestError as exc:
-            logger.error("SUBSCRIBE_SEND_UNREACHABLE email=%s error=%s", email, exc)
-            await log_action(
-                request, email, "subscribe_error",
-                contact_id=contact_id, error_detail=f"send_httpx: {exc}",
-            )
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        if send_status not in (200, 201):
-            logger.error(
-                "SUBSCRIBE_SEND_FAILED email=%s contact_id=%s status=%s",
-                email, contact_id, send_status,
-            )
-            await log_action(
-                request, email, "subscribe_error",
-                contact_id=contact_id, error_detail=f"send_status={send_status}",
-            )
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-    await log_action(request, email, "subscribe_ok", contact_id=contact_id)
-    return JSONResponse({"status": "pending_confirmation"})
-
-
-@app.get("/api/confirm")
-@limiter.limit(CONFIRM_RATE_LIMIT)
-async def confirm(request: Request, token: str = Query(..., min_length=1)):
-    """
-    Double opt-in landing. Validates signed token, flips Mautic tags, and
-    redirects the browser back to the website's confirmed or error page.
-    The user navigates here by clicking the confirm link in the Mautic email,
-    so response is always a 302 redirect (not JSON).
-    """
-    if not _token_signer or not PUBLIC_WEBSITE_BASE_URL:
-        logger.error("CONFIRM_MISCONFIGURED signer=%s site=%s", bool(_token_signer), bool(PUBLIC_WEBSITE_BASE_URL))
-        return RedirectResponse(
-            _website_redirect("en", "newsletter/confirm-error", reason="server_misconfigured"),
-            status_code=302,
-        )
-
-    try:
-        data = _token_signer.loads(token, max_age=CONFIRM_TOKEN_MAX_AGE)
-    except SignatureExpired:
-        await log_action(request, "", "confirm_expired")
-        return RedirectResponse(
-            _website_redirect("en", "newsletter/confirm-error", reason="invalid_or_expired"),
-            status_code=302,
-        )
-    except BadSignature:
-        await log_action(request, "", "confirm_invalid")
-        return RedirectResponse(
-            _website_redirect("en", "newsletter/confirm-error", reason="invalid_or_expired"),
-            status_code=302,
-        )
-
-    email = (data.get("email") or "").lower()
-    locale = data.get("locale") if data.get("locale") in ("en", "de") else "en"
-    if not email:
-        await log_action(request, "", "confirm_invalid", error_detail="no_email_in_token")
-        return RedirectResponse(
-            _website_redirect(locale, "newsletter/confirm-error", reason="invalid_or_expired"),
-            status_code=302,
-        )
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            status, contact = await _search_mautic_contact(client, email)
-        except httpx.RequestError as exc:
-            logger.error("CONFIRM_MAUTIC_UNREACHABLE email=%s error=%s", email, exc)
-            await log_action(request, email, "confirm_error", error_detail=f"search_httpx: {exc}")
-            return RedirectResponse(
-                _website_redirect(locale, "newsletter/confirm-error", reason="service_unavailable"),
-                status_code=302,
-            )
-
-        if status != 200 or contact is None:
-            await log_action(
-                request, email, "confirm_contact_missing",
-                error_detail=f"search_status={status}",
-            )
-            return RedirectResponse(
-                _website_redirect(locale, "newsletter/confirm-error", reason="contact_missing"),
-                status_code=302,
-            )
-
-        contact_id = str(contact["id"])
-
-        try:
-            upsert_status, _ = await _upsert_contact(
-                client,
-                existing_id=contact_id,
-                email=email,
-                payload_fields={"confirmation_token": ""},
-                add_tags=["newsletter_confirmed"],
-                remove_tags=["newsletter_pending"],
-            )
-        except httpx.RequestError as exc:
-            logger.error("CONFIRM_UPSERT_UNREACHABLE email=%s error=%s", email, exc)
-            await log_action(
-                request, email, "confirm_error",
-                contact_id=contact_id, error_detail=f"upsert_httpx: {exc}",
-            )
-            return RedirectResponse(
-                _website_redirect(locale, "newsletter/confirm-error", reason="service_unavailable"),
-                status_code=302,
-            )
-
-        if upsert_status not in (200, 201):
-            await log_action(
-                request, email, "confirm_error",
-                contact_id=contact_id, error_detail=f"upsert_status={upsert_status}",
-            )
-            return RedirectResponse(
-                _website_redirect(locale, "newsletter/confirm-error", reason="service_unavailable"),
-                status_code=302,
-            )
-
-    await log_action(request, email, "confirm_ok", contact_id=contact_id)
-    return RedirectResponse(
-        _website_redirect(locale, "newsletter/confirmed"),
-        status_code=302,
-    )
-
 
 @app.get("/api/actions")
 async def get_actions(
@@ -673,8 +685,7 @@ async def get_actions(
     if not ADMIN_API_KEY:
         return JSONResponse({"error": "admin endpoint disabled"}, status_code=403)
 
-    auth_header = request.headers.get("authorization", "")
-    if auth_header != f"Bearer {ADMIN_API_KEY}":
+    if not admin_ok(request):  # constant-time compare
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     clauses = []
@@ -695,3 +706,25 @@ async def get_actions(
     rows = await db.execute_fetchall(query, params)
     actions = [dict(row) for row in rows]
     return JSONResponse({"actions": actions, "count": len(actions)})
+
+
+# -- Self-check (flywheel SPEC-020) -----------------------------------------------
+app.include_router(selfcheck_api.build_router(
+    limiter=limiter,
+    search_contact=_search_mautic_contact,
+    contact_is_dnc=_contact_is_dnc,
+    upsert_contact=_upsert_contact,
+    admin_ok=admin_ok,
+    mautic=lambda: (MAUTIC_BASE_URL, MAUTIC_USERNAME, MAUTIC_PASSWORD),
+))
+
+
+class _NoEventAccessLog(logging.Filter):
+    """The anonymous counter endpoint must not leave IPs in the access log (SPEC-020 s.6)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        return not any(isinstance(a, str) and a.startswith(selfcheck_api.EVENT_PATH) for a in args)
+
+
+logging.getLogger("uvicorn.access").addFilter(_NoEventAccessLog())

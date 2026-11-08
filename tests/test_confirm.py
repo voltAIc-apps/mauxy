@@ -1,117 +1,95 @@
 """
-GET /api/confirm -- covers happy path (302 to confirmed, tags flipped),
-invalid token, expired token, and missing Mautic contact.
+GET /api/confirm -- newsletter DOI landing after the 2026-11-08 security review.
+
+T-SEC-010 .. T-SEC-016 (fix 2: token replay / consent bypass):
+  signature + max_age AND a matching, unused pending record (SHA-256, constant-time compare)
+  AND the address is not DNC; the token is burnt on success (single use).
 """
 import re
-from urllib.parse import urlparse, parse_qs
 
 import httpx
-import pytest
 import respx
 
+import main as mauxy_main
 
 CONTACTS_URL = re.compile(r"https://mautic\.test/api/contacts(\?.*)?$")
-EDIT_CONTACT_URL_RE = re.compile(r"https://mautic\.test/api/contacts/\d+/edit$")
+NEW_URL = "https://mautic.test/api/contacts/new"
+ERR = "https://site.test/en/newsletter/confirm-error"
+OK = "https://site.test/en/newsletter/confirmed"
 
 
-def _contact(contact_id, email, *, tags=None):
-    return {
-        "contacts": {
-            str(contact_id): {
-                "id": contact_id,
-                "fields": {"core": {"email": {"value": email}}},
-                "tags": [{"tag": t} for t in (tags or [])],
-                "doNotContact": [],
-            }
-        }
-    }
+def subscribe(client, respx_mock, outbox, email="alice@example.com"):
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(200, json={"contacts": {}, "total": 0}))
+    resp = client.post("/api/subscribe", json={
+        "email": email, "locale": "en", "source": "footer", "consent": True, "pageUrl": "https://site.test/en/",
+    })
+    assert resp.status_code == 200
+    return re.search(r"token=(\S+)", outbox[-1]["body"]).group(1)
 
 
-@respx.mock
-def test_confirm_happy_path_redirects_to_confirmed(respx_mock, client, token_signer):
-    token = token_signer.dumps({"email": "alice@example.com", "locale": "de"})
-    respx_mock.get(CONTACTS_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json=_contact(42, "alice@example.com", tags=["newsletter_pending"]),
-        )
-    )
-    edit_route = respx_mock.patch("https://mautic.test/api/contacts/42/edit").mock(
-        return_value=httpx.Response(200, json={"contact": {"id": 42}})
-    )
-
-    resp = client.get("/api/confirm", params={"token": token}, follow_redirects=False)
-
-    assert resp.status_code == 302
-    assert resp.headers["location"] == "https://site.test/de/newsletter/confirmed"
-    assert edit_route.called
-
-    # Verify tag flip body
-    body = edit_route.calls.last.request.read().decode()
-    assert '"newsletter_confirmed"' in body
-    assert '"-newsletter_pending"' in body
-    # Token field should be cleared
-    assert '"confirmation_token": ""' in body or '"confirmation_token":""' in body
+def confirm(client, token):
+    return client.get(f"/api/confirm?token={token}", follow_redirects=False)
 
 
 @respx.mock
-def test_confirm_bad_signature_redirects_to_error(respx_mock, client):
-    # Touch the routes so that if code attempts Mautic, we'd notice
+def test_t_sec_010_happy_path_creates_confirmed_contact(respx_mock, client, outbox):
+    token = subscribe(client, respx_mock, outbox)
+    create = respx_mock.post(NEW_URL).mock(return_value=httpx.Response(201, json={"contact": {"id": 7}}))
+    resp = confirm(client, token)
+    assert resp.status_code == 302 and resp.headers["location"] == OK
+    body = create.calls.last.request.read().decode()
+    assert '"newsletter_confirmed"' in body and '"-newsletter_pending"' in body
+
+
+@respx.mock
+def test_t_sec_011_token_is_single_use(respx_mock, client, outbox):
+    token = subscribe(client, respx_mock, outbox)
+    create = respx_mock.post(NEW_URL).mock(return_value=httpx.Response(201, json={"contact": {"id": 7}}))
+    assert confirm(client, token).headers["location"] == OK
+    second = confirm(client, token)
+    assert second.headers["location"].startswith(ERR)
+    assert create.call_count == 1  # replay changed nothing
+
+
+@respx.mock(assert_all_called=False)
+def test_t_sec_012_validly_signed_token_without_pending_record_is_refused(respx_mock, client, token_signer):
     search = respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(200, json={"contacts": {}}))
-
-    resp = client.get("/api/confirm", params={"token": "totally-invalid"}, follow_redirects=False)
-
-    assert resp.status_code == 302
-    location = urlparse(resp.headers["location"])
-    assert location.netloc == "site.test"
-    assert location.path == "/en/newsletter/confirm-error"
-    assert parse_qs(location.query).get("reason") == ["invalid_or_expired"]
+    legacy = token_signer.dumps({"email": "alice@example.com", "locale": "en"})  # old flow / forged
+    unknown = token_signer.dumps({"p": "does-not-exist"})
+    for t in (legacy, unknown):
+        assert confirm(client, t).headers["location"].startswith(ERR)
     assert not search.called
 
 
 @respx.mock
-def test_confirm_expired_token_redirects_to_error(respx_mock, client, token_signer, monkeypatch):
-    """Simulate expiry by setting CONFIRM_TOKEN_MAX_AGE=0 at the module level."""
-    import main as mauxy_main
-    monkeypatch.setattr(mauxy_main, "CONFIRM_TOKEN_MAX_AGE", 0)
-
-    token = token_signer.dumps({"email": "alice@example.com", "locale": "en"})
-
-    # Sleep ~1s so ts < now - max_age (0) is trivially true
-    import time
-    time.sleep(1.1)
-
-    resp = client.get("/api/confirm", params={"token": token}, follow_redirects=False)
-
-    assert resp.status_code == 302
-    location = urlparse(resp.headers["location"])
-    assert location.path == "/en/newsletter/confirm-error"
-    assert parse_qs(location.query).get("reason") == ["invalid_or_expired"]
+def test_t_sec_013_dnc_at_confirmation_is_refused_and_burnt(respx_mock, client, outbox):
+    token = subscribe(client, respx_mock, outbox)
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(200, json={"contacts": {"5": {
+        "id": 5, "fields": {"core": {"email": {"value": "alice@example.com"}}},
+        "doNotContact": [{"channel": "email", "reason": 1}], "tags": []}}}))
+    edit = respx_mock.patch(re.compile(r".*/contacts/5/edit$")).mock(return_value=httpx.Response(200, json={"contact": {"id": 5}}))
+    assert confirm(client, token).headers["location"].startswith(ERR)
+    assert not edit.called
 
 
-@respx.mock
-def test_confirm_contact_missing_redirects_to_error(respx_mock, client, token_signer):
-    token = token_signer.dumps({"email": "ghost@example.com", "locale": "en"})
-    respx_mock.get(CONTACTS_URL).mock(
-        return_value=httpx.Response(200, json={"contacts": {}, "total": 0})
-    )
-
-    resp = client.get("/api/confirm", params={"token": token}, follow_redirects=False)
-
-    assert resp.status_code == 302
-    location = urlparse(resp.headers["location"])
-    assert location.path == "/en/newsletter/confirm-error"
-    assert parse_qs(location.query).get("reason") == ["contact_missing"]
+@respx.mock(assert_all_called=False)
+def test_t_sec_014_bad_signature_and_expired(respx_mock, client, outbox, monkeypatch):
+    token = subscribe(client, respx_mock, outbox)
+    assert confirm(client, token[:-2] + "xx").headers["location"].startswith(ERR)
+    monkeypatch.setattr(mauxy_main, "CONFIRM_TOKEN_MAX_AGE", -1)
+    assert confirm(client, token).headers["location"].startswith(ERR)
 
 
 @respx.mock
-def test_confirm_mautic_unreachable_redirects_to_error(respx_mock, client, token_signer):
-    token = token_signer.dumps({"email": "alice@example.com", "locale": "en"})
-    respx_mock.get(CONTACTS_URL).mock(side_effect=httpx.ConnectError("boom"))
+def test_t_sec_015_mautic_down_keeps_token_usable(respx_mock, client, outbox):
+    token = subscribe(client, respx_mock, outbox)
+    respx_mock.get(CONTACTS_URL).mock(side_effect=httpx.ConnectError("down"))
+    assert "service_unavailable" in confirm(client, token).headers["location"]
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(200, json={"contacts": {}}))
+    respx_mock.post(NEW_URL).mock(return_value=httpx.Response(201, json={"contact": {"id": 7}}))
+    assert confirm(client, token).headers["location"] == OK
 
-    resp = client.get("/api/confirm", params={"token": token}, follow_redirects=False)
 
-    assert resp.status_code == 302
-    location = urlparse(resp.headers["location"])
-    assert location.path == "/en/newsletter/confirm-error"
-    assert parse_qs(location.query).get("reason") == ["service_unavailable"]
+def test_t_sec_016_admin_key_checked(client):
+    assert client.get("/api/actions", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.get("/api/actions", headers={"Authorization": "Bearer admin-test-key"}).status_code == 200

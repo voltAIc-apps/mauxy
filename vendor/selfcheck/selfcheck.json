@@ -1,0 +1,383 @@
+{
+  "_comment": "Selbst-Check (flywheel SPEC-020): SINGLE SOURCE of questions, options, groups and evaluation rules. Read by the page (src/utils/selfcheck.ts), by backend/libs/selfcheck.py (flywheel) and, vendored via scripts/sync_selfcheck.py, by mauxy (/api/selfcheck). Change rules here only; parity cases in tests/cases/selfcheck_cases.json. Conditions: {q, eq|in|has|count_gte|only} or {any:[...]}/{all:[...]}; an unanswered question never matches. Article links are knowledge-page slugs (src/data/knowledge/), never prices.",
+  "version": "2026-11-08.1",
+  "website": "https://simplify-erp.de",
+  "route": "/selbst-check",
+  "minutes_per_question": 0.3,
+  "precision": {
+    "solid_min": 0.6,
+    "precise_min": 0.99,
+    "band_max": 80,
+    "band_shrink": 56,
+    "words": {
+      "rough": { "de": "grob", "en": "rough" },
+      "solid": { "de": "solide", "en": "solid" },
+      "precise": { "de": "präzise", "en": "precise" }
+    },
+    "demo": [
+      { "answered": 4, "of": 13, "label": { "de": "nach 4 Fragen", "en": "after 4 questions" } },
+      { "answered": 8, "of": 13, "label": { "de": "nach 8 Fragen", "en": "after 8 questions" } },
+      { "answered": 13, "of": 13, "label": { "de": "alle 13 Fragen", "en": "all 13 questions" } }
+    ]
+  },
+  "groups": [
+    { "id": "start", "label": { "de": "Ausgangslage", "en": "Starting point" } },
+    { "id": "scope", "label": { "de": "Umfang", "en": "Scope" } },
+    { "id": "complexity", "label": { "de": "Komplexität", "en": "Complexity" } },
+    { "id": "data", "label": { "de": "Daten", "en": "Data" } },
+    { "id": "team", "label": { "de": "Team und Betrieb", "en": "Team and operations" } }
+  ],
+  "questions": [
+    {
+      "id": "system", "group": "start", "multi": true,
+      "text": { "de": "Was nutzen Sie heute?", "en": "What do you use today?" },
+      "options": [
+        { "id": "ecc", "label": { "de": "SAP ECC / R/3", "en": "SAP ECC / R/3" } },
+        { "id": "b1", "label": { "de": "SAP Business One", "en": "SAP Business One" } },
+        { "id": "other", "label": { "de": "Anderes ERP (Navision, Sage, proALPHA, abas, Eigenbau)", "en": "Another ERP (Navision, Sage, proALPHA, abas, in-house)" } },
+        { "id": "excel", "label": { "de": "Excel-Listen und DATEV", "en": "Excel lists and DATEV" } }
+      ]
+    },
+    {
+      "id": "why", "group": "start", "multi": true,
+      "text": { "de": "Warum jetzt?", "en": "Why now?" },
+      "options": [
+        { "id": "eol", "icon": "clock", "label": { "de": "Wartungsende oder Vertrag läuft aus", "en": "End of maintenance or contract expiring" } },
+        { "id": "cost", "icon": "euro", "label": { "de": "Kosten für Lizenz und Wartung zu hoch", "en": "Licence and maintenance costs too high" } },
+        { "id": "slow", "icon": "gauge", "label": { "de": "Das System bremst unsere Abläufe", "en": "The system slows our processes down" } },
+        { "id": "duty", "icon": "doc", "label": { "de": "Pflichten wie E-Rechnung oder GoBD", "en": "Obligations such as e-invoicing or GoBD" } },
+        { "id": "none", "icon": "none", "exclusive": true, "label": { "de": "Noch kein konkreter Anlass", "en": "No specific trigger yet" } }
+      ]
+    },
+    {
+      "id": "s4", "group": "start",
+      "show_if": { "q": "system", "has": "ecc" },
+      "text": { "de": "Liegt Ihnen ein Angebot für S/4HANA vor?", "en": "Do you have an offer for S/4HANA?" },
+      "options": [
+        { "id": "yes", "label": { "de": "Ja", "en": "Yes" } },
+        { "id": "wip", "label": { "de": "In Arbeit", "en": "In progress" } },
+        { "id": "no", "label": { "de": "Nein", "en": "No" } }
+      ]
+    },
+    {
+      "id": "when", "group": "start",
+      "text": { "de": "Bis wann muss das neue System laufen?", "en": "By when must the new system be running?" },
+      "options": [
+        { "id": "6", "label": { "de": "In weniger als 6 Monaten", "en": "In less than 6 months" } },
+        { "id": "12", "label": { "de": "In 6 bis 12 Monaten", "en": "In 6 to 12 months" } },
+        { "id": "24", "label": { "de": "In 12 bis 24 Monaten", "en": "In 12 to 24 months" } },
+        { "id": "open", "label": { "de": "Noch offen", "en": "Not decided yet" } }
+      ]
+    },
+    {
+      "id": "users", "group": "scope",
+      "text": { "de": "Wie viele Mitarbeitende arbeiten im System?", "en": "How many employees work in the system?" },
+      "options": [
+        { "id": "10", "label": { "de": "1 bis 10", "en": "1 to 10" } },
+        { "id": "50", "label": { "de": "11 bis 50", "en": "11 to 50" } },
+        { "id": "150", "label": { "de": "51 bis 150", "en": "51 to 150" } },
+        { "id": "more", "label": { "de": "Mehr als 150", "en": "More than 150" } }
+      ]
+    },
+    {
+      "id": "areas", "group": "scope", "multi": true,
+      "text": { "de": "Welche Bereiche laufen heute darin?", "en": "Which areas run in it today?" },
+      "options": [
+        { "id": "fibu", "label": { "de": "Finanzbuchhaltung", "en": "Financial accounting" } },
+        { "id": "einkauf", "label": { "de": "Einkauf", "en": "Purchasing" } },
+        { "id": "lager", "label": { "de": "Lager und Logistik", "en": "Warehouse and logistics" } },
+        { "id": "verkauf", "label": { "de": "Verkauf und CRM", "en": "Sales and CRM" } },
+        { "id": "produktion", "label": { "de": "Produktion", "en": "Manufacturing" } },
+        { "id": "service", "label": { "de": "Service und Projekte", "en": "Service and projects" } },
+        { "id": "lohn", "label": { "de": "Personal und Lohn", "en": "HR and payroll" } }
+      ]
+    },
+    {
+      "id": "entities", "group": "scope",
+      "text": { "de": "Wie viele Gesellschaften oder Standorte?", "en": "How many companies or sites?" },
+      "options": [
+        { "id": "1", "label": { "de": "Eine", "en": "One" } },
+        { "id": "3", "label": { "de": "2 bis 3", "en": "2 to 3" } },
+        { "id": "many", "label": { "de": "Mehr, auch international", "en": "More, including international" } }
+      ]
+    },
+    {
+      "id": "custom", "group": "complexity",
+      "text": { "de": "Wie stark ist Ihr System angepasst?", "en": "How heavily is your system customised?" },
+      "options": [
+        { "id": "few", "label": { "de": "Weitgehend Standard", "en": "Mostly standard" } },
+        { "id": "some", "label": { "de": "Einige Anpassungen", "en": "Some customisations" } },
+        { "id": "many", "label": { "de": "Viele Eigenentwicklungen", "en": "Many in-house developments" } },
+        { "id": "unknown", "label": { "de": "Weiß nicht", "en": "Don't know" } }
+      ],
+      "variants": [
+        {
+          "when": { "q": "system", "only": "excel" },
+          "text": { "de": "Wie viele Listen und Insellösungen pflegen Sie?", "en": "How many lists and stand-alone tools do you maintain?" },
+          "options": {
+            "few": { "de": "Wenige", "en": "A few" },
+            "some": { "de": "Einige", "en": "Some" },
+            "many": { "de": "Sehr viele", "en": "A great many" },
+            "unknown": { "de": "Weiß nicht", "en": "Don't know" }
+          }
+        }
+      ]
+    },
+    {
+      "id": "ifaces", "group": "complexity", "multi": true,
+      "text": { "de": "Welche Systeme hängen daran?", "en": "Which systems are connected to it?" },
+      "options": [
+        { "id": "datev", "label": { "de": "DATEV oder Steuerberater", "en": "DATEV or tax adviser" } },
+        { "id": "lohn", "label": { "de": "Lohnabrechnung", "en": "Payroll" } },
+        { "id": "shop", "label": { "de": "Onlineshop oder Marktplatz", "en": "Online shop or marketplace" } },
+        { "id": "bank", "label": { "de": "Bank und Zahlungsdienste", "en": "Bank and payment services" } },
+        { "id": "edi", "label": { "de": "EDI mit Kunden oder Lieferanten", "en": "EDI with customers or suppliers" } },
+        { "id": "kasse", "label": { "de": "Kasse", "en": "Point of sale" } },
+        { "id": "bi", "label": { "de": "Reporting oder BI", "en": "Reporting or BI" } },
+        { "id": "none", "exclusive": true, "label": { "de": "Keine", "en": "None" } }
+      ]
+    },
+    {
+      "id": "data", "group": "data",
+      "text": { "de": "Wie gut sind Ihre Stammdaten?", "en": "How good is your master data?" },
+      "options": [
+        { "id": "clean", "label": { "de": "Sauber und gepflegt", "en": "Clean and maintained" } },
+        { "id": "partly", "label": { "de": "Teils doppelt oder veraltet", "en": "Partly duplicated or outdated" } },
+        { "id": "unknown", "label": { "de": "Das weiß niemand genau", "en": "Nobody knows for sure" } }
+      ]
+    },
+    {
+      "id": "history", "group": "data",
+      "text": { "de": "Wie viel Historie muss ins neue System?", "en": "How much history must move to the new system?" },
+      "options": [
+        { "id": "open", "label": { "de": "Offene Posten und Stammdaten", "en": "Open items and master data" } },
+        { "id": "2y", "label": { "de": "Die letzten 1 bis 2 Jahre", "en": "The last 1 to 2 years" } },
+        { "id": "all", "label": { "de": "Alles", "en": "Everything" } }
+      ]
+    },
+    {
+      "id": "team", "group": "team",
+      "text": { "de": "Wer kann im Haus Zeit für den Wechsel geben?", "en": "Who in-house can give time to the switch?" },
+      "options": [
+        { "id": "keyusers", "label": { "de": "Je Bereich eine benannte Person", "en": "One named person per area" } },
+        { "id": "one", "label": { "de": "Eine Person für alles", "en": "One person for everything" } },
+        { "id": "nobody", "label": { "de": "Noch niemand", "en": "Nobody yet" } }
+      ]
+    },
+    {
+      "id": "hosting", "group": "team",
+      "text": { "de": "Wie soll das neue System betrieben werden?", "en": "How should the new system be operated?" },
+      "options": [
+        { "id": "cloud", "label": { "de": "In einer Cloud in Deutschland", "en": "In a cloud in Germany" } },
+        { "id": "own", "label": { "de": "Auf eigenen Servern", "en": "On our own servers" } },
+        { "id": "open", "label": { "de": "Noch offen", "en": "Not decided yet" } }
+      ]
+    }
+  ],
+  "levels": {
+    "good": { "label": { "de": "gut", "en": "good" }, "color": "#1E7B4F" },
+    "mid": { "label": { "de": "prüfen", "en": "check" }, "color": "#A35F00" },
+    "bad": { "label": { "de": "handeln", "en": "act" }, "color": "#C0392B" }
+  },
+  "dimensions": [
+    {
+      "id": "urgency", "name": { "de": "Dringlichkeit", "en": "Urgency" },
+      "bad": { "any": [{ "q": "when", "eq": "6" }, { "q": "why", "has": "eol" }, { "q": "why", "has": "duty" }] },
+      "mid": { "q": "when", "eq": "12" },
+      "notes": {
+        "good": { "de": "Zeit für eine gründliche Vorbereitung", "en": "Time for thorough preparation" },
+        "mid": { "de": "Zeitplan jetzt festlegen", "en": "Set the schedule now" },
+        "bad": { "de": "Frist oder Pflicht fällt in Ihren Zeitraum", "en": "A deadline or obligation falls in your time frame" }
+      }
+    },
+    {
+      "id": "scope", "name": { "de": "Umfang", "en": "Scope" },
+      "bad": { "any": [{ "q": "users", "eq": "more" }, { "q": "areas", "count_gte": 5 }] },
+      "mid": { "any": [{ "q": "users", "eq": "150" }, { "q": "areas", "count_gte": 3 }] },
+      "notes": {
+        "good": { "de": "Überschaubar, ein Wechsel in einem Zug ist denkbar", "en": "Manageable, a switch in one go is conceivable" },
+        "mid": { "de": "In Wellen planen", "en": "Plan in waves" },
+        "bad": { "de": "Viele Bereiche: in Wellen gehen", "en": "Many areas: go in waves" }
+      }
+    },
+    {
+      "id": "complexity", "name": { "de": "Komplexität", "en": "Complexity" },
+      "bad": { "any": [{ "q": "custom", "eq": "many" }, { "q": "entities", "eq": "many" }, { "q": "ifaces", "count_gte": 4 }, { "q": "system", "count_gte": 2 }] },
+      "mid": { "any": [{ "q": "custom", "in": ["some", "unknown"] }, { "q": "ifaces", "count_gte": 2 }] },
+      "notes": {
+        "good": { "de": "Wenig Sonderwege", "en": "Few special cases" },
+        "mid": { "de": "Anpassungen und Schnittstellen sichten", "en": "Review customisations and interfaces" },
+        "bad": { "de": "Systeme, Eigenentwicklungen und Schnittstellen zuerst klären", "en": "Clarify systems, in-house developments and interfaces first" }
+      }
+    },
+    {
+      "id": "data", "name": { "de": "Daten", "en": "Data" },
+      "bad": { "q": "data", "eq": "unknown" },
+      "mid": { "any": [{ "q": "data", "eq": "partly" }, { "q": "history", "eq": "all" }] },
+      "notes": {
+        "good": { "de": "Gute Grundlage für die Übernahme", "en": "A good basis for the migration" },
+        "mid": { "de": "Vor der Übernahme bereinigen", "en": "Clean up before the migration" },
+        "bad": { "de": "Datenlage zuerst klären", "en": "Clarify the state of the data first" }
+      }
+    },
+    {
+      "id": "team", "name": { "de": "Team", "en": "Team" },
+      "bad": { "q": "team", "eq": "nobody" },
+      "mid": { "q": "team", "eq": "one" },
+      "notes": {
+        "good": { "de": "Entscheider je Bereich vorhanden", "en": "Decision-makers per area in place" },
+        "mid": { "de": "Eine Person trägt zu viel", "en": "One person carries too much" },
+        "bad": { "de": "Ohne Zeit im Haus kein Wechsel", "en": "No switch without time in-house" }
+      }
+    }
+  ],
+  "risks": {
+    "max": 3,
+    "pool": [
+      {
+        "id": "custom_many", "when": { "q": "custom", "eq": "many" },
+        "title": { "de": "Viele Eigenentwicklungen", "en": "Many in-house developments" },
+        "rule": { "de": "Erst die Abläufe prüfen, dann entscheiden, was im Standard läuft. Nicht nachbauen, was niemand mehr braucht.", "en": "Review the processes first, then decide what runs in the standard. Do not rebuild what nobody needs any more." },
+        "article": "ist-prozesse-aufnehmen-ohne-sie-im-neuen-system-nachzubauen"
+      },
+      {
+        "id": "data_quality", "when": { "q": "data", "in": ["unknown", "partly"] },
+        "title": { "de": "Stammdaten nicht sauber", "en": "Master data not clean" },
+        "rule": { "de": "Vor der Übernahme bereinigen und Zeile für Zeile in einer Zwischentabelle prüfen, nicht erst im neuen System.", "en": "Clean up before the migration and check row by row in a staging table, not only in the new system." },
+        "article": "datenimport-mit-mensch-in-der-schleife-zwischentabelle-und"
+      },
+      {
+        "id": "interfaces", "when": { "q": "ifaces", "count_gte": 3 },
+        "title": { "de": "Viele Schnittstellen", "en": "Many interfaces" },
+        "rule": { "de": "Für jede Schnittstelle festlegen, welches System führt, bevor migriert wird.", "en": "For every interface, decide which system leads before migrating." },
+        "article": "welches-system-fuehrt-schnittstellen-fuer-lohn-kasse-und"
+      },
+      {
+        "id": "team_time", "when": { "q": "team", "in": ["one", "nobody"] },
+        "title": { "de": "Zu wenig Zeit im Haus", "en": "Too little time in-house" },
+        "rule": { "de": "Je Bereich eine Person benennen, die entscheidet und testet. Ohne sie verzögert sich jede Welle.", "en": "Name one person per area who decides and tests. Without them every wave is delayed." },
+        "article": null
+      },
+      {
+        "id": "tight_schedule", "when": { "q": "when", "eq": "6" },
+        "title": { "de": "Knapper Zeitplan", "en": "Tight schedule" },
+        "rule": { "de": "Mit der Finanzbuchhaltung beginnen, in Wellen gehen und einen Parallelbetrieb einplanen.", "en": "Start with financial accounting, go in waves and plan a parallel run." },
+        "article": "parallelbetrieb-bei-der-sap-abloesung-wie-monatlicher"
+      },
+      {
+        "id": "full_history", "when": { "q": "history", "eq": "all" },
+        "title": { "de": "Vollständige Historie gewünscht", "en": "Full history wanted" },
+        "rule": { "de": "Offene Posten und Stammdaten übernehmen, alte Jahre über ein Archiv mit GoBD-Zugriff lesbar halten.", "en": "Migrate open items and master data, keep old years readable through an archive with GoBD access." },
+        "article": null
+      },
+      {
+        "id": "parallel_run", "when": null,
+        "title": { "de": "Umstieg ohne Betriebsrisiko", "en": "Switching without operational risk" },
+        "rule": { "de": "Altes und neues System nebeneinander laufen lassen, bis der Monatsabgleich stimmt.", "en": "Run the old and new system side by side until the monthly reconciliation matches." },
+        "article": "parallelbetrieb-bei-der-sap-abloesung-wie-monatlicher"
+      }
+    ]
+  },
+  "waves": {
+    "first": {
+      "title": { "de": "Finanzbuchhaltung und Stammdaten", "en": "Financial accounting and master data" },
+      "items": { "de": "Kontenzuordnung, Eröffnungsbilanz, offene Posten", "en": "Account mapping, opening balance, open items" }
+    },
+    "next": [
+      { "id": "goods", "title": { "de": "Waren und Kunden", "en": "Goods and customers" }, "areas": ["einkauf", "lager", "verkauf"] },
+      { "id": "more", "title": { "de": "Weitere Bereiche", "en": "Further areas" }, "areas": ["produktion", "service", "lohn"] }
+    ],
+    "area_names": {
+      "einkauf": { "de": "Einkauf", "en": "Purchasing" },
+      "lager": { "de": "Lager", "en": "Warehouse" },
+      "verkauf": { "de": "Verkauf", "en": "Sales" },
+      "produktion": { "de": "Produktion", "en": "Manufacturing" },
+      "service": { "de": "Service und Projekte", "en": "Service and projects" },
+      "lohn": { "de": "Lohn (Schnittstelle prüfen)", "en": "Payroll (check the interface)" }
+    }
+  },
+  "headlines": [
+    { "min_bad": 2, "text": { "de": "Der Wechsel ist machbar, braucht aber eine klare Reihenfolge.", "en": "The switch is feasible, but it needs a clear order." } },
+    { "min_bad": 1, "text": { "de": "Gute Ausgangslage mit einem Punkt, der zuerst geklärt werden sollte.", "en": "A good starting point with one issue to clarify first." } },
+    { "min_bad": 0, "text": { "de": "Gute Ausgangslage für einen geordneten Wechsel.", "en": "A good starting point for an orderly switch." } }
+  ],
+  "chips": {
+    "system_names": {
+      "ecc": { "de": "SAP ECC / R/3", "en": "SAP ECC / R/3" },
+      "b1": { "de": "SAP Business One", "en": "SAP Business One" },
+      "other": { "de": "Anderes ERP", "en": "Another ERP" },
+      "excel": { "de": "Excel und DATEV", "en": "Excel and DATEV" }
+    },
+    "system_none": { "de": "System offen", "en": "System open" },
+    "users": {
+      "10": { "de": "1 bis 10 Mitarbeitende", "en": "1 to 10 employees" },
+      "50": { "de": "11 bis 50 Mitarbeitende", "en": "11 to 50 employees" },
+      "150": { "de": "51 bis 150 Mitarbeitende", "en": "51 to 150 employees" },
+      "more": { "de": "mehr als 150 Mitarbeitende", "en": "more than 150 employees" }
+    },
+    "areas": { "de": "{n} Bereiche", "en": "{n} areas" }
+  },
+  "stay_cost": {
+    "_comment": "Stage 2, reader's own inputs only (EUR). cost_5y = years * (licence + support) + offer; per_user_year = (licence + support) / users. No numbers of ours.",
+    "years": 5,
+    "max_amount": 100000000,
+    "max_users": 100000
+  },
+  "picks": [
+    {
+      "id": "mail", "icon": "mail", "accent": "#0077B5",
+      "title": { "de": "Ergebnis und Richtangebot", "en": "Result and indicative quote" },
+      "text": { "de": "Ihre Auswertung per Mail, das Richtangebot folgt. Zum Weiterleiten an Kollegen oder Steuerberater.", "en": "Your evaluation by mail, the indicative quote follows. To forward to colleagues or your tax adviser." },
+      "foot": { "de": "Einmalige Zusendung, keine Werbung", "en": "Sent once, no advertising" }
+    },
+    {
+      "id": "call", "icon": "calendar", "accent": "#EA5562",
+      "title": { "de": "30 Minuten Kennenlernen", "en": "30-minute introduction" },
+      "text": { "de": "Mit Ashant per Video. Sie bringen Ihr Ergebnis mit, wir sprechen über Ihre nächsten Schritte. Unverbindlich.", "en": "With Ashant by video. You bring your result, we talk about your next steps. No obligation." },
+      "foot": { "de": "Termin wählen Sie danach in Meetly", "en": "You pick the slot in Meetly afterwards" }
+    },
+    {
+      "id": "radar", "icon": "radar", "accent": "#0077B5",
+      "title": { "de": "Migration Radar", "en": "Migration Radar" },
+      "text": { "de": "Was sich in der SAP-Migration tut: Fristen, Erfahrungen aus Projekten, Werkzeuge. Kurz und sachlich.", "en": "What is happening in SAP migration: deadlines, lessons from projects, tools. Short and factual." },
+      "foot": { "de": "Per Mail und LinkedIn, jederzeit abbestellbar", "en": "By mail and LinkedIn, unsubscribe at any time" }
+    }
+  ],
+  "mail": {
+    "_comment": "Plain-text mails sent by mauxy (transactional). {placeholders} are filled server-side; no free text from the browser is ever inserted.",
+    "doi": {
+      "subject": { "de": "Bitte bestätigen: Ihr Selbst-Check", "en": "Please confirm: your self-check" },
+      "body": {
+        "de": "Guten Tag,\n\nSie haben auf simplify-erp.de den Selbst-Check zum Wechsel nach Odoo ausgefüllt und angefordert:\n{picks}\n\nBitte bestätigen Sie mit diesem Link, dass die Anfrage von Ihnen stammt:\n{link}\n\nDer Link gilt {hours} Stunden. Ohne Bestätigung senden wir nichts weiter und löschen Ihre Angaben nach {retention_pending_days} Tagen.\n\nWenn Sie das nicht waren, ignorieren Sie diese Mail einfach.\n\nAshant Chalasani\nSimplify-ERP, wapsol GmbH\nhttps://simplify-erp.de/de/impressum",
+        "en": "Hello,\n\nYou filled in the self-check on switching to Odoo at simplify-erp.de and requested:\n{picks}\n\nPlease confirm with this link that the request came from you:\n{link}\n\nThe link is valid for {hours} hours. Without confirmation we send nothing further and delete your details after {retention_pending_days} days.\n\nIf this was not you, simply ignore this mail.\n\nAshant Chalasani\nSimplify-ERP, wapsol GmbH\nhttps://simplify-erp.de/en/impressum"
+      }
+    },
+    "result": {
+      "subject": { "de": "Ihr Selbst-Check: Ergebnis", "en": "Your self-check: result" },
+      "intro": {
+        "de": "Guten Tag,\n\ndanke für Ihre Bestätigung. Hier ist Ihre Auswertung aus {answered} von {total} Antworten. Das Richtangebot erstelle ich aus Ihren Antworten und sende es Ihnen per Mail.",
+        "en": "Hello,\n\nthank you for confirming. Here is your evaluation from {answered} of {total} answers. I will prepare the indicative quote from your answers and send it to you by mail."
+      },
+      "partial": {
+        "de": "Guten Tag,\n\ndanke für Ihre Bestätigung. Sie haben {answered} von {total} Fragen beantwortet. Daraus erstelle ich ein grobes Richtangebot und sende es Ihnen per Mail; fehlende Angaben setze ich vorsichtig an. Mit allen Antworten wird es genauer: {url}",
+        "en": "Hello,\n\nthank you for confirming. You answered {answered} of {total} questions. From these I will prepare a rough indicative quote and send it to you by mail; missing details are estimated cautiously. With all answers it gets more precise: {url}"
+      },
+      "outro": {
+        "de": "Ihre Antworten können Sie jederzeit im Browser ändern: {url}\n\nAshant Chalasani\nSimplify-ERP, wapsol GmbH\nhttps://simplify-erp.de/de/impressum",
+        "en": "You can change your answers in the browser at any time: {url}\n\nAshant Chalasani\nSimplify-ERP, wapsol GmbH\nhttps://simplify-erp.de/en/impressum"
+      },
+      "labels": {
+        "answers": { "de": "Ihre Antworten", "en": "Your answers" },
+        "lights": { "de": "Ampeln", "en": "Traffic lights" },
+        "risks": { "de": "Die drei größten Risiken und was Sie tun können", "en": "The three biggest risks and what you can do" },
+        "waves": { "de": "Sinnvolle Reihenfolge", "en": "A sensible order" },
+        "read": { "de": "Weiterlesen", "en": "Read more" },
+        "wave": { "de": "Welle", "en": "Wave" },
+        "stay": { "de": "Was kostet es, zu bleiben? (Ihre Angaben)", "en": "What does staying cost? (your figures)" }
+      }
+    },
+    "notify": {
+      "subject": { "de": "Selbst-Check bestätigt: {picks_short} ({precision})", "en": "Self-check confirmed: {picks_short} ({precision})" }
+    }
+  }
+}

@@ -158,8 +158,9 @@ kubectl create secret generic mauxy-credentials \
 | `CONFIRM_TOKEN_MAX_AGE` | Token lifetime in seconds | `86400` |
 | `PUBLIC_BASE_URL` | Public URL of this mauxy (used inside the Mautic email link) | *(required for subscribe)* |
 | `PUBLIC_WEBSITE_BASE_URL` | Public URL of the website; confirm redirects here | *(required for subscribe)* |
-| `MAUTIC_CONFIRM_EMAIL_ID_EN` | Numeric Mautic email template ID, English | *(required for subscribe)* |
-| `MAUTIC_CONFIRM_EMAIL_ID_DE` | Numeric Mautic email template ID, German | *(required for subscribe)* |
+| `MAIL_MODE` | `smtp` / `console` (dry run) / `memory` (tests) | `smtp` if `SMTP_HOST` set, else `console` |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | mailcow SMTP (587 STARTTLS or 465 SSL) | *(required for DOI mails)* |
+| `SELFCHECK_*`, `MAUTIC_RADAR_*` | Self-check, see `.env.example` | see `.env.example` |
 
 ### Health & Monitoring
 
@@ -240,43 +241,39 @@ curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
 
 ## Newsletter Signup (Double Opt-In)
 
-`POST /api/subscribe` accepts a JSON signup from a browser (see
-`website/src/config/api.ts` for the canonical payload) and starts a double
-opt-in flow:
+`POST /api/subscribe` (payload: `website/src/config/api.ts`) starts a double opt-in **without
+touching Mautic**: the request is kept in SQLite (`newsletter_pending`) and a confirmation link is
+mailed via SMTP. Every contact-specific outcome (new, already confirmed, DNC, throttled) answers
+`200 {"status": "pending_confirmation"}` -- no enumeration. `consent` must be `true`; the consent
+timestamp is the server time of the click; `pageUrl` must be on an `ALLOWED_ORIGINS` origin.
 
-1. Search the contact in Mautic. If it already carries the
-   `newsletter_confirmed` tag, return `200 {"status": "already_subscribed"}`.
-   If the email is on the DNC list, return
-   `200 {"status": "already_unsubscribed_no_email_sent"}`.
-2. Sign a self-contained 24h token (`email`, `locale`) with `itsdangerous`.
-3. Upsert the contact with the token + source metadata and tag
-   `newsletter_pending`.
-4. Trigger Mautic's transactional send for the locale-specific email template
-   (`MAUTIC_CONFIRM_EMAIL_ID_{EN,DE}`). The template resolves the confirm link
-   via `{contactfield=confirmation_token}`.
-5. Respond `200 {"status": "pending_confirmation"}`.
+`GET /api/confirm?token=...` checks signature + age, a matching unused pending record (SHA-256,
+constant-time) and that the address is not DNC; only then the contact is created/updated in
+Mautic (tag `newsletter_confirmed`) and the token is burnt (single use). 302 to
+`${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed` (or `confirm-error?reason=...`).
 
-`GET /api/confirm?token=...` validates the token, flips the contact from
-`newsletter_pending` to `newsletter_confirmed`, clears the token field, and
-issues a `302` redirect to `${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed`
-(or `.../newsletter/confirm-error?reason=...` on failure).
+Security review 2026-11-08 (enumeration, token replay, consent validation, pre-confirmation CRM
+writes): fixed, tests T-SEC-001..016. Tokens issued by the earlier flow are refused (users re-subscribe).
 
 ### One-time Mautic setup
 
-Before deploying, create the following in Mautic (or the endpoints will fail):
+- Contact fields `newsletter_locale`, `newsletter_source`, `newsletter_consented_at` (date/time),
+  `newsletter_page_url`; tags `newsletter_confirmed`, `migration_radar_confirmed`.
+- SMTP credentials (mailcow) in the secret; Mautic e-mail templates are no longer used.
 
-- **Custom contact fields** (text unless noted):
-  - `confirmation_token`
-  - `newsletter_locale`
-  - `newsletter_source`
-  - `newsletter_consented_at` (date/time)
-  - `newsletter_page_url`
-- **Tags**: `newsletter_pending`, `newsletter_confirmed`
-- **Two email templates**, one per locale (EN / DE). Each confirm button must
-  link to:
-  `${PUBLIC_BASE_URL}/api/confirm?token={contactfield=confirmation_token}`.
-  Record the numeric IDs in `MAUTIC_CONFIRM_EMAIL_ID_EN` and
-  `MAUTIC_CONFIRM_EMAIL_ID_DE`.
+## Selbst-Check (simplify-erp.de, flywheel SPEC-020)
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/selfcheck` | `{email, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company_website}`. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Uniform `200 pending_confirmation`. |
+| `GET /api/selfcheck/confirm?token=` | Single-use. Result mail (pick `mail`), Migration Radar in Mautic (pick `radar`, not DNC), notification to `SELFCHECK_NOTIFY_TO` (always: indicative-quote request, call yes/no, answers). 302 to `/{lang}/selbst-check?bestaetigt=1` / `=fehler`. |
+| `POST /api/selfcheck/event` | `{event: started|completed|exited_early|submitted, lang}` -> 204. Stores day + event + lang only; global rate-limit key (IP never read), access-log lines dropped. |
+| `GET /api/selfcheck/submissions` | Admin (Bearer `ADMIN_API_KEY`): confirmed (or pending) submissions. |
+| `GET /api/selfcheck/stats` | Admin: counters per day (success metric "completed checks"). |
+
+Rules: `vendor/selfcheck/` is a copy of flywheel `backend/libs/selfcheck.py` + `website/src/data/selfcheck.json`,
+refreshed with `python scripts/sync_selfcheck.py --mauxy <this repo>` in flywheel. Retention: pending
+7 days, confirmed 90 days (`SELFCHECK_*_DAYS`). Local dry run: `MAIL_MODE=console` prints mails instead of sending.
 
 ## Roadmap
 

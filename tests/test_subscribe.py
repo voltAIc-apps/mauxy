@@ -1,22 +1,23 @@
 """
-POST /api/subscribe -- covers honeypot, new-contact happy path, locale email
-ID selection, already-confirmed short-circuit, DNC short-circuit, Mautic
-search failure (503), and Mautic connection error.
+POST /api/subscribe -- newsletter DOI after the 2026-11-08 security review.
+
+T-SEC-001 .. T-SEC-009 (fixes 1, 3, 4 of the review):
+  1 user enumeration      -> one uniform {"status": "pending_confirmation"}
+  3 consent validation    -> consent must be true; server-side consent timestamp
+  4 no CRM change before confirmation; source / page_url / consentedAt validated + limited
+Mautic is mocked via respx; mails land in mailer.OUTBOX (MAIL_MODE=memory).
 """
 import re
 
 import httpx
-import pytest
 import respx
 
-
 CONTACTS_URL = re.compile(r"https://mautic\.test/api/contacts(\?.*)?$")
-NEW_CONTACT_URL = "https://mautic.test/api/contacts/new"
-EDIT_CONTACT_URL_RE = re.compile(r"https://mautic\.test/api/contacts/\d+/edit$")
-SEND_EMAIL_URL_RE = re.compile(r"https://mautic\.test/api/emails/\d+/contact/\d+/send$")
+ANY_WRITE = re.compile(r"https://mautic\.test/api/(contacts/new|contacts/\d+/edit|emails/.*)$")
+PENDING = {"status": "pending_confirmation"}
 
 
-def _subscribe_payload(**overrides):
+def payload(**overrides):
     base = {
         "email": "alice@example.com",
         "locale": "en",
@@ -29,191 +30,126 @@ def _subscribe_payload(**overrides):
     return base
 
 
-def _mautic_contact_payload(contact_id, email, *, tags=None, dnc=None):
-    return {
-        "contacts": {
-            str(contact_id): {
-                "id": contact_id,
-                "fields": {"core": {"email": {"value": email}}},
-                "tags": [{"tag": t} for t in (tags or [])],
-                "doNotContact": dnc or [],
-            }
-        }
-    }
+def contact(contact_id, email, *, tags=None, dnc=None):
+    return {"contacts": {str(contact_id): {
+        "id": contact_id,
+        "fields": {"core": {"email": {"value": email}}},
+        "tags": [{"tag": t} for t in (tags or [])],
+        "doNotContact": dnc or [],
+    }}}
+
+
+def no_contact(respx_mock):
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(200, json={"contacts": {}, "total": 0}))
 
 
 @respx.mock(assert_all_called=False)
-def test_subscribe_honeypot_short_circuits(respx_mock, client):
-    """When honeypot is filled, no Mautic call is made and response is success-shaped."""
-    resp = client.post("/api/subscribe", json=_subscribe_payload(company_website="x"))
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "pending_confirmation"}
-    # No Mautic routes should have been hit
-    assert all(not route.called for route in respx_mock.routes)
+def test_t_sec_001_honeypot_uniform_no_calls(respx_mock, client, outbox):
+    resp = client.post("/api/subscribe", json=payload(company_website="x"))
+    assert resp.status_code == 200 and resp.json() == PENDING
+    assert all(not r.called for r in respx_mock.routes)
+    assert outbox == []
 
 
 @respx.mock
-def test_subscribe_new_contact_en_happy_path(respx_mock, client):
-    """No existing contact -> creates, tags pending, triggers EN email template."""
-    respx_mock.get(CONTACTS_URL).mock(
-        return_value=httpx.Response(200, json={"contacts": {}, "total": 0})
-    )
-    create_route = respx_mock.post(NEW_CONTACT_URL).mock(
-        return_value=httpx.Response(
-            201,
-            json={"contact": {"id": 7, "fields": {"core": {"email": {"value": "alice@example.com"}}}}},
-        )
-    )
-    send_route = respx_mock.post("https://mautic.test/api/emails/11/contact/7/send").mock(
-        return_value=httpx.Response(200, json={"success": True})
-    )
+def test_t_sec_002_new_address_mails_link_and_writes_nothing_to_mautic(respx_mock, client, outbox, app):
+    no_contact(respx_mock)
+    writes = respx_mock.route(url__regex=ANY_WRITE.pattern).mock(return_value=httpx.Response(500))
 
-    resp = client.post("/api/subscribe", json=_subscribe_payload())
+    resp = client.post("/api/subscribe", json=payload())
 
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "pending_confirmation"}
-    assert create_route.called
-    assert send_route.called
-
-    # Body sent to Mautic must include tag + token + metadata
-    create_body = create_route.calls.last.request.read().decode()
-    assert '"newsletter_pending"' in create_body
-    assert '"confirmation_token"' in create_body
-    assert '"newsletter_locale"' in create_body
-    assert '"newsletter_source"' in create_body
+    assert resp.status_code == 200 and resp.json() == PENDING
+    assert not writes.called  # fix 4: Mautic untouched until confirmation
+    assert len(outbox) == 1 and outbox[0]["to"] == "alice@example.com"
+    assert re.search(r"https://mauxy\.test/api/confirm\?token=\S+", outbox[0]["body"])
+    assert "alice" not in outbox[0]["body"].split("token=")[1]  # no e-mail inside the URL
 
 
 @respx.mock
-def test_subscribe_new_contact_de_uses_de_template_id(respx_mock, client):
-    respx_mock.get(CONTACTS_URL).mock(
-        return_value=httpx.Response(200, json={"contacts": {}, "total": 0})
-    )
-    respx_mock.post(NEW_CONTACT_URL).mock(
-        return_value=httpx.Response(
-            201,
-            json={"contact": {"id": 9, "fields": {"core": {"email": {"value": "bob@example.com"}}}}},
-        )
-    )
-    de_send = respx_mock.post("https://mautic.test/api/emails/22/contact/9/send").mock(
-        return_value=httpx.Response(200, json={"success": True})
-    )
-
-    resp = client.post(
-        "/api/subscribe",
-        json=_subscribe_payload(email="bob@example.com", locale="de"),
-    )
-
-    assert resp.status_code == 200
-    assert de_send.called
+def test_t_sec_003_already_confirmed_is_indistinguishable(respx_mock, client, outbox):
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(
+        200, json=contact(42, "alice@example.com", tags=["newsletter_confirmed"])))
+    resp = client.post("/api/subscribe", json=payload())
+    assert resp.status_code == 200 and resp.json() == PENDING  # fix 1
+    assert outbox == []
 
 
 @respx.mock
-def test_subscribe_already_confirmed_returns_already_subscribed(respx_mock, client):
-    respx_mock.get(CONTACTS_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json=_mautic_contact_payload(42, "alice@example.com", tags=["newsletter_confirmed"]),
-        )
-    )
-    create_route = respx_mock.post(NEW_CONTACT_URL).mock(return_value=httpx.Response(201))
-    edit_route = respx_mock.patch(EDIT_CONTACT_URL_RE).mock(return_value=httpx.Response(200))
-    send_route = respx_mock.post(SEND_EMAIL_URL_RE).mock(return_value=httpx.Response(200))
-
-    resp = client.post("/api/subscribe", json=_subscribe_payload())
-
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "already_subscribed"}
-    assert not create_route.called
-    assert not edit_route.called
-    assert not send_route.called
+def test_t_sec_004_dnc_is_indistinguishable_and_gets_no_mail(respx_mock, client, outbox):
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(
+        200, json=contact(42, "alice@example.com", dnc=[{"channel": "email", "reason": 1}])))
+    resp = client.post("/api/subscribe", json=payload())
+    assert resp.status_code == 200 and resp.json() == PENDING  # fix 1
+    assert outbox == []
 
 
 @respx.mock
-def test_subscribe_dnc_contact_returns_already_unsubscribed(respx_mock, client):
-    respx_mock.get(CONTACTS_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json=_mautic_contact_payload(
-                42,
-                "alice@example.com",
-                dnc=[{"channel": "email", "reason": 1}],
-            ),
-        )
-    )
-    create_route = respx_mock.post(NEW_CONTACT_URL).mock(return_value=httpx.Response(201))
-    edit_route = respx_mock.patch(EDIT_CONTACT_URL_RE).mock(return_value=httpx.Response(200))
-    send_route = respx_mock.post(SEND_EMAIL_URL_RE).mock(return_value=httpx.Response(200))
+def test_t_sec_005_existing_unconfirmed_contact_not_patched(respx_mock, client, outbox):
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(
+        200, json=contact(9, "alice@example.com", tags=["something"])))
+    patch = respx_mock.patch(re.compile(r"https://mautic\.test/api/contacts/9/edit$")).mock(
+        return_value=httpx.Response(200, json={"contact": {"id": 9}}))
+    resp = client.post("/api/subscribe", json=payload())
+    assert resp.status_code == 200 and resp.json() == PENDING
+    assert not patch.called  # fix 4
+    assert len(outbox) == 1
 
-    resp = client.post("/api/subscribe", json=_subscribe_payload())
 
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "already_unsubscribed_no_email_sent"}
-    assert not create_route.called
-    assert not edit_route.called
-    assert not send_route.called
+def test_t_sec_006_consent_must_be_true(client):
+    assert client.post("/api/subscribe", json=payload(consent=False)).status_code == 422
+    body = payload()
+    del body["consent"]
+    assert client.post("/api/subscribe", json=body).status_code == 422
+
+
+def test_t_sec_007_fields_validated_and_length_limited(client):
+    assert client.post("/api/subscribe", json=payload(pageUrl="https://evil.test/x")).status_code == 422
+    assert client.post("/api/subscribe", json=payload(pageUrl="https://site.test.evil.test/")).status_code == 422
+    assert client.post("/api/subscribe", json=payload(pageUrl="https://site.test/" + "a" * 600)).status_code == 422
+    assert client.post("/api/subscribe", json=payload(source="Footer <script>")).status_code == 422
+    assert client.post("/api/subscribe", json=payload(source="a" * 41)).status_code == 422
+    assert client.post("/api/subscribe", json=payload(consentedAt="x" * 41)).status_code == 422
+    assert client.post("/api/subscribe", json=payload(email="not-an-email")).status_code == 422
+    assert client.post("/api/subscribe", json=payload(locale="fr")).status_code == 422
 
 
 @respx.mock
-def test_subscribe_mautic_search_5xx_returns_503(respx_mock, client):
-    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(502, text="bad gateway"))
+def test_t_sec_008_client_consent_time_is_not_stored(respx_mock, client, outbox, app):
+    no_contact(respx_mock)
+    client.post("/api/subscribe", json=payload(consentedAt="1999-01-01T00:00:00Z"))
+    token = re.search(r"token=(\S+)", outbox[0]["body"]).group(1)
+    create = respx_mock.post("https://mautic.test/api/contacts/new").mock(
+        return_value=httpx.Response(201, json={"contact": {"id": 7}}))
+    resp = client.get(f"/api/confirm?token={token}", follow_redirects=False)
+    assert resp.status_code == 302 and resp.headers["location"].endswith("/en/newsletter/confirmed")
+    sent = create.calls.last.request.read().decode()
+    assert "1999-01-01" not in sent and "newsletter_consented_at" in sent  # server time used
 
-    resp = client.post("/api/subscribe", json=_subscribe_payload())
 
-    assert resp.status_code == 503
-    assert resp.json() == {"status": "service_unavailable"}
+@respx.mock
+def test_t_sec_009_per_address_throttle_is_silent(respx_mock, client, outbox):
+    no_contact(respx_mock)
+    for _ in range(4):
+        resp = client.post("/api/subscribe", json=payload())
+        assert resp.status_code == 200 and resp.json() == PENDING
+    assert len(outbox) == 3  # MAX_PENDING_PER_EMAIL
+
+
+@respx.mock
+def test_subscribe_mautic_search_5xx_returns_503(respx_mock, client, outbox):
+    respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(500))
+    assert client.post("/api/subscribe", json=payload()).status_code == 503
+    assert outbox == []
 
 
 @respx.mock
 def test_subscribe_mautic_unreachable_returns_503(respx_mock, client):
     respx_mock.get(CONTACTS_URL).mock(side_effect=httpx.ConnectError("boom"))
-
-    resp = client.post("/api/subscribe", json=_subscribe_payload())
-
-    assert resp.status_code == 503
-    assert resp.json() == {"status": "service_unavailable"}
+    assert client.post("/api/subscribe", json=payload()).status_code == 503
 
 
 @respx.mock
-def test_subscribe_existing_unconfirmed_contact_patches_and_sends(respx_mock, client):
-    """Existing contact (no confirmed tag, no DNC) -> PATCH edit, then send."""
-    respx_mock.get(CONTACTS_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json=_mautic_contact_payload(42, "alice@example.com"),
-        )
-    )
-    edit_route = respx_mock.patch("https://mautic.test/api/contacts/42/edit").mock(
-        return_value=httpx.Response(
-            200,
-            json={"contact": {"id": 42, "fields": {"core": {"email": {"value": "alice@example.com"}}}}},
-        )
-    )
-    send_route = respx_mock.post("https://mautic.test/api/emails/11/contact/42/send").mock(
-        return_value=httpx.Response(200, json={"success": True})
-    )
-    # Make sure POST /contacts/new is NOT called
-    create_route = respx_mock.post(NEW_CONTACT_URL).mock(return_value=httpx.Response(201))
-
-    resp = client.post("/api/subscribe", json=_subscribe_payload())
-
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "pending_confirmation"}
-    assert edit_route.called
-    assert send_route.called
-    assert not create_route.called
-
-
-def test_subscribe_rejects_invalid_email(client):
-    resp = client.post(
-        "/api/subscribe",
-        json=_subscribe_payload(email="not-an-email"),
-    )
-    assert resp.status_code == 422
-
-
-def test_subscribe_rejects_unknown_locale(client):
-    resp = client.post(
-        "/api/subscribe",
-        json=_subscribe_payload(locale="fr"),
-    )
-    assert resp.status_code == 422
+def test_subscribe_de_mail_is_german(respx_mock, client, outbox):
+    no_contact(respx_mock)
+    client.post("/api/subscribe", json=payload(locale="de", pageUrl="https://site.test/de/"))
+    assert outbox[0]["subject"].startswith("Bitte bestätigen")

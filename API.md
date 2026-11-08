@@ -162,3 +162,13 @@ Detailed health status for operator debugging. Always returns HTTP 200.
 | 422    | Invalid request body (e.g. malformed email on `/api/unsubscribe`) |
 | 429    | Rate limit exceeded -- retry after the period resets |
 | 503    | Mautic API unreachable -- request was not processed, retry later |
+
+---
+
+## POST /api/subscribe, GET /api/confirm, /api/selfcheck*
+
+See README "Newsletter Signup (Double Opt-In)" and "Selbst-Check". All contact-specific outcomes
+of `POST /api/subscribe` and `POST /api/selfcheck` return `200 {"status": "pending_confirmation"}`;
+422 = invalid payload (incl. `consent` not `true`), 403 = self-check origin not allowed, 429 = rate
+limit, 503 = Mautic or mail unavailable.
+

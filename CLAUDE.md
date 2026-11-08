@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-**mauxy** -- centralized newsletter subscription + unsubscribe proxy for Mautic. Python (FastAPI) microservice that accepts subscribe/unsubscribe requests from SPA frontends and manages contacts via the Mautic REST API. Mautic Basic Auth credentials stay server-side and are never exposed to the browser. Contact-specific responses return `{"status": "ok"}` to prevent email enumeration; returns 503 when Mautic is unreachable. Multi-site config via `sites.yaml`, GDPR double opt-in via SMTP confirmation emails.
+**mauxy** -- centralized newsletter subscription + unsubscribe proxy for Mautic. Python (FastAPI) microservice that accepts subscribe/unsubscribe requests from SPA frontends and manages contacts via the Mautic REST API. Mautic Basic Auth credentials stay server-side and are never exposed to the browser. Contact-specific responses are uniform (`ok` / `pending_confirmation`) to prevent email enumeration; returns 503 when Mautic is unreachable. GDPR double opt-in with server-side pending state (SQLite) and SMTP confirmation mails (mailcow). Also the public consent service of the simplify-erp.de Selbst-Check (`selfcheck_api.py`, flywheel SPEC-020).
 
 ## Development
 
@@ -16,7 +16,13 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-No tests or linter are configured in this repo.
+Tests (respx mocks Mautic, mails captured with `MAIL_MODE=memory`):
+
+```bash
+PYTHONPATH=. tests/venv/bin/python -m pytest tests -q
+```
+
+Numbered: T-SEC-0xx (security review 2026-11-08), T-SC-1xx (self-check, cases in `tests/cases/`).
 
 ## Build & Deploy
 
@@ -36,27 +42,26 @@ Credentials are stored in a k8s Secret (`mauxy-credentials`), not committed -- c
 
 ## Architecture
 
-All application logic is in `main.py` (single-file service):
+Application logic: `main.py` (newsletter, unsubscribe, health, admin), `selfcheck_api.py` (self-check router, Mautic helpers injected from main), `mailer.py` (SMTP / console / memory), `vendor/selfcheck/` (rules engine + rules JSON, vendored from flywheel by `scripts/sync_selfcheck.py` there; never edit by hand, test T-SC-150 checks the sha256).
 
-- **POST /api/subscribe** -- JSON signup payload from the website (see `website/src/config/api.ts`). Honeypot (`company_website`) short-circuits silently. Searches Mautic; returns `already_subscribed` when the contact is already tagged `newsletter_confirmed`, `already_unsubscribed_no_email_sent` on DNC, otherwise signs a 24h token (`itsdangerous`), upserts the contact with `confirmation_token` + metadata + tag `newsletter_pending`, and triggers Mautic's transactional send of `MAUTIC_CONFIRM_EMAIL_ID_{locale}`. Returns 503 on any Mautic failure. Rate-limited by `RATE_LIMIT`.
-- **GET /api/confirm?token=...** -- double opt-in landing. Validates token (`itsdangerous` max_age = `CONFIRM_TOKEN_MAX_AGE`), flips the Mautic contact from `newsletter_pending` to `newsletter_confirmed`, clears the token field, and 302-redirects to `${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed`. Failures redirect to `.../newsletter/confirm-error?reason=...`. Rate-limited by `CONFIRM_RATE_LIMIT`.
+- **POST /api/subscribe** -- JSON signup payload from the website (see `website/src/config/api.ts`). `consent` must be `true`, `source` `^[a-z0-9-]{1,40}$`, `pageUrl` on an `ALLOWED_ORIGINS` origin (<= 500 chars), `consentedAt` ignored (server time counts). Honeypot (`company_website`) short-circuits. Reads Mautic only; NOTHING is written to Mautic here. Already confirmed / DNC / throttled (`MAX_PENDING_PER_EMAIL` per 24h) -> no mail. Otherwise a row in `newsletter_pending` (SQLite, SHA-256 of the signed token `{"p": id}`) and a DOI mail via SMTP. Always `200 {"status":"pending_confirmation"}` for contact-specific outcomes; 503 when Mautic/mail is down.
+- **GET /api/confirm?token=...** -- DOI landing. Valid signature + max_age AND unused pending row with matching hash (constant time) AND not DNC; then upsert the contact (tag `newsletter_confirmed`, server-side `newsletter_consented_at`), burn the token (single use), 302 to `/{locale}/newsletter/confirmed`; else `.../newsletter/confirm-error?reason=...`. Tokens of the old flow (`{email, locale}`) are refused.
+- **POST /api/selfcheck**, **GET /api/selfcheck/confirm**, **POST /api/selfcheck/event**, **GET /api/selfcheck/submissions|stats** (admin) -- see `selfcheck_api.py` docstring and README "Selbst-Check".
 - **POST /api/unsubscribe** -- accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Returns 503 when Mautic is unreachable (search phase); contact-specific outcomes always return 200. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
 - **GET /api/actions** -- admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Supports `email`, `result`, `limit`, `offset` query params. Disabled (403) if `ADMIN_API_KEY` is unset.
 - **GET /health** -- k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
 - **GET /health/detail** -- richer health endpoint showing degraded/ok status, Mautic detail, and cache age. Always returns HTTP 200.
 - CORS is restricted to `ALLOWED_ORIGINS` (must be set via env).
 
-### Newsletter prerequisites in Mautic (one-time)
+### Mautic prerequisites (one-time)
 
-Subscribe + confirm assume these exist in Mautic (not created by the code):
-
-- Custom contact fields `confirmation_token`, `newsletter_locale`, `newsletter_source`, `newsletter_consented_at` (datetime), `newsletter_page_url`.
-- Tags `newsletter_pending` and `newsletter_confirmed`.
-- Two email templates (EN / DE). Their confirm link must be `${PUBLIC_BASE_URL}/api/confirm?token={contactfield=confirmation_token}`. Record the numeric IDs into `MAUTIC_CONFIRM_EMAIL_ID_EN` / `MAUTIC_CONFIRM_EMAIL_ID_DE`.
+- Custom contact fields `newsletter_locale`, `newsletter_source`, `newsletter_consented_at` (datetime), `newsletter_page_url` (`confirmation_token` only for clearing old values).
+- Tags `newsletter_confirmed`, `migration_radar_confirmed` (self-check Radar); optional segment id `MAUTIC_RADAR_SEGMENT_ID`.
+- No Mautic e-mail templates needed any more (DOI mails go out via SMTP).
 
 ### Persistent storage
 
-Action log uses SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/data/actions.db`). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment.
+SQLite via `aiosqlite` at `ACTION_LOG_DB` (default `/data/actions.db`): `action_log`, `newsletter_pending` (deleted after `NEWSLETTER_PENDING_DAYS`), `selfcheck_submission` (pending 7 d / confirmed 90 d), `selfcheck_counter` (day, event, lang, count only). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment.
 
 ## Environment Variables
 
@@ -74,5 +79,11 @@ Action log uses SQLite via `aiosqlite`, stored at `ACTION_LOG_DB` (default `/dat
 | `CONFIRM_TOKEN_MAX_AGE` | Token lifetime in seconds (default 86400) |
 | `PUBLIC_BASE_URL` | Public URL of mauxy; embedded in Mautic email template |
 | `PUBLIC_WEBSITE_BASE_URL` | Public URL of the website; confirm endpoint redirects here |
-| `MAUTIC_CONFIRM_EMAIL_ID_EN` | Mautic email template ID (English) |
-| `MAUTIC_CONFIRM_EMAIL_ID_DE` | Mautic email template ID (German) |
+| `NEWSLETTER_PENDING_DAYS`, `MAX_PENDING_PER_EMAIL` | Pending retention (7) / DOI mails per address and 24 h (3) |
+| `MAIL_MODE` | `smtp` / `console` (dry run) / `memory` (tests) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | mailcow mc1.simplify-erp.de, 587 STARTTLS or 465 SSL |
+| `SELFCHECK_ALLOWED_ORIGINS` | Origins allowed on the self-check endpoints (also in `ALLOWED_ORIGINS`) |
+| `SELFCHECK_WEBSITE_URL`, `SELFCHECK_NOTIFY_TO` | Confirm redirect base; operator mailbox |
+| `SELFCHECK_RATE_LIMIT`, `SELFCHECK_EVENT_RATE_LIMIT` | Per-IP submit limit; global counter limit (no IP) |
+| `SELFCHECK_PENDING_DAYS`, `SELFCHECK_RETENTION_DAYS` | Retention 7 / 90 days |
+| `MAUTIC_RADAR_TAG`, `MAUTIC_RADAR_SEGMENT_ID` | Migration Radar in Mautic (after DOI only) |
