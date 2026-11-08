@@ -94,7 +94,9 @@ def main():
 
     # Discover templates
     k8s_dir = project_root / "k8s"
-    templates = sorted(k8s_dir.glob("*.yaml"))
+    # secret.yaml is a template with EMPTY values: applying it would overwrite the real
+    # mauxy-credentials secret (Odoo / SMTP keys). The secret is created by hand (kubectl create).
+    templates = sorted(t for t in k8s_dir.glob("*.yaml") if t.name != "secret.yaml")
     if not templates:
         print("ERROR: No .yaml templates found in k8s/", file=sys.stderr)
         sys.exit(1)

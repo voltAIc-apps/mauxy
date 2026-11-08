@@ -1,8 +1,24 @@
 # Mauxy
 
-Privacy-safe email unsubscribe proxy for Mautic. Accepts unsubscribe requests from website frontends and adds contacts to the Do-Not-Contact (DNC) list -- without exposing Mautic credentials to the browser.
+The website's interface to other systems (owner decision 2026-11-08, flywheel SPEC-021): public
+consent service of simplify-erp.de for newsletter, Migration Radar, Selbst-Check and every lead CTA
+(contact form, app inquiry, webinar registration, shop checkout). Double opt-in for everything;
+confirmed data goes to **sinks**: `crm.lead` and Email Marketing lists in erp.wapsol (Odoo 18,
+default). Mautic is a deprecated sink (`SUBSCRIBER_SINK=mautic`) until it is shut down.
+Credentials stay server-side.
 
-**Key design property:** Every contact-specific request returns `{"status": "ok"}` regardless of whether the email exists, was already unsubscribed, or caused an error -- this prevents email enumeration attacks. Returns `503` when Mautic is unreachable so the frontend can prompt the user to retry.
+**Key design property:** every contact-specific request gets the same answer (`pending_confirmation`
+/ `ok`), immediately, whatever the address -- no enumeration through content, status or timing.
+Nothing is written to any sink before the confirmation link is clicked.
+
+| Area | Endpoints | Code |
+|---|---|---|
+| Newsletter | `POST /api/subscribe`, `GET /api/confirm`, `POST /api/unsubscribe` | `main.py` |
+| Selbst-Check | `/api/selfcheck*` | `selfcheck_api.py` |
+| CTA leads | `POST /api/lead`, `GET /api/lead/confirm`, admin `/api/lead/submissions`, `/api/lead/sync/{id}/retry` | `leads_api.py` |
+| Delivery after DOI | outbox with retries | `lead_sync.py` |
+| Sinks | Odoo lead + subscriber sink, deprecated Mautic sink | `sinks.py`, `mautic_sink.py` |
+| Odoo | the one Odoo client (JSON-RPC, allowlist) | `odoo_client.py` |
 
 ---
 
@@ -168,10 +184,11 @@ Two health endpoints are available. Both always return HTTP 200.
 
 | Endpoint | Purpose | Example response |
 |---|---|---|
-| `GET /health` | Kubernetes liveness/readiness probe. Also useful for a quick manual check. | `{"status": "ok", "mautic": "reachable"}` |
-| `GET /health/detail` | Richer status with `ok` / `degraded` indicator and cache age. | `{"status": "ok", "mautic": "reachable", "cache_age_seconds": 12.3}` |
+| `GET /health` | Kubernetes liveness/readiness probe (cheap, no sink call). | `{"status": "ok"}` |
+| `GET /health/detail` | Sink reachability, `ok` / `degraded`, cache age (30 s). | `{"status": "ok", "lead_sink": "odoo: reachable (18.0+e)", "subscriber_sink": "odoo: reachable (18.0+e)", "cache_age_seconds": 3.1}` |
 
-If `status` is `degraded`, the proxy cannot reach Mautic. Unsubscribe requests will return `503 {"status": "service_unavailable"}` and the attempt is logged as `mautic_unreachable`.
+`degraded`: a sink is unreachable or misconfigured. Unsubscribe then returns `503`; confirmed
+leads wait in the outbox and are retried (see "CTA leads").
 
 ---
 
@@ -242,21 +259,22 @@ curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
 ## Newsletter Signup (Double Opt-In)
 
 `POST /api/subscribe` (payload: `website/src/config/api.ts`) starts a double opt-in **without
-touching Mautic**: the request is kept in SQLite (`newsletter_pending`) and a confirmation link is
+writing to any sink** (the job only reads: already subscribed / blacklisted -> no mail): the request is kept in SQLite (`newsletter_pending`) and a confirmation link is
 mailed via SMTP. Every valid request (new, already confirmed, DNC, throttled, Mautic down) gets the same immediate
 `200 {"status": "pending_confirmation"}`; the contact-dependent work runs after the response as a job
 (`jobs.py`), so neither content, status code nor timing reveal anything (T-SEC-017/018). `consent` must be `true`; the consent
 timestamp is the server time of the click; `pageUrl` must be on an `ALLOWED_ORIGINS` origin.
 
-`GET /api/confirm?token=...` checks signature + age, a matching unused pending record (SHA-256,
-constant-time) and that the address is not DNC; only then the contact is created/updated in
-Mautic (tag `newsletter_confirmed`) and the token is burnt (single use). 302 to
+`GET /api/confirm?token=...` checks signature + age and a matching unused pending record (SHA-256,
+constant-time); then the subscriber sink subscribes (Odoo: `mailing.contact` / `mailing.subscription`
+on `ODOO_LIST_NEWSLETTER_ID`; deprecated Mautic: tag `newsletter_confirmed`) and the token is burnt
+(single use). Blacklisted / DNC -> burnt, error page; sink down -> token stays valid. 302 to
 `${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed` (or `confirm-error?reason=...`).
 
 Security review 2026-11-08 (enumeration, token replay, consent validation, pre-confirmation CRM
 writes): fixed, tests T-SEC-001..018. Tokens issued by the earlier flow are refused (users re-subscribe).
 
-### One-time Mautic setup
+### One-time Mautic setup (DEPRECATED, only with `SUBSCRIBER_SINK=mautic`)
 
 - Contact fields `newsletter_locale`, `newsletter_source`, `newsletter_consented_at` (date/time),
   `newsletter_page_url`; tags `newsletter_confirmed`, `migration_radar_confirmed`.
@@ -267,7 +285,7 @@ writes): fixed, tests T-SEC-001..018. Tokens issued by the earlier flow are refu
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/selfcheck` | `{email, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company_website}`. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
-| `GET /api/selfcheck/confirm?token=` | Single-use. Result mail (pick `mail`), Migration Radar in Mautic (pick `radar`, not DNC), notification to `SELFCHECK_NOTIFY_TO` (always: indicative-quote request, call yes/no, answers). 302 to `/{lang}/selbst-check?bestaetigt=1` / `=fehler`. |
+| `GET /api/selfcheck/confirm?token=` | Single-use. Result mail (pick `mail`), then the outbox: Migration Radar via the subscriber sink (pick `radar`, not blacklisted), `crm.lead` (picks `mail` / `call`; Radar alone = no lead), notification to `SELFCHECK_NOTIFY_TO` (always: quote request, call yes/no, answers, CRM lead id). 302 to `/{lang}/selbst-check?bestaetigt=1` / `=fehler`. Optional field `company` names the lead. |
 | `POST /api/selfcheck/event` | `{event: started|completed|exited_early|submitted, lang}` -> 204. Stores day + event + lang only; global rate-limit key (IP never read), access-log lines dropped. |
 | `GET /api/selfcheck/submissions` | Admin (Bearer `ADMIN_API_KEY`): confirmed (or pending) submissions. |
 | `GET /api/selfcheck/stats` | Admin: counters per day (success metric "completed checks"). |
@@ -275,6 +293,96 @@ writes): fixed, tests T-SEC-001..018. Tokens issued by the earlier flow are refu
 Rules: `vendor/selfcheck/` is a copy of flywheel `backend/libs/selfcheck.py` + `website/src/data/selfcheck.json`,
 refreshed with `python scripts/sync_selfcheck.py --mauxy <this repo>` in flywheel. Retention: pending
 7 days, confirmed 90 days (`SELFCHECK_*_DAYS`). Local dry run: `MAIL_MODE=console` prints mails instead of sending.
+
+## CTA leads (flywheel SPEC-021)
+
+`POST /api/lead` with `kind` = `contact` | `inquiry` | `webinar` | `checkout` | `selfcheck`
+(selfcheck = alias of `POST /api/selfcheck`). Per-kind schema, extra fields refused, lengths
+limited, no control characters; honeypot `company_website`; Origin must be in
+`LEAD_ALLOWED_ORIGINS`; `newsletter: true` = the ticked newsletter box, confirmed by the same DOI.
+
+| kind | required | optional |
+|---|---|---|
+| contact | email, lang, name, company, message (<= 4000) | phone, newsletter, page_url |
+| inquiry | email, lang, subject_id, subject_title, subject_type (app/page/webinar/card/offer) | name, company, phone, message (<= 2000) |
+| webinar | email, lang, name, company, webinar_id, webinar_title, date (ISO with zone, -1 d .. +2 y) | newsletter, page_url |
+| checkout | email, lang, name, company, product_id, product_title, price_net, order_ref `ORD-...`, billing {street, postal_code, city, country ISO-2}, terms: true | phone, bundle, technology, services[<=20], vat_id, currency EUR |
+
+Flow: immediate `200 {"status":"pending_confirmation"}`; storage + ONE DOI mail (server-side text
+only) run as a job; throttle `MAX_PENDING_PER_EMAIL` / 24 h, silent. `GET /api/lead/confirm?token=`
+(own salt, single use) burns the token and queues the delivery, 302 to
+`/{lang}/anfrage/bestaetigt?art=<kind>` (error `/{lang}/anfrage/fehler`).
+
+Delivery (`lead_sync.py`, table `lead_sync`, UNIQUE per submission = at most one lead):
+subscriptions first, then the lead; each finished step is stored. `SinkTransient` -> retry with
+backoff (`LEAD_SYNC_BACKOFF_SECONDS` x 2^n, max 1 h, `LEAD_SYNC_MAX_ATTEMPTS`), resumed after a
+restart. A retry first looks for the lead of an earlier attempt (marker `Referenz: mauxy-<hex>` in
+the description), so a lost response never yields a duplicate. Permanent failure / retries
+exhausted -> mail with the whole submission to `LEAD_NOTIFY_TO`; after fixing the cause:
+`POST /api/lead/sync/{id}/retry` (admin). Delivered rows keep only ids (`odoo_lead_id`, list
+results); submissions are deleted after `LEAD_RETENTION_DAYS` (30), unconfirmed after 7 days.
+
+### What is written to erp.wapsol (and nothing else)
+
+- `crm.lead` create: `name` ("Website: Kontaktanfrage – Muster GmbH", "Website: Selbst-Check SAP ECC / R/3 – Muster GmbH", ...
+  from submitted fields only), `type=lead`, `user_id=ODOO_LEAD_USER_ID`, `description` (plain text,
+  HTML-escaped: submitted content, Selbst-Check answers + result text from the shared rules engine,
+  what was requested, UTM line, marker), `source_id` / `medium_id` / `campaign_id` (existing UTM records
+  by name: `ODOO_UTM_SOURCE`, `ODOO_UTM_MEDIUM`, campaign = kind; missing -> left empty, warning),
+  optional `team_id`, `tag_ids`. Exactly one active `res.partner` with that e-mail -> `partner_id`
+  (+ `contact_name`); then NO `email_from` / `phone` (crm.lead's inverse would write them onto the
+  partner). Otherwise `contact_name`, `partner_name`, `email_from`, `phone`.
+- `crm.lead.message_subscribe` (Ashant's partner) only if Odoo did not already auto-follow him.
+- `mailing.contact` create (name, email, company_name + one subscription line) or
+  `mailing.subscription` create (existing contact joins the list; the contact is not changed);
+  `mailing.subscription.write({'opt_out': ...})`: opt-out on unsubscribe, re-subscribe after a new
+  DOI. Blacklisted addresses (`mail.blacklist`) are never (re)subscribed.
+- Never: write / unlink / merge on `res.partner` or existing leads, UTM create. Enforced twice:
+  `odoo_client.ALLOWED` / `WRITE_FIELDS` (client) and the bot's Odoo group (server).
+
+### erp.wapsol setup (owner, one-time)
+
+1. Group `Website Bot (mauxy)` (Settings > Technical > Groups), no implied groups. Access rights:
+   `res.partner` read; `res.users` read (default); `crm.lead` read + create + write; `utm.source`,
+   `utm.medium`, `utm.campaign` read; `mail.blacklist` read; `mailing.list` read;
+   `mailing.contact` read + create; `mailing.subscription` read + create + write. No unlink anywhere.
+2. Record rules for the group: `crm.lead` read + write `[('create_uid', '=', user.id)]` (only its own
+   leads; write is needed by Odoo's message_subscribe, mauxy never calls write on leads);
+   `mailing.subscription` read/create/write `[('list_id', 'in', [<newsletter id>, <radar id>])]`;
+   `mailing.contact` read/create `[('list_ids', 'in', [<ids>])]` (or no rule if contacts of other
+   lists must be found to avoid duplicates -- then read only).
+3. User `website-bot` (internal user, NOT portal, no other groups; e-mail notifications off), group
+   from 1, API key (Preferences > Account Security > New API key, name "mauxy"). If Odoo requires
+   a sales group for crm.lead creation, add "Sales / User: Own Documents Only" and keep rule 2.
+4. Email Marketing: lists "Newsletter" and "Migration Radar" -> ids into `ODOO_LIST_*_ID`.
+   Unsubscribe link in mailings = Odoo's own (opt-out lands on the same `mailing.subscription`).
+5. UTM: source `simplify-erp.de`, medium `Website` (exists by default), campaigns `selfcheck`,
+   `contact`, `inquiry`, `webinar`, `checkout`.
+6. Ashant's `res.users` id -> `ODOO_LEAD_USER_ID`; optional CRM team -> `ODOO_LEAD_TEAM_ID`.
+7. Secret `mauxy-credentials` (namespace of mauxy, see `k8s/secret.yaml`): `ODOO_URL`, `ODOO_DB`,
+   `ODOO_USER`, `ODOO_API_KEY`, `ODOO_LEAD_USER_ID`, `ODOO_LIST_NEWSLETTER_ID`, `ODOO_LIST_RADAR_ID`,
+   `LEAD_ALLOWED_ORIGINS`, `LEAD_NOTIFY_TO` (+ existing SMTP / token / origin keys). Never in git.
+8. Check, read only: `python scripts/odoo_smoke.py --env-file <file with the bot credentials>`
+   (version, bot login + groups, Ashant, teams, UTM, lists, needed rights True, forbidden rights False).
+
+Deploy order: mauxy first (new endpoints, Odoo sinks), then the website.
+
+### Local run (fake Odoo, mails on the console)
+
+`PYTHONPATH=. tests/venv/bin/python tests/scripts/run_local.py` -> `http://10.0.99.1:8020`,
+`GET /__fake_odoo` shows what was written. Refuses any `ODOO_URL` other than the fake.
+
+### Security notes
+
+- MITM: Odoo and SMTP only over TLS with certificate verification (`odoo_client` refuses http);
+  the browser reaches mauxy over HTTPS (ingress). Risk low while TLS is verified; a compromised
+  CA / proxy with a trusted cert could read the API key and lead data -> keep the bot's rights
+  minimal (rules above) so a stolen key can only create leads / list entries, never read sales,
+  invoices or change partners. Rotate the key on suspicion (Odoo API keys page).
+- Personal data: pending submissions in mauxy SQLite (7 d), confirmed ones 30 d (then only in
+  Odoo, the system of record; deletion requests there). No IP / user agent stored for leads.
+- Scale: one replica (SQLite on an RWO volume, in-process outbox). More replicas need a shared DB
+  and a leader for the outbox.
 
 ## Roadmap
 

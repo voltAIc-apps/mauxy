@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-**mauxy** -- centralized newsletter subscription + unsubscribe proxy for Mautic. Python (FastAPI) microservice that accepts subscribe/unsubscribe requests from SPA frontends and manages contacts via the Mautic REST API. Mautic Basic Auth credentials stay server-side and are never exposed to the browser. Contact-specific responses are uniform (`ok` / `pending_confirmation`) to prevent email enumeration; returns 503 when Mautic is unreachable. GDPR double opt-in with server-side pending state (SQLite) and SMTP confirmation mails (mailcow). Also the public consent service of the simplify-erp.de Selbst-Check (`selfcheck_api.py`, flywheel SPEC-020).
+**mauxy** -- the website's interface to other systems (owner decision 2026-11-08, flywheel SPEC-021). Python (FastAPI). Public consent service of simplify-erp.de: newsletter + Migration Radar double opt-in, Selbst-Check (`selfcheck_api.py`, SPEC-020) and every lead CTA (`leads_api.py`: contact, inquiry, webinar, checkout). After the DOI click, `lead_sync.py` delivers to the sinks (`sinks.py`): `crm.lead` + Email Marketing lists in erp.wapsol (Odoo 18) via `odoo_client.py` -- the ONE sanctioned write path into erp.wapsol, create-only, own bot user, allowlist of (model, method). Mautic = deprecated `SUBSCRIBER_SINK=mautic` (`mautic_sink.py`), delete with Mautic. Responses are uniform and immediate (no enumeration); nothing is written to any sink before the confirmation. Credentials from env only, never logged.
 
 ## Development
 
@@ -22,7 +22,7 @@ Tests (respx mocks Mautic, mails captured with `MAIL_MODE=memory`):
 PYTHONPATH=. tests/venv/bin/python -m pytest tests -q
 ```
 
-Numbered: T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check, cases in `tests/cases/`).
+Numbered: T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check), T-ODOO-0xx (Odoo client), T-SINK-0xx (sinks), T-LEAD-0xx (CTA leads, outbox; cases in `tests/cases/`). Odoo is ALWAYS the in-memory fake (`tests/fake_odoo.py`, `odoo` fixture); legacy suites run with `LEAD_SINK=none`, `SUBSCRIBER_SINK=mautic`. Local run with the fake: `tests/scripts/run_local.py` (10.0.99.1:8020). Read-only check against the real erp.wapsol (only with the bot credentials): `scripts/odoo_smoke.py`.
 
 ## Build & Deploy
 
@@ -42,18 +42,15 @@ Credentials are stored in a k8s Secret (`mauxy-credentials`), not committed -- c
 
 ## Architecture
 
-Application logic: `main.py` (newsletter, unsubscribe, health, admin), `selfcheck_api.py` (self-check router, Mautic helpers injected from main), `mailer.py` (SMTP / console / memory), `jobs.py` (fire-and-forget jobs for contact-dependent work), `vendor/selfcheck/` (rules engine + rules JSON, vendored from flywheel by `scripts/sync_selfcheck.py` there; never edit by hand, test T-SC-150 checks the sha256).
+- `main.py` newsletter (`/api/subscribe`, `/api/confirm`, `/api/unsubscribe` via the subscriber sink), `/health` (cheap), `/health/detail` (sinks), `/api/actions` (admin), lifespan (DB, purge, outbox resume, drain with timeout).
+- `selfcheck_api.py` `/api/selfcheck*` (SPEC-020); confirm sends the result mail, then queues Radar + lead + operator mail in the outbox. `vendor/selfcheck/` = rules engine from flywheel (`scripts/sync_selfcheck.py` there; T-SC-150 checks the sha256, never edit).
+- `leads_api.py` `POST /api/lead` (kinds contact/inquiry/webinar/checkout/selfcheck), `GET /api/lead/confirm`, admin `GET /api/lead/submissions`, `POST /api/lead/sync/{id}/retry`; renders the lead title + plain-text description.
+- `lead_sync.py` outbox table `lead_sync` (UNIQUE per submission), retries with backoff via `jobs.py`, marker search against duplicates, failure mail to `LEAD_NOTIFY_TO`, data cleared after delivery.
+- `sinks.py` `OdooLeadSink`, `OdooSubscriberSink`, none sinks, factory (`LEAD_SINK`, `SUBSCRIBER_SINK`). `odoo_client.py` JSON-RPC over verified HTTPS, `ALLOWED` / `WRITE_FIELDS`.
+- `mailer.py` SMTP / console / memory. `jobs.py` fire-and-forget tasks (after the response).
+- Owner setup of erp.wapsol (bot user, group, rules, lists, UTM): README "erp.wapsol setup".
 
-- **POST /api/subscribe** -- JSON signup payload from the website (see `website/src/config/api.ts`). `consent` must be `true`, `source` `^[a-z0-9-]{1,40}$`, `pageUrl` on an `ALLOWED_ORIGINS` origin (<= 500 chars), `consentedAt` ignored (server time counts). Honeypot (`company_website`) short-circuits. Reads Mautic only; NOTHING is written to Mautic here. Already confirmed / DNC / throttled (`MAX_PENDING_PER_EMAIL` per 24h) -> no mail. Otherwise a row in `newsletter_pending` (SQLite, SHA-256 of the signed token `{"p": id}`) and a DOI mail via SMTP. Once the input is valid the answer is an immediate, identical `200 {"status":"pending_confirmation"}`; Mautic lookup, throttle, storage and mail run afterwards as a job (`jobs.py`), errors are only logged (no enumeration via content, status or timing). 503 only when DOI is not configured.
-- **GET /api/confirm?token=...** -- DOI landing. Valid signature + max_age AND unused pending row with matching hash (constant time) AND not DNC; then upsert the contact (tag `newsletter_confirmed`, server-side `newsletter_consented_at`), burn the token (single use), 302 to `/{locale}/newsletter/confirmed`; else `.../newsletter/confirm-error?reason=...`. Tokens of the old flow (`{email, locale}`) are refused.
-- **POST /api/selfcheck**, **GET /api/selfcheck/confirm**, **POST /api/selfcheck/event**, **GET /api/selfcheck/submissions|stats** (admin) -- see `selfcheck_api.py` docstring and README "Selbst-Check".
-- **POST /api/unsubscribe** -- accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Returns 503 when Mautic is unreachable (search phase); contact-specific outcomes always return 200. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.
-- **GET /api/actions** -- admin endpoint to query the action log. Requires `Authorization: Bearer {ADMIN_API_KEY}`. Supports `email`, `result`, `limit`, `offset` query params. Disabled (403) if `ADMIN_API_KEY` is unset.
-- **GET /health** -- k8s liveness/readiness probe. Includes Mautic connectivity status in response body (always returns HTTP 200).
-- **GET /health/detail** -- richer health endpoint showing degraded/ok status, Mautic detail, and cache age. Always returns HTTP 200.
-- CORS is restricted to `ALLOWED_ORIGINS` (must be set via env).
-
-### Mautic prerequisites (one-time)
+### Mautic prerequisites (DEPRECATED, only with SUBSCRIBER_SINK=mautic)
 
 - Custom contact fields `newsletter_locale`, `newsletter_source`, `newsletter_consented_at` (datetime), `newsletter_page_url` (`confirmation_token` only for clearing old values).
 - Tags `newsletter_confirmed`, `migration_radar_confirmed` (self-check Radar); optional segment id `MAUTIC_RADAR_SEGMENT_ID`.
@@ -61,15 +58,20 @@ Application logic: `main.py` (newsletter, unsubscribe, health, admin), `selfchec
 
 ### Persistent storage
 
-SQLite via `aiosqlite` at `ACTION_LOG_DB` (default `/data/actions.db`): `action_log`, `newsletter_pending` (deleted after `NEWSLETTER_PENDING_DAYS`), `selfcheck_submission` (pending 7 d / confirmed 90 d), `selfcheck_counter` (day, event, lang, count only). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment.
+SQLite via `aiosqlite` at `ACTION_LOG_DB` (default `/data/actions.db`): `action_log`, `newsletter_pending` (deleted after `NEWSLETTER_PENDING_DAYS`), `selfcheck_submission` (pending 7 d / confirmed 90 d), `selfcheck_counter` (day, event, lang, count only), `lead_submission` (pending 7 d / confirmed 30 d), `lead_sync` (outbox; deleted 30 d after done / failed). One replica only (SQLite RWO + in-process outbox). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment.
 
 ## Environment Variables
 
 | Variable | Purpose |
 |---|---|
-| `MAUTIC_BASE_URL` | Mautic instance URL |
-| `MAUTIC_USERNAME` | Mautic API basic auth user |
-| `MAUTIC_PASSWORD` | Mautic API basic auth password |
+| `LEAD_SINK`, `SUBSCRIBER_SINK` | `odoo` (default) / `none`; subscriber also `mautic` (deprecated) |
+| `ODOO_URL`, `ODOO_DB`, `ODOO_USER`, `ODOO_API_KEY`, `ODOO_TIMEOUT` | erp.wapsol, mauxy's own bot user, https only |
+| `ODOO_LEAD_USER_ID`, `ODOO_LEAD_TEAM_ID`, `ODOO_LEAD_TAG_IDS` | salesperson (+ follower), optional team / tags |
+| `ODOO_UTM_SOURCE`, `ODOO_UTM_MEDIUM` | UTM names (default `simplify-erp.de`, `Website`); campaign = kind |
+| `ODOO_LIST_NEWSLETTER_ID`, `ODOO_LIST_RADAR_ID` | Email Marketing lists |
+| `LEAD_ALLOWED_ORIGINS`, `LEAD_WEBSITE_URL`, `LEAD_RATE_LIMIT`, `LEAD_NOTIFY_TO`, `LEAD_PENDING_DAYS`, `LEAD_RETENTION_DAYS` | CTA leads |
+| `LEAD_SYNC_MAX_ATTEMPTS`, `LEAD_SYNC_BACKOFF_SECONDS`, `SHUTDOWN_DRAIN_SECONDS` | outbox retries / shutdown |
+| `MAUTIC_BASE_URL`, `MAUTIC_USERNAME`, `MAUTIC_PASSWORD` | DEPRECATED Mautic sink |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
 | `RATE_LIMIT` | slowapi rate limit for subscribe/unsubscribe (default `5/minute`) |
 | `CONFIRM_RATE_LIMIT` | slowapi rate limit for `/api/confirm` (default `30/minute`) |
@@ -86,4 +88,4 @@ SQLite via `aiosqlite` at `ACTION_LOG_DB` (default `/data/actions.db`): `action_
 | `SELFCHECK_WEBSITE_URL`, `SELFCHECK_NOTIFY_TO` | Confirm redirect base; operator mailbox |
 | `SELFCHECK_RATE_LIMIT`, `SELFCHECK_EVENT_RATE_LIMIT` | Per-IP submit limit; global counter limit (no IP) |
 | `SELFCHECK_PENDING_DAYS`, `SELFCHECK_RETENTION_DAYS` | Retention 7 / 90 days |
-| `MAUTIC_RADAR_TAG`, `MAUTIC_RADAR_SEGMENT_ID` | Migration Radar in Mautic (after DOI only) |
+| `MAUTIC_RADAR_TAG`, `MAUTIC_RADAR_SEGMENT_ID` | DEPRECATED: Migration Radar in Mautic |

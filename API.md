@@ -2,6 +2,10 @@
 
 Base URL: `https://newsletter.example.com` (set via `DEPLOY_DOMAIN`)
 
+Lead CTAs (`POST /api/lead`, `GET /api/lead/confirm`, admin endpoints) and the Selbst-Check are
+documented in the README ("CTA leads", "Selbst-Check"). Unsubscribe below works on the active
+subscriber sink (Odoo mailing lists by default; Mautic DNC only with the deprecated Mautic sink).
+
 ---
 
 ## POST /api/unsubscribe

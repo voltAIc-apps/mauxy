@@ -4,9 +4,11 @@ Selbst-Check endpoints (simplify-erp.de /:lang/selbst-check, flywheel SPEC-020).
   POST /api/selfcheck            submission: e-mail + picks (mail/call/radar) + answers.
                                  Validated against the vendored rules, stored minimally, ONE
                                  double opt-in mail. Uniform 200 for every contact-specific outcome.
-  GET  /api/selfcheck/confirm    DOI link: result mail (if picked), Migration Radar in Mautic
-                                 (if picked, not DNC), notification to the operator (always).
-                                 Then 302 back to the website (?bestaetigt=1 / =fehler).
+  GET  /api/selfcheck/confirm    DOI link: result mail (if picked), then the outbox (lead_sync):
+                                 Migration Radar via the subscriber sink (if picked, not blacklisted),
+                                 crm.lead in erp.wapsol (picks mail / call; SPEC-021), notification
+                                 to the operator (always). 302 back to the website (?bestaetigt=1 / =fehler).
+                                 POST /api/lead with kind "selfcheck" is an alias of POST /api/selfcheck.
   POST /api/selfcheck/event      anonymous counter (started/completed/exited_early/submitted):
                                  stores day + event + lang only. No IP (global rate limit key,
                                  access log filtered), no cookie, no identifier.
@@ -14,7 +16,7 @@ Selbst-Check endpoints (simplify-erp.de /:lang/selbst-check, flywheel SPEC-020).
                                  indicative quote and the flywheel follow-up (G3 import).
   GET  /api/selfcheck/stats        admin: counters per day.
 
-Nothing is written to Mautic before the confirmation. Retention: unconfirmed submissions are
+Nothing is written to any sink (Odoo / Mautic) before the confirmation. Retention: unconfirmed submissions are
 deleted after SELFCHECK_PENDING_DAYS (7), confirmed ones after SELFCHECK_RETENTION_DAYS (90).
 Rules + engine are vendored from flywheel (vendor/selfcheck, scripts/sync_selfcheck.py there).
 """
@@ -26,16 +28,16 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Literal, Optional
+from typing import Callable, Literal, Optional
 
 import aiosqlite
-import httpx
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 import jobs
+import lead_sync
 import mailer
 from vendor.selfcheck import selfcheck as engine
 
@@ -51,8 +53,6 @@ SELFCHECK_EVENT_RATE_LIMIT = os.environ.get("SELFCHECK_EVENT_RATE_LIMIT", "600/m
 SELFCHECK_PENDING_DAYS = int(os.environ.get("SELFCHECK_PENDING_DAYS", "7"))
 SELFCHECK_RETENTION_DAYS = int(os.environ.get("SELFCHECK_RETENTION_DAYS", "90"))
 SELFCHECK_NOTIFY_TO = os.environ.get("SELFCHECK_NOTIFY_TO", "")
-MAUTIC_RADAR_TAG = os.environ.get("MAUTIC_RADAR_TAG", "migration_radar_confirmed")
-MAUTIC_RADAR_SEGMENT_ID = os.environ.get("MAUTIC_RADAR_SEGMENT_ID", "")
 CONFIRM_TOKEN_SECRET = os.environ.get("CONFIRM_TOKEN_SECRET", "")
 CONFIRM_TOKEN_MAX_AGE = int(os.environ.get("CONFIRM_TOKEN_MAX_AGE", "86400"))
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
@@ -104,9 +104,15 @@ async def init_db(db: aiosqlite.Connection) -> None:
             confirmed_at  TEXT,
             mail_sent     INTEGER,
             notify_sent   INTEGER,
-            radar_result  TEXT
+            radar_result  TEXT,
+            company       TEXT
         )
     """)
+    # migration for databases created before SPEC-021 (optional company field)
+    async with db.execute("PRAGMA table_info(selfcheck_submission)") as cur:
+        cols = {r[1] for r in await cur.fetchall()}
+    if "company" not in cols:
+        await db.execute("ALTER TABLE selfcheck_submission ADD COLUMN company TEXT")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_sc_email ON selfcheck_submission(email, created_at)")
     # Anonymous counters: day + event + lang, nothing else.
     await db.execute("""
@@ -155,6 +161,8 @@ class SelfCheckRequest(BaseModel):
     stay: Optional[StayInputs] = None
     rules_version: str = Field(max_length=40)
     consent: Literal[True]
+    # optional (SPEC-021): only used to name the CRM lead; letters, digits, punctuation, no controls
+    company: Optional[str] = Field(default=None, min_length=1, max_length=160, pattern=r"^[^\x00-\x1f\x7f]+$")
     company_website: Optional[str] = Field(default=None, max_length=200)
 
     @field_validator("picks")
@@ -205,29 +213,100 @@ def result_mail(row: aiosqlite.Row) -> tuple[str, str]:
     return m["subject"][lang], body
 
 
-def notify_mail(row: aiosqlite.Row, radar_result: str, mail_sent: bool) -> tuple[str, str]:
-    """Operator mail (always German): indicative-quote request + call yes/no + answers."""
+def _summary(row, radar_result: str, mail_sent: Optional[bool]) -> tuple[str, list[str]]:
+    """(short pick titles, German summary lines) shared by the operator mail and the CRM lead."""
     picks = json.loads(row["picks"])
     answers = json.loads(row["answers"])
-    stay = json.loads(row["stay"]) if row["stay"] else None
     prog = engine.progress(RULES, answers)
     prec = RULES["precision"]["words"][prog["precision"]["level"]]["de"]
     short = ", ".join(engine.pick_titles(RULES, picks, "de"))
-    subject = RULES["mail"]["notify"]["subject"]["de"].format(picks_short=short, precision=prec)
     lines = [
         f"Selbst-Check #{row['id']} bestätigt am {row['confirmed_at'] or _iso(_now())} (Sprache {row['lang']}).",
         f"E-Mail: {row['email']}",
+    ]
+    if row["company"]:
+        lines.append(f"Firma: {row['company']}")
+    lines += [
         f"Gewählt: {short}",
         f"Richtangebot: {'ja' if 'mail' in picks else 'nein'} ({prog['answered']} von {prog['total']} Antworten, Genauigkeit {prec})",
         f"Kennenlernen (Meetly): {'ja, Termin wählt die Person selbst' if 'call' in picks else 'nein'}",
         f"Migration Radar: {radar_result}",
-        f"Ergebnis-Mail an die Person: {'gesendet' if mail_sent else ('nicht gewählt' if 'mail' not in picks else 'FEHLER, bitte manuell senden')}",
-        "",
-        engine.result_text(RULES, answers, "de", stay),
-        "",
-        f"Regeln {row['rules_version']} (Server {RULES['version']}). Aufbewahrung {SELFCHECK_RETENTION_DAYS} Tage.",
     ]
-    return subject, "\n".join(lines)
+    if mail_sent is not None:
+        lines.append(f"Ergebnis-Mail an die Person: {'gesendet' if mail_sent else ('nicht gewählt' if 'mail' not in picks else 'FEHLER, bitte manuell senden')}")
+    return short, lines
+
+
+def _body(row, lines: list[str]) -> str:
+    answers = json.loads(row["answers"])
+    stay = json.loads(row["stay"]) if row["stay"] else None
+    return "\n".join(lines + ["", engine.result_text(RULES, answers, "de", stay), "",
+                              f"Regeln {row['rules_version']} (Server {RULES['version']}). Aufbewahrung {SELFCHECK_RETENTION_DAYS} Tage."])
+
+
+def notify_mail(row, radar_result: str, mail_sent: bool, crm_line: str = "") -> tuple[str, str]:
+    """Operator mail (always German): indicative-quote request + call yes/no + answers + CRM lead."""
+    answers = json.loads(row["answers"])
+    prog = engine.progress(RULES, answers)
+    prec = RULES["precision"]["words"][prog["precision"]["level"]]["de"]
+    short, lines = _summary(row, radar_result, mail_sent)
+    if crm_line:
+        lines.append(crm_line)
+    subject = RULES["mail"]["notify"]["subject"]["de"].format(picks_short=short, precision=prec)
+    return subject, _body(row, lines)
+
+
+def lead_for(row, ref: str) -> Optional[dict]:
+    """CRM lead of a confirmed self-check (SPEC-021): only for picks mail (Richtangebot) / call.
+    Radar alone is a subscription, not a lead. Title from submitted fields only."""
+    picks = json.loads(row["picks"])
+    if not ({"mail", "call"} & set(picks)):
+        return None
+    answers = json.loads(row["answers"])
+    labels = {o["id"]: o["label"]["de"] for q in RULES["questions"] if q["id"] == "system" for o in q["options"]}
+    systems = " + ".join(labels[x] for x in (answers.get("system") or []) if x in labels)
+    who = row["company"] or row["email"]
+    title = f"Website: Selbst-Check {systems} – {who}" if systems else f"Website: Selbst-Check – {who}"
+    _, lines = _summary(row, "gewählt" if "radar" in picks else "nicht gewählt", None)
+    wanted = [t for p, t in zip(("mail", "call"), ("Ergebnis und Richtangebot per Mail", "30 Minuten Kennenlernen (Meetly)")) if p in picks]
+    lines.insert(2, "Angefragt: " + "; ".join(wanted))
+    desc = _body(row, lines) + f"\n\nQuelle: simplify-erp.de / Website / Kampagne selfcheck\nReferenz: {ref}"
+    return {"ref": ref, "kind": "selfcheck", "campaign": "selfcheck", "title": title, "email": row["email"],
+            "contact_name": None, "partner_name": row["company"], "phone": None, "lang": row["lang"], "description": desc}
+
+
+async def finish(db: aiosqlite.Connection, sync: dict, outcome: str) -> None:
+    """lead_sync hook: store the Radar outcome, then the operator notification (always)."""
+    sid = sync["origin_id"]
+    async with db.execute("SELECT * FROM selfcheck_submission WHERE id = ?", (sid,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    picks = json.loads(row["picks"])
+    results = json.loads(sync["sub_results"] or "{}")
+    if "radar" not in picks:
+        radar = "nicht gewählt"
+    else:
+        radar = results.get("radar") or f"error:{(sync['last_error'] or 'unknown')[:80]}"
+    if sync["odoo_lead_id"]:
+        crm = f"CRM-Lead (erp.wapsol): #{sync['odoo_lead_id']}"
+    elif not sync["lead"]:
+        crm = "CRM-Lead: keiner (nur Radar)"
+    elif outcome == "failed":
+        crm = f"CRM-Lead: FEHLER, bitte manuell anlegen ({(sync['last_error'] or '')[:120]})"
+    else:
+        crm = "CRM-Lead: nicht angelegt (LEAD_SINK=none)"
+    notify_sent = False
+    if SELFCHECK_NOTIFY_TO:
+        subject, body = notify_mail(row, radar, bool(row["mail_sent"]), crm)
+        notify_sent = await mailer.send(SELFCHECK_NOTIFY_TO, subject, body, reply_to=row["email"])
+    await db.execute("UPDATE selfcheck_submission SET notify_sent = ?, radar_result = ? WHERE id = ?",
+                     (int(notify_sent), radar, sid))
+    await db.commit()
+    logger.info("SELFCHECK_DELIVERED id=%s radar=%s lead=%s notify=%s", sid, radar, sync["odoo_lead_id"], notify_sent)
+
+
+lead_sync.register("selfcheck", finish)
 
 
 # --------------------------------------------------------------------------- router
@@ -263,10 +342,11 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     stay = payload.stay.model_dump(exclude_none=True) if payload.stay else None
     prog = engine.progress(RULES, clean)
     cur = await db.execute(
-        "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete, company) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
-         json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"])),
+         json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"]),
+         " ".join(payload.company.split()) if payload.company else None),
     )
     sid = cur.lastrowid
     token = _signer.dumps({"s": sid})
@@ -288,71 +368,32 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     logger.info("SELFCHECK_PENDING id=%s picks=%s complete=%s", sid, ",".join(payload.picks), prog["complete"])
 
 
-def build_router(
-    *,
-    limiter,
-    search_contact: Callable[[httpx.AsyncClient, str], Awaitable[tuple[int, dict | None]]],
-    contact_is_dnc: Callable[[dict], bool],
-    upsert_contact: Callable[..., Awaitable[tuple[int, dict | None]]],
-    admin_ok: Callable[[Request], bool],
-    mautic: Callable[[], tuple[str, str, str]],
-) -> APIRouter:
-    """Router with mauxy's Mautic helpers injected (no import cycle with main.py)."""
-    router = APIRouter()
+async def submit(payload: SelfCheckRequest, request: Request) -> JSONResponse:
+    """POST /api/selfcheck and POST /api/lead {kind: selfcheck}."""
+    if not _origin_ok(request):
+        return JSONResponse({"status": "forbidden"}, status_code=403)
+    if payload.company_website:  # honeypot: looks like success, nothing stored or sent
+        return JSONResponse(PENDING)
+    clean, errors = engine.validate_answers(RULES, payload.answers)
+    if errors:
+        return JSONResponse({"status": "invalid", "detail": errors[:5]}, status_code=422)
+    if not _signer or not PUBLIC_BASE_URL or not mailer.configured():
+        logger.error("SELFCHECK_NOT_CONFIGURED")
+        return JSONResponse({"status": "service_unavailable"}, status_code=503)
 
-    async def radar_subscribe(email: str, lang: str) -> str:
-        """Migration Radar in Mautic, only after DOI. Returns ok / dnc_skip / error:<detail>."""
-        base, user, pwd = mautic()
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            try:
-                status, contact = await search_contact(client, email)
-                if status != 200:
-                    return f"error:search_status={status}"
-                if contact and contact_is_dnc(contact):
-                    return "dnc_skip"
-                ustatus, upserted = await upsert_contact(
-                    client,
-                    existing_id=str(contact["id"]) if contact else None,
-                    email=email,
-                    payload_fields={
-                        "newsletter_locale": lang,
-                        "newsletter_source": "selfcheck",
-                        "newsletter_consented_at": _iso(_now()),
-                        "newsletter_page_url": _site_url(lang),
-                    },
-                    add_tags=[MAUTIC_RADAR_TAG],
-                )
-                if not upserted:
-                    return f"error:upsert_status={ustatus}"
-                if MAUTIC_RADAR_SEGMENT_ID:
-                    resp = await client.post(
-                        f"{base}/api/segments/{MAUTIC_RADAR_SEGMENT_ID}/contact/{upserted.get('id')}/add",
-                        auth=(user, pwd),
-                    )
-                    if resp.status_code not in (200, 201):
-                        return f"error:segment_status={resp.status_code}"
-                return "ok"
-            except httpx.RequestError as exc:
-                return f"error:{exc.__class__.__name__}"
+    # From here on the answer is the same for every address, immediately (no enumeration via
+    # content, status code or timing); storage + DOI mail run as a job after the response.
+    jobs.spawn(_submit_job(request.app.state.db, payload, clean), name="selfcheck_submit")
+    return JSONResponse(PENDING)
+
+
+def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
+    router = APIRouter()
 
     @router.post("/api/selfcheck")
     @limiter.limit(SELFCHECK_RATE_LIMIT)
     async def selfcheck_submit(payload: SelfCheckRequest, request: Request):
-        if not _origin_ok(request):
-            return JSONResponse({"status": "forbidden"}, status_code=403)
-        if payload.company_website:  # honeypot: looks like success, nothing stored or sent
-            return JSONResponse(PENDING)
-        clean, errors = engine.validate_answers(RULES, payload.answers)
-        if errors:
-            return JSONResponse({"status": "invalid", "detail": errors[:5]}, status_code=422)
-        if not _signer or not PUBLIC_BASE_URL or not mailer.configured():
-            logger.error("SELFCHECK_NOT_CONFIGURED")
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        # From here on the answer is the same for every address, immediately (no enumeration via
-        # content, status code or timing); storage + DOI mail run as a job after the response.
-        jobs.spawn(_submit_job(request.app.state.db, payload, clean), name="selfcheck_submit")
-        return JSONResponse(PENDING)
+        return await submit(payload, request)
 
     @router.get("/api/selfcheck/confirm")
     @limiter.limit(os.environ.get("CONFIRM_RATE_LIMIT", "30/minute"))
@@ -385,21 +426,19 @@ def build_router(
             row = await cur.fetchone()
 
         picks = json.loads(row["picks"])
-        radar = await radar_subscribe(row["email"], row["lang"]) if "radar" in picks else "nicht gewählt"
         mail_sent = False
         if "mail" in picks:
             subject, body = result_mail(row)
             mail_sent = await mailer.send(row["email"], subject, body)
-        notify_sent = False
-        if SELFCHECK_NOTIFY_TO:
-            subject, body = notify_mail(row, radar, mail_sent)
-            notify_sent = await mailer.send(SELFCHECK_NOTIFY_TO, subject, body, reply_to=row["email"])
-        await db.execute(
-            "UPDATE selfcheck_submission SET mail_sent = ?, notify_sent = ?, radar_result = ? WHERE id = ?",
-            (int(mail_sent), int(notify_sent), radar, sid),
-        )
+        await db.execute("UPDATE selfcheck_submission SET mail_sent = ? WHERE id = ?", (int(mail_sent), sid))
         await db.commit()
-        logger.info("SELFCHECK_CONFIRMED id=%s radar=%s mail=%s notify=%s", sid, radar, mail_sent, notify_sent)
+
+        # Radar subscription + CRM lead + operator mail: outbox with retries (lead_sync, SPEC-021)
+        ref = lead_sync.new_ref()
+        subscribe = {"email": row["email"], "lang": row["lang"], "source": "selfcheck", "page_url": _site_url(row["lang"]),
+                     "company": row["company"], "lists": ["radar"] if "radar" in picks else []}
+        await lead_sync.enqueue(db, origin="selfcheck", origin_id=sid, lead=lead_for(row, ref), subscribe=subscribe)
+        logger.info("SELFCHECK_CONFIRMED id=%s mail=%s", sid, mail_sent)
         return _redirect(row["lang"], True)
 
     @router.post(EVENT_PATH, status_code=204)
@@ -425,13 +464,15 @@ def build_router(
     ):
         if not admin_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        sql = ("SELECT id, created_at, confirmed_at, email, lang, picks, answers, stay, rules_version, complete, "
-               "mail_sent, notify_sent, radar_result FROM selfcheck_submission WHERE status = ?")
+        sql = ("SELECT s.id, s.created_at, s.confirmed_at, s.email, s.company, s.lang, s.picks, s.answers, s.stay, "
+               "s.rules_version, s.complete, s.mail_sent, s.notify_sent, s.radar_result, "
+               "l.odoo_lead_id, l.state AS crm_state FROM selfcheck_submission s "
+               "LEFT JOIN lead_sync l ON l.origin = 'selfcheck' AND l.origin_id = s.id WHERE s.status = ?")
         params: list = [status]
         if since:
-            sql += " AND COALESCE(confirmed_at, created_at) >= ?"
+            sql += " AND COALESCE(s.confirmed_at, s.created_at) >= ?"
             params.append(since)
-        sql += " ORDER BY id DESC LIMIT ?"
+        sql += " ORDER BY s.id DESC LIMIT ?"
         params.append(limit)
         db: aiosqlite.Connection = request.app.state.db
         async with db.execute(sql, params) as cur:

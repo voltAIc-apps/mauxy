@@ -1,6 +1,15 @@
 # mauxy tests
 
-Unit tests for `/api/subscribe` and `/api/confirm`. Mautic is mocked via `respx`.
+Tests for every endpoint. Mautic is mocked via `respx`; Odoo is ALWAYS the in-memory fake
+`tests/fake_odoo.py` (`odoo` fixture) -- no test talks to the real erp.wapsol.
+
+| Prefix | Suite |
+|---|---|
+| T-SEC-0xx | newsletter DOI security (test_subscribe, test_confirm, test_timing) |
+| T-SC-1xx | Selbst-Check (test_selfcheck, cases/selfcheck_api_cases.json) |
+| T-ODOO-0xx | Odoo client: https, allowlist, errors, no key leaks (test_odoo_client) |
+| T-SINK-0xx | Odoo sinks: partner match, lead vals, follower, lists, opt-out (test_sinks) |
+| T-LEAD-0xx | CTA leads + outbox: validation (cases/lead_api_cases.json), DOI, retries, idempotency (test_leads) |
 
 ## Run
 

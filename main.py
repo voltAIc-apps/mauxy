@@ -1,11 +1,17 @@
 """
-mauxy -- centralized newsletter subscription + unsubscribe proxy for Mautic, and the public
-consent service of the simplify-erp.de Selbst-Check (selfcheck_api.py, flywheel SPEC-020).
-Manages contacts, segments, and DNC lists via Basic Auth -- credentials never exposed to browser.
+mauxy -- the website's interface to other systems (owner decision 2026-11-08): public consent
+service of simplify-erp.de for newsletter, Migration Radar, Selbst-Check and every lead CTA.
 
-Double opt-in (newsletter and self-check) keeps ALL pending data server-side in SQLite and
-changes nothing in Mautic before the confirmation link is clicked; confirmation tokens are
-signed, time-limited and single-use (stored as SHA-256, compared in constant time).
+  newsletter   POST /api/subscribe, GET /api/confirm, POST /api/unsubscribe   (this file)
+  self-check   /api/selfcheck*                                              (selfcheck_api.py, SPEC-020)
+  CTA leads    /api/lead*                                                   (leads_api.py, SPEC-021)
+
+Confirmed data goes to sinks (sinks.py): crm.lead + Email Marketing lists in erp.wapsol (Odoo,
+default) -- Mautic only as deprecated SUBSCRIBER_SINK=mautic. Credentials stay server-side.
+
+Double opt-in keeps ALL pending data server-side in SQLite and writes nothing to any sink before
+the confirmation link is clicked; confirmation tokens are signed, time-limited and single-use
+(stored as SHA-256, compared in constant time).
 """
 import hashlib
 import hmac
@@ -19,7 +25,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import aiosqlite
-import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -30,16 +35,16 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 import jobs
+import lead_sync
+import leads_api
 import mailer
 import selfcheck_api
+import sinks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # -- Config from env --------------------------------------------------------
-MAUTIC_BASE_URL = os.environ.get("MAUTIC_BASE_URL", "")
-MAUTIC_USERNAME = os.environ.get("MAUTIC_USERNAME", "")
-MAUTIC_PASSWORD = os.environ.get("MAUTIC_PASSWORD", "")
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "5/minute")
 CONFIRM_RATE_LIMIT = os.environ.get("CONFIRM_RATE_LIMIT", "30/minute")
 ACTION_LOG_DB = os.environ.get("ACTION_LOG_DB", "/data/actions.db")
@@ -60,8 +65,6 @@ _raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _raw_origins.split(",") if o.strip()]
 
 # -- Startup validation -------------------------------------------------------
-if not MAUTIC_BASE_URL:
-    logger.warning("MAUTIC_BASE_URL is not set -- all unsubscribe requests will fail")
 if not ALLOWED_ORIGINS:
     logger.warning("ALLOWED_ORIGINS is not set -- CORS will block all browser requests")
 if not CONFIRM_TOKEN_SECRET:
@@ -80,10 +83,9 @@ _token_signer: URLSafeTimedSerializer | None = (
     else None
 )
 
-# -- Mautic health check cache -----------------------------------------------
-_mautic_health = {"ok": True, "checked_at": 0.0, "detail": "pending"}
+# -- Sink health check cache ---------------------------------------------------
+_sink_health: dict = {"checked_at": -1e9, "detail": {}}
 HEALTH_CHECK_CACHE_TTL = 30
-HEALTH_CHECK_TIMEOUT = 5.0
 
 
 def now_iso() -> str:
@@ -122,7 +124,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
     """)
     await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_email ON action_log(email)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_action_log_result ON action_log(result)")
-    # Newsletter DOI: pending signups live here, NOT in Mautic, until confirmed.
+    # Newsletter DOI: pending signups live here, NOT in any sink, until confirmed.
     await db.execute("""
         CREATE TABLE IF NOT EXISTS newsletter_pending (
             id          TEXT PRIMARY KEY,
@@ -137,6 +139,8 @@ async def init_db(db: aiosqlite.Connection) -> None:
     """)
     await db.execute("CREATE INDEX IF NOT EXISTS idx_nl_pending_email ON newsletter_pending(email)")
     await selfcheck_api.init_db(db)
+    await leads_api.init_db(db)
+    await lead_sync.init_db(db)
     await db.commit()
 
 
@@ -153,10 +157,15 @@ async def lifespan(app: FastAPI):
     await init_db(db)
     await purge_newsletter_pending(db)
     await selfcheck_api.purge(db)
+    await leads_api.purge(db)
+    await lead_sync.purge(db)
     app.state.db = db
     logger.info("ACTION_LOG_DB opened: %s", ACTION_LOG_DB)
+    await lead_sync.resume(db)  # CRM deliveries interrupted by a restart
     yield
-    await jobs.drain()  # finish pending DOI mails before the DB closes
+    # finish pending DOI mails before the DB closes; retries sleeping in their backoff are
+    # cancelled (state stays in SQLite, resumed on the next start)
+    await jobs.drain(timeout=float(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "10")))
     await db.close()
     logger.info("ACTION_LOG_DB closed")
 
@@ -259,125 +268,14 @@ NEWSLETTER_DOI = {
 }
 
 
-# -- Mautic connectivity check -----------------------------------------------
-async def _check_mautic() -> dict:
-    """Check Mautic API reachability; cache result for HEALTH_CHECK_CACHE_TTL seconds."""
-    global _mautic_health
+# -- Sink health ---------------------------------------------------------------
+async def _check_sinks() -> dict:
+    """Lead + subscriber sink reachability; cached HEALTH_CHECK_CACHE_TTL seconds."""
+    global _sink_health
     now = time.monotonic()
-    if now - _mautic_health["checked_at"] < HEALTH_CHECK_CACHE_TTL:
-        return _mautic_health
-
-    try:
-        async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT) as client:
-            resp = await client.get(
-                f"{MAUTIC_BASE_URL}/api/contacts?limit=1",
-                auth=(MAUTIC_USERNAME, MAUTIC_PASSWORD),
-            )
-        if resp.status_code == 200:
-            _mautic_health = {"ok": True, "checked_at": now, "detail": "reachable"}
-        else:
-            detail = f"HTTP {resp.status_code}"
-            logger.warning("HEALTH_MAUTIC_HTTP_ERROR status=%s", resp.status_code)
-            _mautic_health = {"ok": False, "checked_at": now, "detail": detail}
-    except httpx.RequestError as exc:
-        detail = f"connection error: {exc.__class__.__name__}"
-        logger.error("HEALTH_MAUTIC_CONNECT_ERROR error=%s", exc)
-        _mautic_health = {"ok": False, "checked_at": now, "detail": detail}
-    except Exception as exc:
-        detail = f"unexpected: {exc.__class__.__name__}"
-        logger.error("HEALTH_MAUTIC_UNEXPECTED_ERROR error=%s", exc)
-        _mautic_health = {"ok": False, "checked_at": now, "detail": detail}
-
-    return _mautic_health
-
-
-# -- Mautic contact helpers --------------------------------------------------
-async def _search_mautic_contact(client: httpx.AsyncClient, email: str) -> tuple[int, dict | None]:
-    """
-    Search Mautic for exact-match contact by email.
-    Returns (status_code, contact_dict_or_None). On non-200 status, contact is None.
-    contact dict includes: {"id": str, "fields": ..., "doNotContact": [...], "tags": [...]}.
-    """
-    auth = (MAUTIC_USERNAME, MAUTIC_PASSWORD)
-    resp = await client.get(
-        f"{MAUTIC_BASE_URL}/api/contacts",
-        params={
-            "where[0][col]": "email",
-            "where[0][expr]": "eq",
-            "where[0][val]": email,
-        },
-        auth=auth,
-    )
-    if resp.status_code != 200:
-        return resp.status_code, None
-
-    contacts = resp.json().get("contacts", {}) or {}
-    for cid, cdata in contacts.items():
-        core = cdata.get("fields", {}).get("core", {})
-        contact_email = (core.get("email", {}).get("value") or "").lower()
-        if contact_email == email:
-            return 200, {"id": cid, **cdata}
-    return 200, None
-
-
-def _contact_is_dnc(contact: dict) -> bool:
-    """Mautic exposes DNC state via contact['doNotContact'] list with channel entries."""
-    dnc = contact.get("doNotContact") or []
-    return any(
-        (entry.get("channel") == "email") and int(entry.get("reason", 0)) != 0
-        for entry in dnc
-    )
-
-
-def _contact_has_tag(contact: dict, tag: str) -> bool:
-    tags = contact.get("tags") or []
-    for t in tags:
-        # Mautic tag entries can be {"tag": "..."} or plain strings depending on API shape.
-        name = t.get("tag") if isinstance(t, dict) else t
-        if name == tag:
-            return True
-    return False
-
-
-async def _upsert_contact(
-    client: httpx.AsyncClient,
-    *,
-    existing_id: str | None,
-    email: str,
-    payload_fields: dict,
-    add_tags: list[str],
-    remove_tags: list[str] | None = None,
-) -> tuple[int, dict | None]:
-    """
-    Create or patch a Mautic contact. Returns (status, contact_json) where contact_json
-    is the Mautic response's 'contact' object. On failure returns (status, None).
-    Mautic tag convention: prefix '-' on a tag string removes it.
-    """
-    auth = (MAUTIC_USERNAME, MAUTIC_PASSWORD)
-    body: dict = {"email": email, **payload_fields}
-    tag_strs = list(add_tags)
-    if remove_tags:
-        tag_strs.extend(f"-{t}" for t in remove_tags)
-    if tag_strs:
-        body["tags"] = tag_strs
-
-    if existing_id:
-        resp = await client.patch(
-            f"{MAUTIC_BASE_URL}/api/contacts/{existing_id}/edit",
-            json=body,
-            auth=auth,
-        )
-    else:
-        resp = await client.post(
-            f"{MAUTIC_BASE_URL}/api/contacts/new",
-            json=body,
-            auth=auth,
-        )
-    if resp.status_code not in (200, 201):
-        return resp.status_code, None
-    return resp.status_code, resp.json().get("contact")
-
-
+    if now - _sink_health["checked_at"] >= HEALTH_CHECK_CACHE_TTL:
+        _sink_health = {"checked_at": now, "detail": await sinks.health()}
+    return _sink_health
 
 
 def _website_redirect(locale: str, path: str, reason: str | None = None) -> str:
@@ -395,13 +293,14 @@ PENDING = {"status": "pending_confirmation"}
 @limiter.limit(RATE_LIMIT)
 async def subscribe(payload: SubscribeRequest, request: Request):
     """
-    Newsletter signup with double opt-in. Nothing is written to Mautic here.
+    Newsletter signup with double opt-in. Nothing is written to any sink here.
 
     Once the input is valid the answer is ALWAYS an immediate 200 {"status":
     "pending_confirmation"} -- same status, body and timing for every address (security
     review 2026-11-08: enumeration via response content, status code and timing). All
-    contact-dependent work runs afterwards as a job (_subscribe_job): Mautic lookup (read only),
-    skip if already confirmed / DNC / throttled, pending row in SQLite with the SHA-256 of a
+    contact-dependent work runs afterwards as a job (_subscribe_job): subscriber-sink lookup (read
+    only: Odoo list / blacklist, or deprecated Mautic), skip if already subscribed / blocked /
+    throttled, pending row in SQLite with the SHA-256 of a
     signed token ({"p": id}), DOI mail via SMTP. Failures there are logged, never returned.
     503 only for a misconfigured service (independent of the address).
     """
@@ -418,21 +317,18 @@ async def subscribe(payload: SubscribeRequest, request: Request):
 
 async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str) -> None:
     db: aiosqlite.Connection = request.app.state.db
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            status, contact = await _search_mautic_contact(client, email)
-        except httpx.RequestError as exc:
-            logger.error("SUBSCRIBE_MAUTIC_UNREACHABLE error=%s", exc)
-            await log_action(request, email, "mautic_unreachable", error_detail=f"httpx_error: {exc}")
-            return
-    if status != 200:
-        await log_action(request, email, "mautic_error", error_detail=f"search_status={status}")
+    try:
+        state = await sinks.subscriber_sink().status(email, "newsletter")
+    except (sinks.SinkTransient, sinks.SinkPermanent) as exc:
+        # not returned to the caller (enumeration); no DOI now, the person can retry later
+        logger.error("SUBSCRIBE_SINK_ERROR error=%s", str(exc)[:200])
+        await log_action(request, email, "sink_error", error_detail=str(exc)[:200])
         return
-    if contact and _contact_has_tag(contact, "newsletter_confirmed"):
-        await log_action(request, email, "subscribe_already_confirmed", contact_id=str(contact["id"]))
+    if state == "subscribed":
+        await log_action(request, email, "subscribe_already_confirmed")
         return
-    if contact and _contact_is_dnc(contact):
-        await log_action(request, email, "subscribe_dnc_skip", contact_id=str(contact["id"]))
+    if state == "blocked":
+        await log_action(request, email, "subscribe_dnc_skip")
         return
 
     await purge_newsletter_pending(db)
@@ -474,9 +370,10 @@ async def confirm(request: Request, token: str = Query(..., min_length=1, max_le
     Double opt-in landing (link in the DOI mail). Always a 302 back to the website.
 
     Checks, in order: signature + max_age; pending row exists; stored token hash equals the
-    presented token (constant time) and is unused (single use); contact not DNC in Mautic.
-    Only then the contact is created/updated in Mautic (tag newsletter_confirmed, server-side
-    consent timestamp) and the token is burnt.
+    presented token (constant time) and is unused (single use). Then the subscriber sink
+    subscribes (Odoo: mailing.contact / mailing.subscription on ODOO_LIST_NEWSLETTER_ID;
+    deprecated Mautic: tag newsletter_confirmed, server-side consent time). Blocked (blacklist /
+    DNC) -> token burnt, error page. Sink unreachable -> token stays valid, the person can retry.
     """
     db: aiosqlite.Connection = request.app.state.db
 
@@ -508,68 +405,41 @@ async def confirm(request: Request, token: str = Query(..., min_length=1, max_le
 
     email, locale = row["email"], row["locale"]
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            status, contact = await _search_mautic_contact(client, email)
-        except httpx.RequestError as exc:
-            await log_action(request, email, "confirm_error", error_detail=f"search_httpx: {exc}")
-            return fail(locale, "service_unavailable")  # token stays valid, user can retry
-        if status != 200:
-            await log_action(request, email, "confirm_error", error_detail=f"search_status={status}")
-            return fail(locale, "service_unavailable")
+    async def burn():
+        await db.execute("UPDATE newsletter_pending SET used_at = ?, token_hash = NULL WHERE id = ?", (now_iso(), pid))
+        await db.commit()
 
-        async def burn():
-            await db.execute("UPDATE newsletter_pending SET used_at = ?, token_hash = NULL WHERE id = ?", (now_iso(), pid))
-            await db.commit()
-
-        if contact and _contact_is_dnc(contact):
-            await burn()
-            await log_action(request, email, "confirm_dnc_refused", contact_id=str(contact["id"]))
-            return fail(locale, "unavailable")
-
-        existing_id = str(contact["id"]) if contact else None
-        try:
-            upsert_status, upserted = await _upsert_contact(
-                client,
-                existing_id=existing_id,
-                email=email,
-                payload_fields={
-                    "confirmation_token": "",  # clears tokens of the pre-2026-11 flow
-                    "newsletter_locale": locale,
-                    "newsletter_source": row["source"],
-                    "newsletter_consented_at": now_iso(),
-                    "newsletter_page_url": row["page_url"],
-                },
-                add_tags=["newsletter_confirmed"],
-                remove_tags=["newsletter_pending"],
-            )
-        except httpx.RequestError as exc:
-            await log_action(request, email, "confirm_error", contact_id=existing_id, error_detail=f"upsert_httpx: {exc}")
-            return fail(locale, "service_unavailable")
-        if not upserted:
-            await log_action(request, email, "confirm_error", contact_id=existing_id, error_detail=f"upsert_status={upsert_status}")
-            return fail(locale, "service_unavailable")
+    try:
+        result = await sinks.subscriber_sink().subscribe(
+            email, "newsletter", lang=locale, source=row["source"], page_url=row["page_url"])
+    except (sinks.SinkTransient, sinks.SinkPermanent) as exc:
+        await log_action(request, email, "confirm_error", error_detail=str(exc)[:200])
+        return fail(locale, "service_unavailable")  # token stays valid, user can retry
+    if result == "blocked":
+        await burn()
+        await log_action(request, email, "confirm_dnc_refused")
+        return fail(locale, "unavailable")
 
     await burn()
-    await log_action(request, email, "confirm_ok", contact_id=str(upserted.get("id") or existing_id or ""))
+    await log_action(request, email, "confirm_ok", error_detail=None if result == "ok" else result)
     return RedirectResponse(_website_redirect(locale, "newsletter/confirmed"), status_code=302)
 
 
 # -- Routes -----------------------------------------------------------------
 @app.get("/health")
 async def health():
-    """k8s liveness / readiness probe — always 200, includes Mautic status."""
-    result = await _check_mautic()
-    return {"status": "ok", "mautic": result["detail"]}
+    """k8s liveness / readiness probe -- always 200 and cheap (no sink call)."""
+    return {"status": "ok"}
 
 
 @app.get("/health/detail")
 async def health_detail():
-    """Richer health endpoint for operator debugging."""
-    result = await _check_mautic()
+    """Operator view: sink reachability (cached 30 s). Always 200."""
+    result = await _check_sinks()
+    ok = all(not v.startswith("error") for v in result["detail"].values())
     return {
-        "status": "ok" if result["ok"] else "degraded",
-        "mautic": result["detail"],
+        "status": "ok" if ok else "degraded",
+        **result["detail"],
         "cache_age_seconds": round(time.monotonic() - result["checked_at"], 1),
     }
 
@@ -578,96 +448,25 @@ async def health_detail():
 @limiter.limit(RATE_LIMIT)
 async def unsubscribe(payload: UnsubscribeRequest, request: Request):
     """
-    Add email to Mautic DNC list.
+    Opt-out via the subscriber sink (Odoo: opt_out on the address' subscriptions of the
+    configured lists; deprecated Mautic: DNC list).
     Returns 200 {"status":"ok"} for all contact-specific outcomes (prevents enumeration).
-    Returns 503 {"status":"service_unavailable"} when Mautic cannot be reached at all.
+    Returns 503 {"status":"service_unavailable"} when the sink cannot be reached at all.
     """
     email = payload.email.lower()
-    auth = (MAUTIC_USERNAME, MAUTIC_PASSWORD)
-    logger.info("UNSUBSCRIBE_START email=%s", email)
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # Phase 1: Search for contact -- failures here are email-independent, return 503
-        search_url = f"{MAUTIC_BASE_URL}/api/contacts"
-        try:
-            resp = await client.get(
-                search_url,
-                params={
-                    "where[0][col]": "email",
-                    "where[0][expr]": "eq",
-                    "where[0][val]": email,
-                },
-                auth=auth,
-            )
-        except httpx.RequestError as exc:
-            logger.error("UNSUBSCRIBE_MAUTIC_UNREACHABLE email=%s error=%s", email, exc)
-            await log_action(request, email, "mautic_unreachable", error_detail=f"httpx_error: {exc}")
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        if resp.status_code != 200:
-            logger.warning("UNSUBSCRIBE_SEARCH_FAILED email=%s status=%s", email, resp.status_code)
-            await log_action(request, email, "mautic_error", error_detail=f"search_status={resp.status_code}")
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
-        # Phase 2: Contact-specific logic -- always 200 to prevent enumeration
-        try:
-            contacts = resp.json().get("contacts", {})
-            if not contacts:
-                logger.warning("UNSUBSCRIBE_NO_CONTACT email=%s", email)
-                await log_action(request, email, "not_found")
-                return JSONResponse({"status": "ok"})
-
-            # Defense in depth: verify exact email match among results
-            contact_id = None
-            for cid, cdata in contacts.items():
-                fields = cdata.get("fields", {}).get("core", {})
-                contact_email = (fields.get("email", {}).get("value") or "").lower()
-                if contact_email == email:
-                    contact_id = cid
-                    break
-
-            if contact_id is None:
-                candidates = list(contacts.keys())
-                logger.warning("UNSUBSCRIBE_NO_EXACT_MATCH email=%s candidates=%s", email, candidates)
-                await log_action(request, email, "not_found", error_detail=f"no_exact_match candidates={candidates}")
-                return JSONResponse({"status": "ok"})
-
-            logger.info("UNSUBSCRIBE_CONTACT_FOUND email=%s contact_id=%s", email, contact_id)
-
-            # Add contact to DNC with retry (2 attempts)
-            dnc_url = f"{MAUTIC_BASE_URL}/api/contacts/{contact_id}/dnc/email/add"
-            dnc_ok = False
-            for attempt in range(1, 3):
-                dnc_resp = await client.post(
-                    dnc_url,
-                    json={"reason": 1, "comments": "Unsubscribed via website"},
-                    auth=auth,
-                )
-                if dnc_resp.status_code in (200, 201):
-                    logger.info("UNSUBSCRIBE_DNC_OK email=%s contact_id=%s", email, contact_id)
-                    dnc_ok = True
-                    break
-                logger.warning(
-                    "UNSUBSCRIBE_DNC_FAILED email=%s status=%s attempt=%d",
-                    email, dnc_resp.status_code, attempt,
-                )
-
-            if dnc_ok:
-                await log_action(request, email, "ok", contact_id=str(contact_id))
-            else:
-                logger.error("UNSUBSCRIBE_DNC_FAILED_RETRY_EXHAUSTED email=%s contact_id=%s", email, contact_id)
-                await log_action(request, email, "error", contact_id=str(contact_id), error_detail="dnc_retry_exhausted")
-
-        except httpx.RequestError as exc:
-            logger.error("UNSUBSCRIBE_DNC_REQUEST_ERROR email=%s error=%s", email, exc)
-            await log_action(request, email, "error", error_detail=f"httpx_error: {exc}")
-        except Exception as exc:
-            logger.error("UNSUBSCRIBE_UNEXPECTED_ERROR email=%s error=%s", email, exc)
-            await log_action(request, email, "error", error_detail=f"unexpected: {exc}")
-
+    try:
+        result, ref = await sinks.subscriber_sink().unsubscribe(email)
+    except sinks.SinkTransient as exc:
+        logger.error("UNSUBSCRIBE_SINK_UNREACHABLE error=%s", str(exc)[:200])
+        await log_action(request, email, "sink_unreachable", error_detail=str(exc)[:200])
+        return JSONResponse({"status": "service_unavailable"}, status_code=503)
+    except sinks.SinkPermanent as exc:
+        logger.error("UNSUBSCRIBE_SINK_ERROR error=%s", str(exc)[:200])
+        await log_action(request, email, "error", error_detail=str(exc)[:200])
+        return JSONResponse({"status": "ok"})
+    await log_action(request, email, result, contact_id=ref)
     # 200 for all contact-specific outcomes -- no enumeration leak
     return JSONResponse({"status": "ok"})
-
 
 
 @app.get("/api/actions")
@@ -705,15 +504,9 @@ async def get_actions(
     return JSONResponse({"actions": actions, "count": len(actions)})
 
 
-# -- Self-check (flywheel SPEC-020) -----------------------------------------------
-app.include_router(selfcheck_api.build_router(
-    limiter=limiter,
-    search_contact=_search_mautic_contact,
-    contact_is_dnc=_contact_is_dnc,
-    upsert_contact=_upsert_contact,
-    admin_ok=admin_ok,
-    mautic=lambda: (MAUTIC_BASE_URL, MAUTIC_USERNAME, MAUTIC_PASSWORD),
-))
+# -- Self-check (flywheel SPEC-020) and CTA leads (SPEC-021) ------------------------
+app.include_router(selfcheck_api.build_router(limiter=limiter, admin_ok=admin_ok))
+app.include_router(leads_api.build_router(limiter=limiter, admin_ok=admin_ok))
 
 
 class _NoEventAccessLog(logging.Filter):
