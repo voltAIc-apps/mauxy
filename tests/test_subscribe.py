@@ -136,16 +136,15 @@ def test_t_sec_009_per_address_throttle_is_silent(respx_mock, client, outbox):
 
 
 @respx.mock
-def test_subscribe_mautic_search_5xx_returns_503(respx_mock, client, outbox):
+def test_t_sec_018_mautic_errors_are_not_returned(respx_mock, client, outbox):
+    """A 503 would depend on the address being processed -> uniform 200, logged, no mail."""
     respx_mock.get(CONTACTS_URL).mock(return_value=httpx.Response(500))
-    assert client.post("/api/subscribe", json=payload()).status_code == 503
-    assert outbox == []
-
-
-@respx.mock
-def test_subscribe_mautic_unreachable_returns_503(respx_mock, client):
+    resp = client.post("/api/subscribe", json=payload())
+    assert resp.status_code == 200 and resp.json() == PENDING
     respx_mock.get(CONTACTS_URL).mock(side_effect=httpx.ConnectError("boom"))
-    assert client.post("/api/subscribe", json=payload()).status_code == 503
+    resp = client.post("/api/subscribe", json=payload(email="carol@example.com"))
+    assert resp.status_code == 200 and resp.json() == PENDING
+    assert outbox == []
 
 
 @respx.mock

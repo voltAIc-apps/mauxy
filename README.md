@@ -243,8 +243,9 @@ curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
 
 `POST /api/subscribe` (payload: `website/src/config/api.ts`) starts a double opt-in **without
 touching Mautic**: the request is kept in SQLite (`newsletter_pending`) and a confirmation link is
-mailed via SMTP. Every contact-specific outcome (new, already confirmed, DNC, throttled) answers
-`200 {"status": "pending_confirmation"}` -- no enumeration. `consent` must be `true`; the consent
+mailed via SMTP. Every valid request (new, already confirmed, DNC, throttled, Mautic down) gets the same immediate
+`200 {"status": "pending_confirmation"}`; the contact-dependent work runs after the response as a job
+(`jobs.py`), so neither content, status code nor timing reveal anything (T-SEC-017/018). `consent` must be `true`; the consent
 timestamp is the server time of the click; `pageUrl` must be on an `ALLOWED_ORIGINS` origin.
 
 `GET /api/confirm?token=...` checks signature + age, a matching unused pending record (SHA-256,
@@ -253,7 +254,7 @@ Mautic (tag `newsletter_confirmed`) and the token is burnt (single use). 302 to
 `${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed` (or `confirm-error?reason=...`).
 
 Security review 2026-11-08 (enumeration, token replay, consent validation, pre-confirmation CRM
-writes): fixed, tests T-SEC-001..016. Tokens issued by the earlier flow are refused (users re-subscribe).
+writes): fixed, tests T-SEC-001..018. Tokens issued by the earlier flow are refused (users re-subscribe).
 
 ### One-time Mautic setup
 
@@ -265,7 +266,7 @@ writes): fixed, tests T-SEC-001..016. Tokens issued by the earlier flow are refu
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/selfcheck` | `{email, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company_website}`. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Uniform `200 pending_confirmation`. |
+| `POST /api/selfcheck` | `{email, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company_website}`. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
 | `GET /api/selfcheck/confirm?token=` | Single-use. Result mail (pick `mail`), Migration Radar in Mautic (pick `radar`, not DNC), notification to `SELFCHECK_NOTIFY_TO` (always: indicative-quote request, call yes/no, answers). 302 to `/{lang}/selbst-check?bestaetigt=1` / `=fehler`. |
 | `POST /api/selfcheck/event` | `{event: started|completed|exited_early|submitted, lang}` -> 204. Stores day + event + lang only; global rate-limit key (IP never read), access-log lines dropped. |
 | `GET /api/selfcheck/submissions` | Admin (Bearer `ADMIN_API_KEY`): confirmed (or pending) submissions. |

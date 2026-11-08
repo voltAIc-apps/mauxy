@@ -170,5 +170,6 @@ Detailed health status for operator debugging. Always returns HTTP 200.
 See README "Newsletter Signup (Double Opt-In)" and "Selbst-Check". All contact-specific outcomes
 of `POST /api/subscribe` and `POST /api/selfcheck` return `200 {"status": "pending_confirmation"}`;
 422 = invalid payload (incl. `consent` not `true`), 403 = self-check origin not allowed, 429 = rate
-limit, 503 = Mautic or mail unavailable.
+limit, 503 = DOI not configured. Mautic/mail errors after validation are never returned (they run after
+the response, see jobs.py), so the answer cannot reveal anything about the address.
 

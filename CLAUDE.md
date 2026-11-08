@@ -22,7 +22,7 @@ Tests (respx mocks Mautic, mails captured with `MAIL_MODE=memory`):
 PYTHONPATH=. tests/venv/bin/python -m pytest tests -q
 ```
 
-Numbered: T-SEC-0xx (security review 2026-11-08), T-SC-1xx (self-check, cases in `tests/cases/`).
+Numbered: T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check, cases in `tests/cases/`).
 
 ## Build & Deploy
 
@@ -42,9 +42,9 @@ Credentials are stored in a k8s Secret (`mauxy-credentials`), not committed -- c
 
 ## Architecture
 
-Application logic: `main.py` (newsletter, unsubscribe, health, admin), `selfcheck_api.py` (self-check router, Mautic helpers injected from main), `mailer.py` (SMTP / console / memory), `vendor/selfcheck/` (rules engine + rules JSON, vendored from flywheel by `scripts/sync_selfcheck.py` there; never edit by hand, test T-SC-150 checks the sha256).
+Application logic: `main.py` (newsletter, unsubscribe, health, admin), `selfcheck_api.py` (self-check router, Mautic helpers injected from main), `mailer.py` (SMTP / console / memory), `jobs.py` (fire-and-forget jobs for contact-dependent work), `vendor/selfcheck/` (rules engine + rules JSON, vendored from flywheel by `scripts/sync_selfcheck.py` there; never edit by hand, test T-SC-150 checks the sha256).
 
-- **POST /api/subscribe** -- JSON signup payload from the website (see `website/src/config/api.ts`). `consent` must be `true`, `source` `^[a-z0-9-]{1,40}$`, `pageUrl` on an `ALLOWED_ORIGINS` origin (<= 500 chars), `consentedAt` ignored (server time counts). Honeypot (`company_website`) short-circuits. Reads Mautic only; NOTHING is written to Mautic here. Already confirmed / DNC / throttled (`MAX_PENDING_PER_EMAIL` per 24h) -> no mail. Otherwise a row in `newsletter_pending` (SQLite, SHA-256 of the signed token `{"p": id}`) and a DOI mail via SMTP. Always `200 {"status":"pending_confirmation"}` for contact-specific outcomes; 503 when Mautic/mail is down.
+- **POST /api/subscribe** -- JSON signup payload from the website (see `website/src/config/api.ts`). `consent` must be `true`, `source` `^[a-z0-9-]{1,40}$`, `pageUrl` on an `ALLOWED_ORIGINS` origin (<= 500 chars), `consentedAt` ignored (server time counts). Honeypot (`company_website`) short-circuits. Reads Mautic only; NOTHING is written to Mautic here. Already confirmed / DNC / throttled (`MAX_PENDING_PER_EMAIL` per 24h) -> no mail. Otherwise a row in `newsletter_pending` (SQLite, SHA-256 of the signed token `{"p": id}`) and a DOI mail via SMTP. Once the input is valid the answer is an immediate, identical `200 {"status":"pending_confirmation"}`; Mautic lookup, throttle, storage and mail run afterwards as a job (`jobs.py`), errors are only logged (no enumeration via content, status or timing). 503 only when DOI is not configured.
 - **GET /api/confirm?token=...** -- DOI landing. Valid signature + max_age AND unused pending row with matching hash (constant time) AND not DNC; then upsert the contact (tag `newsletter_confirmed`, server-side `newsletter_consented_at`), burn the token (single use), 302 to `/{locale}/newsletter/confirmed`; else `.../newsletter/confirm-error?reason=...`. Tokens of the old flow (`{email, locale}`) are refused.
 - **POST /api/selfcheck**, **GET /api/selfcheck/confirm**, **POST /api/selfcheck/event**, **GET /api/selfcheck/submissions|stats** (admin) -- see `selfcheck_api.py` docstring and README "Selbst-Check".
 - **POST /api/unsubscribe** -- accepts `{"email": "..."}`, looks up the contact in Mautic, adds to DNC list. Returns 503 when Mautic is unreachable (search phase); contact-specific outcomes always return 200. Rate-limited via `slowapi` (default 5/min per IP). Every attempt is logged to SQLite.

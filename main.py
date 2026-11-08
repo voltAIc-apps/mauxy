@@ -29,6 +29,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+import jobs
 import mailer
 import selfcheck_api
 
@@ -155,6 +156,7 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     logger.info("ACTION_LOG_DB opened: %s", ACTION_LOG_DB)
     yield
+    await jobs.drain()  # finish pending DOI mails before the DB closes
     await db.close()
     logger.info("ACTION_LOG_DB closed")
 
@@ -395,46 +397,43 @@ async def subscribe(payload: SubscribeRequest, request: Request):
     """
     Newsletter signup with double opt-in. Nothing is written to Mautic here.
 
-    Flow:
-      1. Honeypot filled -> uniform 200, nothing stored.
-      2. Search Mautic (read only). Unreachable / 5xx -> 503 (not contact-specific).
-      3. Already confirmed or DNC -> uniform 200, no mail (no enumeration: the HTTP answer is
-         the same for every address).
-      4. More than MAX_PENDING_PER_EMAIL requests for this address in 24h -> uniform 200, no mail.
-      5. Store the request in SQLite (newsletter_pending) with the SHA-256 of a signed token
-         ({"p": id}, CONFIRM_TOKEN_MAX_AGE) and mail the confirmation link via SMTP.
-      6. Uniform 200 {"status": "pending_confirmation"}.
+    Once the input is valid the answer is ALWAYS an immediate 200 {"status":
+    "pending_confirmation"} -- same status, body and timing for every address (security
+    review 2026-11-08: enumeration via response content, status code and timing). All
+    contact-dependent work runs afterwards as a job (_subscribe_job): Mautic lookup (read only),
+    skip if already confirmed / DNC / throttled, pending row in SQLite with the SHA-256 of a
+    signed token ({"p": id}), DOI mail via SMTP. Failures there are logged, never returned.
+    503 only for a misconfigured service (independent of the address).
     """
     email = payload.email.lower()
-    db: aiosqlite.Connection = request.app.state.db
-
-    if payload.company_website:
+    if payload.company_website:  # honeypot
         await log_action(request, email, "subscribe_honeypot")
         return JSONResponse(PENDING)
-
     if not _token_signer or not PUBLIC_BASE_URL or not mailer.configured():
         await log_action(request, email, "subscribe_error", error_detail="doi_not_configured")
         return JSONResponse({"status": "service_unavailable"}, status_code=503)
+    jobs.spawn(_subscribe_job(request, payload, email), name="subscribe")
+    return JSONResponse(PENDING)
 
-    logger.info("SUBSCRIBE_START locale=%s source=%s", payload.locale, payload.source)
 
+async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str) -> None:
+    db: aiosqlite.Connection = request.app.state.db
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             status, contact = await _search_mautic_contact(client, email)
         except httpx.RequestError as exc:
             logger.error("SUBSCRIBE_MAUTIC_UNREACHABLE error=%s", exc)
             await log_action(request, email, "mautic_unreachable", error_detail=f"httpx_error: {exc}")
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
+            return
     if status != 200:
         await log_action(request, email, "mautic_error", error_detail=f"search_status={status}")
-        return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
+        return
     if contact and _contact_has_tag(contact, "newsletter_confirmed"):
         await log_action(request, email, "subscribe_already_confirmed", contact_id=str(contact["id"]))
-        return JSONResponse(PENDING)
+        return
     if contact and _contact_is_dnc(contact):
         await log_action(request, email, "subscribe_dnc_skip", contact_id=str(contact["id"]))
-        return JSONResponse(PENDING)
+        return
 
     await purge_newsletter_pending(db)
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
@@ -444,7 +443,7 @@ async def subscribe(payload: SubscribeRequest, request: Request):
         (recent,) = await cur.fetchone()
     if recent >= MAX_PENDING_PER_EMAIL:
         await log_action(request, email, "subscribe_throttled")
-        return JSONResponse(PENDING)
+        return
 
     pid = secrets.token_urlsafe(16)
     token = _token_signer.dumps({"p": pid})
@@ -464,10 +463,8 @@ async def subscribe(payload: SubscribeRequest, request: Request):
         await db.execute("DELETE FROM newsletter_pending WHERE id = ?", (pid,))
         await db.commit()
         await log_action(request, email, "subscribe_error", error_detail="mail_failed")
-        return JSONResponse({"status": "service_unavailable"}, status_code=503)
-
+        return
     await log_action(request, email, "subscribe_ok")
-    return JSONResponse(PENDING)
 
 
 @app.get("/api/confirm")

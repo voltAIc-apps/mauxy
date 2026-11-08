@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+import jobs
 import mailer
 from vendor.selfcheck import selfcheck as engine
 
@@ -246,6 +247,47 @@ def _redirect(lang: str, ok: bool) -> RedirectResponse:
     return RedirectResponse(f"{_site_url(lang)}?bestaetigt={'1' if ok else 'fehler'}", status_code=302)
 
 
+async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", clean: dict) -> None:
+    """Contact-dependent part of POST /api/selfcheck (runs after the response is sent)."""
+    await purge(db)
+    email = payload.email.lower()
+    since = _iso(_now() - timedelta(hours=24))
+    async with db.execute(
+        "SELECT COUNT(*) FROM selfcheck_submission WHERE email = ? AND created_at >= ?", (email, since)
+    ) as cur:
+        (recent,) = await cur.fetchone()
+    if recent >= MAX_PENDING_PER_EMAIL:
+        logger.info("SELFCHECK_THROTTLED")
+        return
+
+    stay = payload.stay.model_dump(exclude_none=True) if payload.stay else None
+    prog = engine.progress(RULES, clean)
+    cur = await db.execute(
+        "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
+         json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"])),
+    )
+    sid = cur.lastrowid
+    token = _signer.dumps({"s": sid})
+    await db.execute("UPDATE selfcheck_submission SET token_hash = ? WHERE id = ?", (_hash(token), sid))
+    await db.commit()
+
+    doi = RULES["mail"]["doi"]
+    ok = await mailer.send(email, doi["subject"][payload.lang], doi["body"][payload.lang].format(
+        picks=_picks_block(payload.picks, payload.lang),
+        link=f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}",
+        hours=CONFIRM_TOKEN_MAX_AGE // 3600,
+        retention_pending_days=SELFCHECK_PENDING_DAYS,
+    ))
+    if not ok:
+        await db.execute("DELETE FROM selfcheck_submission WHERE id = ?", (sid,))
+        await db.commit()
+        logger.error("SELFCHECK_DOI_MAIL_FAILED id=%s", sid)
+        return
+    logger.info("SELFCHECK_PENDING id=%s picks=%s complete=%s", sid, ",".join(payload.picks), prog["complete"])
+
+
 def build_router(
     *,
     limiter,
@@ -307,43 +349,9 @@ def build_router(
             logger.error("SELFCHECK_NOT_CONFIGURED")
             return JSONResponse({"status": "service_unavailable"}, status_code=503)
 
-        db: aiosqlite.Connection = request.app.state.db
-        await purge(db)
-        email = payload.email.lower()
-        since = _iso(_now() - timedelta(hours=24))
-        async with db.execute(
-            "SELECT COUNT(*) FROM selfcheck_submission WHERE email = ? AND created_at >= ?", (email, since)
-        ) as cur:
-            (recent,) = await cur.fetchone()
-        if recent >= MAX_PENDING_PER_EMAIL:
-            logger.info("SELFCHECK_THROTTLED")
-            return JSONResponse(PENDING)  # uniform: no hint that the address was used before
-
-        stay = payload.stay.model_dump(exclude_none=True) if payload.stay else None
-        prog = engine.progress(RULES, clean)
-        cur = await db.execute(
-            "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
-             json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"])),
-        )
-        sid = cur.lastrowid
-        token = _signer.dumps({"s": sid})
-        await db.execute("UPDATE selfcheck_submission SET token_hash = ? WHERE id = ?", (_hash(token), sid))
-        await db.commit()
-
-        doi = RULES["mail"]["doi"]
-        ok = await mailer.send(email, doi["subject"][payload.lang], doi["body"][payload.lang].format(
-            picks=_picks_block(payload.picks, payload.lang),
-            link=f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}",
-            hours=CONFIRM_TOKEN_MAX_AGE // 3600,
-            retention_pending_days=SELFCHECK_PENDING_DAYS,
-        ))
-        if not ok:
-            await db.execute("DELETE FROM selfcheck_submission WHERE id = ?", (sid,))
-            await db.commit()
-            return JSONResponse({"status": "service_unavailable"}, status_code=503)
-        logger.info("SELFCHECK_PENDING id=%s picks=%s complete=%s", sid, ",".join(payload.picks), prog["complete"])
+        # From here on the answer is the same for every address, immediately (no enumeration via
+        # content, status code or timing); storage + DOI mail run as a job after the response.
+        jobs.spawn(_submit_job(request.app.state.db, payload, clean), name="selfcheck_submit")
         return JSONResponse(PENDING)
 
     @router.get("/api/selfcheck/confirm")

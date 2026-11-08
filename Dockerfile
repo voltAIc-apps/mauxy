@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # application code (vendor/selfcheck = rules engine synced from flywheel, see README)
-COPY main.py mailer.py selfcheck_api.py ./
+COPY main.py jobs.py mailer.py selfcheck_api.py ./
 COPY vendor/ ./vendor/
 
 RUN mkdir -p /data

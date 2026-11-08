@@ -40,6 +40,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main as mauxy_main  # noqa: E402
+import jobs  # noqa: E402
 import mailer  # noqa: E402
 
 
@@ -60,6 +61,18 @@ def outbox():
 def client(app):
     # `with TestClient(app)` triggers lifespan so the SQLite action log opens.
     with TestClient(app) as c:
+        # Contact-dependent work runs as fire-and-forget jobs after the response (jobs.py).
+        # Tests see its effects by draining the jobs after every request; the timing tests
+        # use c.request_nodrain to observe the response before any job ran.
+        orig = c.request
+
+        def request_and_drain(*args, **kwargs):
+            resp = orig(*args, **kwargs)
+            c.portal.call(jobs.drain)
+            return resp
+
+        c.request_nodrain = orig
+        c.request = request_and_drain
         yield c
     # slowapi keeps in-memory counters; reset so other tests start fresh.
     try:
