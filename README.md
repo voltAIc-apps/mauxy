@@ -411,7 +411,7 @@ site  --POST /api/auth/session {code, binding}  (Origin = that site)-->  mauxy
 - **Login CSRF**: the state is bound to the browser by the cookie; the one-time code to the tab by
   the `binding` (sessionStorage on the site). A code injected via a link or read from a log is useless.
 - **No PII in URLs**: the site only ever sees `code` or `error`; `error_description` is never
-  reflected. Profile = `sub`, `name`, `given_name`, `family_name`, `email` (only when verified),
+  reflected. Profile = `sub`, `name`, `given_name`, `family_name`, `email` (only when LinkedIn says `email_verified` is exactly true; also a signed session claim),
   `email_verified`. No picture, no company (LinkedIn OIDC has none).
 - **Stored**: `auth_state` (hashes, 10 min), `auth_code` (profile, max 60 s, deleted on exchange,
   purged every 30 s), one audit line per login in `action_log` (result + site origin; no name,

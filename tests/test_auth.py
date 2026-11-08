@@ -197,6 +197,7 @@ def test_T_AUTH_056_login_flow_end_to_end(ac, linkedin):
                                "family_name": "Muster", "email": "erika@example.com", "email_verified": True}
     claims = auth_api.verify_session(body["session"], SITE)
     assert claims["sub"] == "li-abc123" and claims["email"] == "erika@example.com" and claims["typ"] == "session"
+    assert claims["email_verified"] is True
     assert auth_api.verify_session(body["session"], "https://www.site.test") is None   # other site
     assert body["expires_at"]
 
@@ -213,11 +214,22 @@ def test_T_AUTH_057_nothing_long_lived_stored(ac, linkedin):
     assert audit[0]["source_origin"] == SITE
 
 
-def test_T_AUTH_058_unverified_email_not_used(ac, linkedin):
-    linkedin["info"].mock(return_value=httpx.Response(200, json={**PROFILE, "email_verified": False}))
+@pytest.mark.parametrize("flag,keep", [
+    (True, True), (False, False), ("missing", False), ("true", False), (1, False), (None, False),
+], ids=["T-AUTH-058-verified-true", "T-AUTH-089-verified-false", "T-AUTH-090-verified-missing",
+        "T-AUTH-091-verified-string", "T-AUTH-092-verified-int", "T-AUTH-093-verified-null"])
+def test_email_kept_only_when_verified_is_true(ac, linkedin, flag, keep):
+    """email survives only with email_verified exactly True; the flag is also in the signed session."""
+    info = {k: v for k, v in PROFILE.items() if k != "email_verified"}
+    if flag != "missing":
+        info["email_verified"] = flag
+    linkedin["info"].mock(return_value=httpx.Response(200, json=info))
     _, q = site_params(login(ac))
-    p = exchange(ac, q["code"]).json()["profile"]
-    assert p["email"] == "" and p["email_verified"] is False and p["name"] == "Erika Muster"
+    body = exchange(ac, q["code"]).json()
+    p, claims = body["profile"], auth_api.verify_session(body["session"], SITE)
+    assert p["name"] == "Erika Muster"
+    assert p["email"] == ("erika@example.com" if keep else "") and p["email_verified"] is keep
+    assert claims["email"] == p["email"] and claims["email_verified"] is keep
 
 
 def test_T_AUTH_059_tls_verified_no_redirects(ac, linkedin, monkeypatch):

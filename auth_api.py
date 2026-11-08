@@ -295,9 +295,10 @@ async def linkedin_profile(code: str) -> tuple[Optional[dict], str]:
     if not sub:
         return None, "userinfo_no_sub"
     email = _clean(d.get("email"), 254).lower()
+    # only an address LinkedIn explicitly reports as verified (True, not "true" / 1 / missing)
     verified = d.get("email_verified") is True
-    if email and (not EMAIL_RE.match(email) or d.get("email_verified") is False):
-        email, verified = "", False                       # unverified / odd address: not used
+    if not verified or not EMAIL_RE.match(email):
+        email, verified = "", False                       # unverified / missing flag / odd address: dropped
     return {
         "sub": sub,
         "name": _clean(d.get("name"), 120),
@@ -311,7 +312,8 @@ async def linkedin_profile(code: str) -> tuple[Optional[dict], str]:
 def issue_session(profile: dict, origin: str) -> str:
     """Short-lived signed session token (AUTH_SESSION_TTL; verify with verify_session)."""
     return _session_signer.dumps({"typ": "session", "aud": origin, "sub": profile["sub"],
-                                  "name": profile["name"], "email": profile["email"]})
+                                  "name": profile["name"], "email": profile["email"],
+                                  "email_verified": profile["email_verified"] is True})
 
 
 def verify_session(token: str, origin: Optional[str] = None) -> Optional[dict]:

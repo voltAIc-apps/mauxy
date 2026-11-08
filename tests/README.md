@@ -9,7 +9,7 @@ Tests for every endpoint. Mautic is mocked via `respx`; Odoo is ALWAYS the in-me
 | T-SC-1xx | Selbst-Check (test_selfcheck, cases/selfcheck_api_cases.json) |
 | T-ODOO-0xx | Odoo client: https, allowlist, errors, no key leaks (test_odoo_client) |
 | T-SINK-0xx | Odoo sinks: partner match, lead vals, follower, lists, opt-out (test_sinks) |
-| T-AUTH-0xx | LinkedIn login: return-path open redirects, Referer origin, config guard, state replay / cookie / expiry, code replay / binding / origin / 60 s, error passthrough, no PII (test_auth, cases/auth_cases.json; LinkedIn mocked with respx) |
+| T-AUTH-0xx | LinkedIn login: email only when email_verified is exactly true (058, 089-093), return-path open redirects, Referer origin, config guard, state replay / cookie / expiry, code replay / binding / origin / 60 s, error passthrough, no PII (test_auth, cases/auth_cases.json; LinkedIn mocked with respx) |
 | T-LEAD-0xx | CTA leads + outbox: validation (cases/lead_api_cases.json), DOI, retries, idempotency (test_leads) |
 
 ## Run
