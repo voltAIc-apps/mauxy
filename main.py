@@ -5,6 +5,7 @@ service of simplify-erp.de for newsletter, Migration Radar, Selbst-Check and eve
   newsletter   POST /api/subscribe, GET /api/confirm, POST /api/unsubscribe   (this file)
   self-check   /api/selfcheck*                                              (selfcheck_api.py, SPEC-020)
   CTA leads    /api/lead*                                                   (leads_api.py, SPEC-021)
+  login        /api/auth/linkedin/start|callback, /api/auth/session         (auth_api.py, sign-in only)
 
 Confirmed data goes to sinks (sinks.py): crm.lead + Email Marketing lists in erp.wapsol (Odoo,
 default) -- Mautic only as deprecated SUBSCRIBER_SINK=mautic. Credentials stay server-side.
@@ -13,6 +14,7 @@ Double opt-in keeps ALL pending data server-side in SQLite and writes nothing to
 the confirmation link is clicked; confirmation tokens are signed, time-limited and single-use
 (stored as SHA-256, compared in constant time).
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -34,6 +36,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+import auth_api
 import jobs
 import lead_sync
 import leads_api
@@ -141,6 +144,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
     await selfcheck_api.init_db(db)
     await leads_api.init_db(db)
     await lead_sync.init_db(db)
+    await auth_api.init_db(db)
     await db.commit()
 
 
@@ -159,10 +163,13 @@ async def lifespan(app: FastAPI):
     await selfcheck_api.purge(db)
     await leads_api.purge(db)
     await lead_sync.purge(db)
+    await auth_api.purge(db)
     app.state.db = db
     logger.info("ACTION_LOG_DB opened: %s", ACTION_LOG_DB)
     await lead_sync.resume(db)  # CRM deliveries interrupted by a restart
+    auth_purger = asyncio.get_running_loop().create_task(auth_api.purger(db), name="auth_purger")
     yield
+    auth_purger.cancel()
     # finish pending DOI mails before the DB closes; retries sleeping in their backoff are
     # cancelled (state stays in SQLite, resumed on the next start)
     await jobs.drain(timeout=float(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "10")))
@@ -440,6 +447,7 @@ async def health_detail():
     return {
         "status": "ok" if ok else "degraded",
         **result["detail"],
+        "auth_linkedin": auth_api.status(),  # 'configured' or the names of missing settings
         "cache_age_seconds": round(time.monotonic() - result["checked_at"], 1),
     }
 
@@ -507,6 +515,8 @@ async def get_actions(
 # -- Self-check (flywheel SPEC-020) and CTA leads (SPEC-021) ------------------------
 app.include_router(selfcheck_api.build_router(limiter=limiter, admin_ok=admin_ok))
 app.include_router(leads_api.build_router(limiter=limiter, admin_ok=admin_ok))
+# -- Website visitor LinkedIn login (sign-in only; replaces app2li, owner decision 2026-11-08) --
+app.include_router(auth_api.build_router(limiter=limiter))
 
 
 class _NoEventAccessLog(logging.Filter):

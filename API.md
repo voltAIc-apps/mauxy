@@ -169,6 +169,22 @@ Detailed health status for operator debugging. Always returns HTTP 200.
 
 ---
 
+## LinkedIn login: /api/auth/linkedin/start, /api/auth/linkedin/callback, POST /api/auth/session
+
+Sign-in only (`openid profile email`). See README "LinkedIn login" for the flow.
+
+- `GET /api/auth/linkedin/start?lang=de|en&return=/de/...&binding=<43+ url-safe chars>`: 302 to LinkedIn
+  + `Set-Cookie: __Host-mauxy_li` (HttpOnly, Secure, SameSite=Lax, 10 min). 400 `{"status": "invalid_request"}`
+  for a bad lang / binding / return path (anything but a same-site path).
+- `GET /api/auth/linkedin/callback` (LinkedIn only): always 302 to `{site}/{lang}/auth/callback?code=<one-time>`
+  or `?error=<code>` (`invalid_state`, `login_failed`, `unavailable`, LinkedIn codes such as `user_cancelled_login`).
+- `POST /api/auth/session` `{"code": "...", "binding": "..."}` from the site (CORS, Origin = the site):
+  200 `{"status": "ok", "profile": {sub, name, given_name, family_name, email, email_verified},
+  "session": "<token, 1 h>", "expires_at": "<ISO>", "return": "/de/..."}`; every failure 400
+  `{"status": "invalid_code"}`; 422 malformed body; 429 rate limit; 503 login not configured.
+
+---
+
 ## POST /api/subscribe, GET /api/confirm, /api/selfcheck*
 
 See README "Newsletter Signup (Double Opt-In)" and "Selbst-Check". All contact-specific outcomes

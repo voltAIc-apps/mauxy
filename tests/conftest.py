@@ -48,6 +48,15 @@ os.environ.setdefault("ODOO_LEAD_USER_ID", "7")
 os.environ.setdefault("ODOO_LIST_NEWSLETTER_ID", "1")
 os.environ.setdefault("ODOO_LIST_RADAR_ID", "2")
 
+# LinkedIn login (auth_api.py): fake client, LinkedIn itself is mocked with respx (tests/test_auth.py).
+# Redirect URI defaults to PUBLIC_BASE_URL + /api/auth/linkedin/callback (https://mauxy.test/...).
+os.environ.setdefault("LINKEDIN_CLIENT_ID", "test-client-id")
+os.environ.setdefault("LINKEDIN_CLIENT_SECRET", "test-client-secret-not-real")
+os.environ.setdefault("AUTH_ALLOWED_ORIGINS", "https://site.test,https://www.site.test")
+os.environ.setdefault("AUTH_TOKEN_SECRET", "auth-test-secret-for-pytest-only-0123456789")
+os.environ.setdefault("AUTH_RATE_LIMIT", "10000/minute")
+os.environ.setdefault("AUTH_SESSION_RATE_LIMIT", "10000/minute")
+
 # Make the repo root importable so `import main` finds mauxy/main.py
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:

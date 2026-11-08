@@ -2,7 +2,8 @@
 
 The website's interface to other systems (owner decision 2026-11-08, flywheel SPEC-021): public
 consent service of simplify-erp.de for newsletter, Migration Radar, Selbst-Check and every lead CTA
-(contact form, app inquiry, webinar registration, shop checkout). Double opt-in for everything;
+(contact form, app inquiry, webinar registration, shop checkout), plus the visitor **LinkedIn
+login** (sign-in only, replaces app2li; decision 2026-11-08). Double opt-in for everything;
 confirmed data goes to **sinks**: `crm.lead` and Email Marketing lists in erp.wapsol (Odoo 18,
 default). Mautic is a deprecated sink (`SUBSCRIBER_SINK=mautic`) until it is shut down.
 Credentials stay server-side.
@@ -19,6 +20,7 @@ Nothing is written to any sink before the confirmation link is clicked.
 | Delivery after DOI | outbox with retries | `lead_sync.py` |
 | Sinks | Odoo lead + subscriber sink, deprecated Mautic sink | `sinks.py`, `mautic_sink.py` |
 | Odoo | the one Odoo client (JSON-RPC, allowlist) | `odoo_client.py` |
+| LinkedIn login | `GET /api/auth/linkedin/start`, `GET /api/auth/linkedin/callback`, `POST /api/auth/session` | `auth_api.py` |
 
 ---
 
@@ -177,6 +179,7 @@ kubectl create secret generic mauxy-credentials \
 | `MAIL_MODE` | `smtp` / `console` (dry run) / `memory` (tests) | `smtp` if `SMTP_HOST` set, else `console` |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | mailcow SMTP (587 STARTTLS or 465 SSL) | *(required for DOI mails)* |
 | `SELFCHECK_*`, `MAUTIC_RADAR_*` | Self-check, see `.env.example` | see `.env.example` |
+| `LINKEDIN_*`, `AUTH_*` | LinkedIn login, see "LinkedIn login" | login disabled until set |
 
 ### Health & Monitoring
 
@@ -383,6 +386,62 @@ Deploy order: mauxy first (new endpoints, Odoo sinks), then the website.
   Odoo, the system of record; deletion requests there). No IP / user agent stored for leads.
 - Scale: one replica (SQLite on an RWO volume, in-process outbox). More replicas need a shared DB
   and a leader for the outbox.
+
+## LinkedIn login (website visitors, sign-in only)
+
+Replaces app2li (retired 2026-11-08). OpenID Connect scopes `openid profile email` only.
+LinkedIn **posting** (as Ashant or the company page) is NOT part of mauxy and belongs to the internal
+flywheel side: no publishing scopes, no member tokens in mauxy.
+
+```
+site login()  --GET /api/auth/linkedin/start?lang&return&binding-->  mauxy
+   mauxy: return path checked (same-site path), state row (hashes only), signed state (10 min),
+          Set-Cookie __Host-mauxy_li (HttpOnly, Secure, SameSite=Lax, 10 min)  --302-->  LinkedIn
+LinkedIn  --302 /api/auth/linkedin/callback?code&state-->  mauxy
+   mauxy: state signature + age, single use (burnt first), cookie == state, code -> token ->
+          userinfo over verified TLS (token dropped), profile parked 60 s under a one-time code
+          --302-->  {site}/{lang}/auth/callback?code=<one-time>   (errors: ?error=<code>)
+site  --POST /api/auth/session {code, binding}  (Origin = that site)-->  mauxy
+   mauxy: single use, 60 s, binding == the one sent at start -> {profile, session (1 h), return}
+```
+
+- **Return target**: only a path `/de/...` or `/en/...` on an allowed site (`AUTH_ALLOWED_ORIGINS`;
+  multi-site: the Referer picks among the allowlisted origins, else the first). Full URLs, `//`,
+  backslashes, encoded slashes, dot segments, `user@host` and the callback itself: 400.
+- **Login CSRF**: the state is bound to the browser by the cookie; the one-time code to the tab by
+  the `binding` (sessionStorage on the site). A code injected via a link or read from a log is useless.
+- **No PII in URLs**: the site only ever sees `code` or `error`; `error_description` is never
+  reflected. Profile = `sub`, `name`, `given_name`, `family_name`, `email` (only when verified),
+  `email_verified`. No picture, no company (LinkedIn OIDC has none).
+- **Stored**: `auth_state` (hashes, 10 min), `auth_code` (profile, max 60 s, deleted on exchange,
+  purged every 30 s), one audit line per login in `action_log` (result + site origin; no name,
+  e-mail, IP or token).
+- **Session token**: itsdangerous, own salt, `AUTH_SESSION_TTL` (1 h), `aud` = site origin.
+  `auth_api.verify_session()` verifies it. The site keeps it in sessionStorage only.
+- **Config guard**: missing / unsafe settings disable only the login (`error=unavailable`,
+  `/health/detail` -> `auth_linkedin: disabled: <names>`); newsletter and leads keep running.
+- **Host**: start and callback must be the same host (the cookie). Prod: the host this code runs on,
+  `unsubscribe.engage.wapsol.de` (see "Public host" below).
+
+| Variable | Purpose |
+|---|---|
+| `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | LinkedIn app of simplify-erp.de (k8s secret only) |
+| `LINKEDIN_REDIRECT_URI` | default `PUBLIC_BASE_URL` + `/api/auth/linkedin/callback`; must equal the LinkedIn portal entry exactly |
+| `AUTH_ALLOWED_ORIGINS` | sites the login returns to (default `LEAD_ALLOWED_ORIGINS`); https only (http only on 10.0.99.1) |
+| `AUTH_TOKEN_SECRET` | >= 32 chars; signs state + session (default `CONFIRM_TOKEN_SECRET`, own salts) |
+| `AUTH_SESSION_TTL`, `AUTH_RATE_LIMIT`, `AUTH_SESSION_RATE_LIMIT` | 3600 s, 20/minute (start + callback), 30/minute (session) |
+| `LINKEDIN_AUTH_URL`, `LINKEDIN_TOKEN_URL`, `LINKEDIN_USERINFO_URL` | LinkedIn defaults; override only for a local mock on 10.0.99.1 |
+
+LinkedIn developer portal (app of simplify-erp.de, Auth tab): product "Sign In with LinkedIn using
+OpenID Connect"; Authorized redirect URL exactly `https://unsubscribe.engage.wapsol.de/api/auth/linkedin/callback`.
+
+**Public host**: this code (repo mautic-unsubscribe) runs as `simplify-web/mautic-unsubscribe-proxy`
+behind `unsubscribe.engage.wapsol.de` (`PUBLIC_BASE_URL`, the site's `VITE_MAUXY_URL`).
+`mauxy.engage.wapsol.de` (namespace `mauxy`) is a DIFFERENT service (repo voltAIc-apps/mauxy,
+multi-site Mautic proxy): do not point the LinkedIn redirect there. Merging the two is an open CRIE item.
+
+Local: `tests/scripts/run_local.py` mounts a mocked LinkedIn at `/__mock_linkedin` (fake person);
+tests `tests/test_auth.py` (T-AUTH-0xx, respx).
 
 ## Roadmap
 
