@@ -1,8 +1,9 @@
 {
   "suite": "POST /api/selfcheck validation (flywheel SPEC-020)",
-  "description": "Each case patches the valid base payload (set / delete keys) and sends it with the given Origin. expect_status is the HTTP status; expect_mail whether a DOI mail goes out; expect_row whether a submission is stored.",
+  "description": "Each case patches the valid base payload (set / delete keys) and sends it with the given Origin. expect_status is the HTTP status; expect_mail whether a DOI mail goes out; expect_row whether a submission is stored. Optional: flag (SELFCHECK_NAME_REQUIRED for this case, default true) and expect_stored (columns of the stored row, after cleaning). String values {xN} are expanded to N times x. T-SC-160..183: name / phone (owner request 2026-11-09, db-patches/0010).",
   "base": {
     "email": "bob@example.com",
+    "name": "Bob Beispiel",
     "lang": "de",
     "picks": ["mail", "call", "radar"],
     "answers": { "system": ["ecc"], "why": ["eol"], "s4": "no", "when": "12" },
@@ -26,6 +27,30 @@
     { "id": "T-SC-114", "name": "unsupported language", "set": { "lang": "fr" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
     { "id": "T-SC-115", "name": "oversized answer value", "set": { "answers": { "when": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" } }, "expect_status": 422, "expect_mail": false, "expect_row": false },
     { "id": "T-SC-116", "name": "valid with stage 2 figures", "set": { "stay": { "licence": 120000, "support": 30000, "users": 60 } }, "expect_status": 200, "expect_mail": true, "expect_row": true },
-    { "id": "T-SC-117", "name": "consent missing", "delete": ["consent"], "expect_status": 422, "expect_mail": false, "expect_row": false }
+    { "id": "T-SC-117", "name": "consent missing", "delete": ["consent"], "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-160", "name": "name missing, SELFCHECK_NAME_REQUIRED on (default)", "set": {}, "delete": ["name"], "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-161", "name": "name missing, SELFCHECK_NAME_REQUIRED off (rollout transition): accepted, stored NULL", "set": {}, "delete": ["name"], "flag": false, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": null, "phone": null } },
+    { "id": "T-SC-162", "name": "name blank (spaces only)", "set": { "name": "   " }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-163", "name": "name blank is refused even with SELFCHECK_NAME_REQUIRED off", "set": { "name": "  " }, "flag": false, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-164", "name": "name of control characters only", "set": { "name": "\u0000\u0007\u001b" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-165", "name": "name exactly 100 characters", "set": { "name": "Maximiliane xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": "Maximiliane xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" } },
+    { "id": "T-SC-166", "name": "name 101 characters", "set": { "name": "Maximiliane xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-167", "name": "control characters stripped, line breaks / tabs become one space", "set": { "name": "  Bob\u0000 Bei\nspiel\t\r\n" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": "Bob Bei spiel" } },
+    { "id": "T-SC-168", "name": "direction override removed", "set": { "name": "Bob \u202eleipsieB\u2066" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": "Bob leipsieB" } },
+    { "id": "T-SC-169", "name": "100 characters plus surrounding whitespace: trimmed, accepted", "set": { "name": "   Maximiliane xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   " }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": "Maximiliane xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" } },
+    { "id": "T-SC-170", "name": "name far over the raw cap (500)", "set": { "name": "{x500}" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-171", "name": "name not a string", "set": { "name": 123 }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-172", "name": "umlauts, apostrophe, hyphen kept", "set": { "name": "Jörg O'Brien-Müller" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": "Jörg O'Brien-Müller" } },
+    { "id": "T-SC-173", "name": "phone valid with + ( ) / - and spaces", "set": { "phone": "+49 (0)30 / 123-45" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "phone": "+49 (0)30 / 123-45" } },
+    { "id": "T-SC-174", "name": "phone absent", "set": {}, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": "Bob Beispiel", "phone": null } },
+    { "id": "T-SC-175", "name": "phone empty string = absent", "set": { "phone": "  " }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "phone": null } },
+    { "id": "T-SC-176", "name": "phone with letters", "set": { "phone": "+49 30 abc" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-177", "name": "phone with a dot (not in the charset)", "set": { "phone": "030.1234" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-178", "name": "phone exactly 40 characters", "set": { "phone": "0000000000000000000000000000000000000000" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "phone": "0000000000000000000000000000000000000000" } },
+    { "id": "T-SC-179", "name": "phone 41 characters", "set": { "phone": "00000000000000000000000000000000000000000" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-180", "name": "phone without any digit", "set": { "phone": "+()/-" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-181", "name": "phone with an inner line break", "set": { "phone": "030\n123" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-182", "name": "phone trimmed", "set": { "phone": " 030 123 " }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "phone": "030 123" } },
+    { "id": "T-SC-183", "name": "invalid phone refused even with SELFCHECK_NAME_REQUIRED off and no name", "set": { "phone": "x" }, "delete": ["name"], "flag": false, "expect_status": 422, "expect_mail": false, "expect_row": false }
   ]
 }

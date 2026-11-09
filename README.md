@@ -385,6 +385,8 @@ The site entry `simplify-erp` exists in `sites` (patch 0004: `subscribe_quiz=0`,
 - Host: every call goes to `VITE_MAUXY_URL` = `https://mauxy.engage.wapsol.de` (= `PUBLIC_BASE_URL`).
 - CORS: the site origin in `ALLOWED_ORIGINS` (GET + POST, headers `Content-Type`, `Authorization`).
 - Lead CTAs, Selbst-Check and LinkedIn login are unchanged (Origin allowlists, no site key).
+- Selbst-Check body since 2026-11-09: + `name` (required) and `phone` (optional), API.md "Website contract:
+  Selbst-Check body"; rollout switch `SELFCHECK_NAME_REQUIRED`.
 
 ### One-time Mautic setup (DEPRECATED, only for sites on the Mautic sink)
 
@@ -444,12 +446,28 @@ the report PDF / rendered images), operator notifications. No second SMTP code a
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/selfcheck` | `{email, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company_website}`. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
+| `POST /api/selfcheck` | `{email, name, phone?, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company?, company_website}`. `name` / `phone`: see below. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
 | `GET /api/selfcheck/confirm?token=` | DOI mail link, read-only: confirmation page with a "Bestätigen" button (API.md "DOI mail links"). |
 | `POST /api/selfcheck/confirm` | The click (form field `token`), single-use. Result mail (pick `mail`), then the outbox: Migration Radar via the subscriber sink (pick `radar`, not blacklisted), `crm.lead` (picks `mail` / `call`; Radar alone = no lead), notification to `SELFCHECK_NOTIFY_TO` (always: quote request, call yes/no, answers, CRM lead id). 303 to `/{lang}/selbst-check?bestaetigt=1` (misconfigured: `=fehler`). Optional field `company` names the lead. |
 | `POST /api/selfcheck/event` | `{event: started|completed|exited_early|submitted, lang}` -> 204. Stores day + event + lang only; global rate-limit key (IP never read), access-log lines dropped. |
 | `GET /api/selfcheck/submissions` | Admin (Bearer `ADMIN_API_KEY`): confirmed (or pending) submissions. |
 | `GET /api/selfcheck/stats` | Admin: counters per day (success metric "completed checks"). |
+
+Name + phone (owner request 2026-11-09, db-patches/0010, tests T-SC-160..199):
+
+- `name` (first + last in one field): required (422 if missing, blank or > 100 chars after cleaning);
+  whitespace runs (tab / newline too) -> one space, other control and direction characters removed.
+  `phone` optional: digits, spaces, `+ ( ) / -` only, at least one digit, max 40; blank = absent.
+- Stored in `selfcheck_submission.name` / `.phone`, same retention as the e-mail (row deleted). Never in
+  the DOI mail (server text only).
+- After the click: `crm.lead` `contact_name` = name, `phone` = phone (not with a linked partner, see
+  "What is written to erp.wapsol"; then in the description), title "... – company or name or e-mail",
+  `partner_name` = company as before; result mail opens "Guten Tag {name}," / "Hello {name}," (name
+  HTML-escaped; neutral greeting without name); operator mail + lead description list Name / Telefon.
+- Rollout switch `SELFCHECK_NAME_REQUIRED` (default `true`): 1) deploy mauxy with `false` (the live
+  website does not send `name` yet; a missing name is accepted, a blank / invalid one never), 2) deploy
+  the website, 3) set `true` (`.env`, `scripts/deploy.py --secret`, restart). Same for the `/api/lead`
+  alias `kind: selfcheck`; other kinds and LUDO unchanged.
 
 Rules: `vendor/selfcheck/` is a copy of flywheel `backend/libs/selfcheck.py` + `website/src/data/selfcheck.json`,
 refreshed with `python scripts/sync_selfcheck.py --mauxy <this repo>` in flywheel. Retention: pending

@@ -117,6 +117,7 @@ The schema is **not** created at runtime. It is owned by integer-numbered SQL pa
 | `SELFCHECK_WEBSITE_URL`, `SELFCHECK_NOTIFY_TO` | Confirm redirect base; operator mailbox |
 | `SELFCHECK_RATE_LIMIT`, `SELFCHECK_EVENT_RATE_LIMIT` | Per-IP submit limit; global counter limit (no IP) |
 | `SELFCHECK_PENDING_DAYS`, `SELFCHECK_RETENTION_DAYS` | Retention 7 / 90 days |
+| `SELFCHECK_NAME_REQUIRED` | `name` required on `POST /api/selfcheck` (default true); false = rollout transition, only a missing name tolerated (README "Selbst-Check") |
 | `MAUTIC_RADAR_TAG`, `MAUTIC_RADAR_SEGMENT_ID` | DEPRECATED: Migration Radar in Mautic |
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, `LINKEDIN_REDIRECT_URI` | LinkedIn login (secret); redirect default `PUBLIC_BASE_URL/api/auth/linkedin/callback` |
 | `AUTH_ALLOWED_ORIGINS`, `AUTH_TOKEN_SECRET`, `AUTH_SESSION_TTL`, `AUTH_RATE_LIMIT`, `AUTH_SESSION_RATE_LIMIT` | login return sites, signing key (>= 32), session 3600 s, limits |
