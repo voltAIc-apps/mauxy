@@ -23,8 +23,11 @@ Odoo specifics (Odoo 18, erp.wapsol.de, dedicated bot user, see README "erp.waps
         are NOT sent (crm.lead's inverse would write them back onto the partner). Otherwise
         contact_name / partner_name / email_from / phone.
   subscriber: mailing.contact + mailing.subscription on ODOO_LIST_NEWSLETTER_ID / ODOO_LIST_RADAR_ID
-        (same list for every calling site; the site's registry `segment` is used by Mautic only);
-        opt-out = mailing.subscription.opt_out; blacklisted addresses (mail.blacklist) are skipped.
+        (fallback lists) or on the list ids of the site's routed odoo target (routing.py, list_id /
+        list_ids arguments); opt-out = mailing.subscription.opt_out; blacklisted addresses
+        (mail.blacklist) are skipped.
+  per-site lead: a routed odoo target may override team_id, tag_ids, utm_source, utm_medium,
+        utm_campaign (create_lead(..., overrides=)); missing keys = the env values above.
 """
 from __future__ import annotations
 
@@ -56,7 +59,7 @@ class SinkPermanent(RuntimeError):
 class LeadSink(Protocol):
     name: str
 
-    async def create_lead(self, lead: dict, *, maybe_exists: bool) -> Optional[int]:
+    async def create_lead(self, lead: dict, *, maybe_exists: bool, overrides: Optional[dict] = None) -> Optional[int]:
         """Create ONE lead. maybe_exists=True on a retry: look for the lead of an earlier attempt
         (marker lead['ref']) first, so one confirmation never yields two leads. Returns the CRM id
         (None for the none sink)."""
@@ -74,8 +77,8 @@ class SubscriberSink(Protocol):
                         name: Optional[str] = None, company: Optional[str] = None,
                         segment: Optional[str] = None) -> Literal["ok", "already", "blocked"]:
         """segment = target of the calling site (per-site key registry, newsletter only).
-        Mautic: segment alias (resolved / created). Odoo: not used yet, the list comes from
-        ODOO_LIST_<KEY>_ID (per-site Odoo lists = open owner decision)."""
+        Mautic: segment alias (resolved / created). Odoo: segment not used; the list is the
+        routed target's list id (list_id=, routing.py) or ODOO_LIST_<KEY>_ID (fallback)."""
 
     async def unsubscribe(self, email: str) -> tuple[str, Optional[str]]:
         """(result 'ok' | 'not_found' | 'error', reference or None)."""
@@ -171,7 +174,11 @@ class OdooLeadSink:
             return
         await self.odoo.execute("crm.lead", "message_subscribe", [[lead_id]], {"partner_ids": [pid]})
 
-    async def build_vals(self, lead: dict) -> dict:
+    async def build_vals(self, lead: dict, overrides: Optional[dict] = None) -> dict:
+        """crm.lead values. overrides = params of the site's routed odoo target (team_id, tag_ids,
+        utm_source, utm_medium, utm_campaign); missing keys fall back to the env settings."""
+        o = overrides or {}
+        team_id, tag_ids = o.get("team_id") or self.team_id, o.get("tag_ids") or self.tag_ids
         desc = lead["description"]
         if lead["ref"] not in desc:  # the retry search needs the marker in the description
             desc += f"\n\nReferenz: {lead['ref']}"
@@ -181,13 +188,13 @@ class OdooLeadSink:
             "user_id": self.user_id,
             "description": text_to_html(desc),
         }
-        if self.team_id:
-            vals["team_id"] = self.team_id
-        if self.tag_ids:
-            vals["tag_ids"] = [[6, 0, self.tag_ids]]
-        for field, model, name in (("source_id", "utm.source", self.utm_source),
-                                   ("medium_id", "utm.medium", self.utm_medium),
-                                   ("campaign_id", "utm.campaign", lead["campaign"])):
+        if team_id:
+            vals["team_id"] = team_id
+        if tag_ids:
+            vals["tag_ids"] = [[6, 0, list(tag_ids)]]
+        for field, model, name in (("source_id", "utm.source", o.get("utm_source") or self.utm_source),
+                                   ("medium_id", "utm.medium", o.get("utm_medium") or self.utm_medium),
+                                   ("campaign_id", "utm.campaign", o.get("utm_campaign") or lead["campaign"])):
             rid = await self._utm_id(model, name)
             if rid:
                 vals[field] = rid
@@ -206,13 +213,13 @@ class OdooLeadSink:
                     vals[k] = lead[k]
         return vals
 
-    async def create_lead(self, lead: dict, *, maybe_exists: bool) -> Optional[int]:
+    async def create_lead(self, lead: dict, *, maybe_exists: bool, overrides: Optional[dict] = None) -> Optional[int]:
         if not self.user_id:
             raise SinkPermanent("ODOO_LEAD_USER_ID is not set (salesperson)")
         async with _wrap():
             lead_id = await self._find_existing(lead["ref"]) if maybe_exists else None
             if lead_id is None:
-                vals = await self.build_vals(lead)
+                vals = await self.build_vals(lead, overrides)
                 lead_id = int(await self.odoo.execute("crm.lead", "create", [vals]))
                 logger.info("ODOO_LEAD_CREATED id=%s campaign=%s partner=%s", lead_id, lead["campaign"], bool(vals.get("partner_id")))
             await self.ensure_follower(lead_id)
@@ -234,8 +241,9 @@ class OdooSubscriberSink:
         self.odoo = client
         self.lists = {"newsletter": _env_int("ODOO_LIST_NEWSLETTER_ID"), "radar": _env_int("ODOO_LIST_RADAR_ID")}
 
-    def _list(self, key: str) -> int:
-        lid = self.lists.get(key)
+    def _list(self, key: str, list_id: Optional[int] = None) -> int:
+        """The routed target's list id, else the fallback ODOO_LIST_<KEY>_ID."""
+        lid = list_id or self.lists.get(key)
         if not lid:
             raise SinkPermanent(f"ODOO_LIST_{key.upper()}_ID is not set")
         return lid
@@ -248,23 +256,24 @@ class OdooSubscriberSink:
             "mailing.subscription",
             [["list_id", "=", list_id], ["contact_id.email_normalized", "=", norm]], ["id", "opt_out", "contact_id"])
 
-    async def status(self, email: str, list_key: str):
+    async def status(self, email: str, list_key: str, *, list_id: Optional[int] = None):
         norm = normalize_email(email)
         async with _wrap():
-            list_id = self._list(list_key)
+            list_id = self._list(list_key, list_id)
             if await self._blacklisted(norm):
                 return "blocked"
             if any(not s["opt_out"] for s in await self._subs(norm, list_id)):
                 return "subscribed"
         return "none"
 
-    async def subscribe(self, email, list_key, *, lang, source, page_url, name=None, company=None, segment=None):
+    async def subscribe(self, email, list_key, *, lang, source, page_url, name=None, company=None, segment=None,
+                        list_id: Optional[int] = None):
         """After DOI. `segment` (site registry) is not used: one list per list_key (see protocol). Opted out earlier on this list -> the new confirmation re-subscribes (opt_out
         False); blacklist stays authoritative. Existing mailing.contact -> new subscription line
         only; the contact itself is never changed."""
         norm = normalize_email(email)
         async with _wrap():
-            list_id = self._list(list_key)
+            list_id = self._list(list_key, list_id)
             if await self._blacklisted(norm):
                 return "blocked"
             subs = await self._subs(norm, list_id)
@@ -284,9 +293,11 @@ class OdooSubscriberSink:
         logger.info("ODOO_SUBSCRIBED list=%s source=%s", list_key, source)
         return "ok"
 
-    async def unsubscribe(self, email: str):
+    async def unsubscribe(self, email: str, *, list_ids: Optional[list[int]] = None):
+        """Opt-out on every given list (routed: all lists the site's odoo targets hold), else the
+        fallback lists."""
         norm = normalize_email(email)
-        list_ids = [lid for lid in self.lists.values() if lid]
+        list_ids = [lid for lid in (list_ids or self.lists.values()) if lid]
         if not list_ids:
             raise SinkPermanent("no ODOO_LIST_*_ID configured")
         async with _wrap():
@@ -312,7 +323,7 @@ class NoLeadSink:
     """LEAD_SINK=none: no CRM write; lead_sync mails the lead to LEAD_NOTIFY_TO instead."""
     name = "none"
 
-    async def create_lead(self, lead: dict, *, maybe_exists: bool) -> Optional[int]:
+    async def create_lead(self, lead: dict, *, maybe_exists: bool, overrides: Optional[dict] = None) -> Optional[int]:
         return None
 
     async def health(self) -> str:
@@ -341,6 +352,7 @@ SUBSCRIBER_KINDS = ("odoo", "mautic", "none")
 
 _client: Optional[OdooClient] = None
 _lead: Optional[LeadSink] = None
+_odoo_lead: Optional["OdooLeadSink"] = None
 _subscribers: dict[str, SubscriberSink] = {}
 
 
@@ -366,6 +378,17 @@ def lead_sink() -> LeadSink:
         else:
             raise SinkPermanent(f"unknown LEAD_SINK={kind}")
     return _lead
+
+
+def odoo_lead_sink() -> "OdooLeadSink":
+    """The Odoo lead sink regardless of LEAD_SINK (a site's routed odoo target)."""
+    global _odoo_lead
+    if _odoo_lead is None:
+        try:
+            _odoo_lead = OdooLeadSink(odoo())
+        except OdooPermanent as exc:
+            raise SinkPermanent(str(exc)) from None
+    return _odoo_lead
 
 
 def default_subscriber_kind() -> str:
@@ -396,8 +419,8 @@ def subscriber_sink(kind: Optional[str] = None) -> SubscriberSink:
 
 def reset() -> None:
     """Forget the cached sinks / client (tests, config reload)."""
-    global _client, _lead
-    _client = _lead = None
+    global _client, _lead, _odoo_lead
+    _client = _lead = _odoo_lead = None
     _subscribers.clear()
 
 

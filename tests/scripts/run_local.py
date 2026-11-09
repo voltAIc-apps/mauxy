@@ -12,6 +12,7 @@ and log in from there; nothing goes to linkedin.com.
 Env defaults below can be overridden from the shell (never put real Odoo / LinkedIn credentials here).
 """
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -78,6 +79,10 @@ odoo_client.TRANSPORT = httpx.MockTransport(fake.handle)
 import db_migrate  # noqa: E402
 
 db_migrate.apply_pending(os.environ["ACTION_LOG_DB"])  # the deployer step (k8s initContainer)
+# dev environment = its own DB values (db-patches/0006 seeds the PROD website of simplify-erp):
+# redirects after a DOI click go to the local site, like PUT /api/admin/brands/simplify-erp would set
+with sqlite3.connect(os.environ["ACTION_LOG_DB"]) as _conn:
+    _conn.execute("UPDATE site_brand SET website_url = ? WHERE site = 'simplify-erp'", (SITE,))
 
 import main  # noqa: E402
 

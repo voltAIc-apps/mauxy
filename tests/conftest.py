@@ -151,6 +151,12 @@ def _gate(c, send, method, url, kwargs):
 def client(app):
     # `with TestClient(app)` triggers lifespan so the SQLite action log opens.
     with TestClient(app) as c:
+        # db-patches/0006 seeds the simplify-erp brand with the PROD website (https://simplify-erp.de);
+        # every environment sets its own (stag / dev: PUT /api/admin/brands/simplify-erp), so does the
+        # test environment: the legacy suites expect redirects to PUBLIC_WEBSITE_BASE_URL.
+        r = c.request("PUT", "/api/admin/brands/simplify-erp", headers={"Authorization": "Bearer admin-test-key"},
+                      json={"website_url": "https://site.test"})
+        assert r.status_code == 200, r.text
         # Contact-dependent work runs as fire-and-forget jobs after the response (jobs.py).
         # Tests see its effects by draining the jobs after every request; the timing tests
         # use c.request_nodrain to observe the response before any job ran.

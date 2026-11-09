@@ -23,6 +23,13 @@ DOI mails contain server-side text only (no browser-supplied text goes to an arb
 The lead (title + plain-text description) is rendered at confirmation from the submitted fields.
 Retention: pending LEAD_PENDING_DAYS (7), confirmed LEAD_RETENTION_DAYS (30): the CRM is the
 system of record once delivered.
+
+Per site (db-patches/0006): the site comes from the Origin (brand.site_for_origin, site_origin
+table; unmapped -> DEFAULT_SITE) and is stored with the submission. It picks the brand (DOI mail
+sender / website name / footer, confirmation page, redirect) and the routing (routing.py: the
+site's odoo target with its team / tags / UTM / lists rides in lead_sync, every other target --
+e.g. a flywheel webhook -- gets its own outbox row; a ticked newsletter box follows the site's
+subscribe routing). No routes = the fallback (LEAD_SINK / SUBSCRIBER_SINK) exactly as before.
 """
 from __future__ import annotations
 
@@ -41,10 +48,12 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
 
+import brand
 import confirm_page
 import jobs
 import lead_sync
 import mailer
+import routing
 import selfcheck_api
 
 logger = logging.getLogger("mauxy.leads")
@@ -199,19 +208,19 @@ KIND_LABEL = {
     "webinar": {"de": "eine Webinar-Anmeldung", "en": "a webinar registration"},
     "checkout": {"de": "eine Bestellung im Shop", "en": "an order in the shop"},
 }
+# {site} = the site's website name (brand.label), {footer} = its mail footer (simplify-erp seed:
+# "Ashant Chalasani / Simplify-ERP, wapsol GmbH / imprint", i.e. the text of before 0006)
 DOI = {
-    "de": ("Bitte bestätigen: Ihre Anfrage auf simplify-erp.de",
-           "Guten Tag,\n\nSie haben auf simplify-erp.de {what} gesendet{nl}.\n\n"
+    "de": ("Bitte bestätigen: Ihre Anfrage auf {site}",
+           "Guten Tag,\n\nSie haben auf {site} {what} gesendet{nl}.\n\n"
            "Bitte bestätigen Sie mit diesem Link, dass die Anfrage von Ihnen stammt:\n{link}\n\n"
            "Der Link gilt {hours} Stunden und kann einmal verwendet werden. Ohne Bestätigung bearbeiten wir nichts "
-           "und löschen Ihre Angaben nach {days} Tagen.\n\nWenn Sie das nicht waren, ignorieren Sie diese Mail einfach.\n\n"
-           "Ashant Chalasani\nSimplify-ERP, wapsol GmbH\nhttps://simplify-erp.de/de/impressum"),
-    "en": ("Please confirm: your request on simplify-erp.de",
-           "Hello,\n\nYou sent {what} on simplify-erp.de{nl}.\n\n"
+           "und löschen Ihre Angaben nach {days} Tagen.\n\nWenn Sie das nicht waren, ignorieren Sie diese Mail einfach.{footer}"),
+    "en": ("Please confirm: your request on {site}",
+           "Hello,\n\nYou sent {what} on {site}{nl}.\n\n"
            "Please confirm with this link that the request came from you:\n{link}\n\n"
            "The link is valid for {hours} hours and can be used once. Without confirmation we do not process anything "
-           "and delete your details after {days} days.\n\nIf this was not you, simply ignore this mail.\n\n"
-           "Ashant Chalasani\nSimplify-ERP, wapsol GmbH\nhttps://simplify-erp.de/en/impressum"),
+           "and delete your details after {days} days.\n\nIf this was not you, simply ignore this mail.{footer}"),
 }
 NL_NOTE = {"de": " und den Newsletter bestellt", "en": " and subscribed to the newsletter"}
 
@@ -267,7 +276,8 @@ def lead_for(row, ref: str) -> dict:
         lines.append(f"Seite: {row['page_url']}")
     if body:
         lines += [""] + body
-    lines += ["", f"Quelle: simplify-erp.de / Website / Kampagne {kind}", f"Referenz: {ref}"]
+    site = brand.lead_site(row["site"])
+    lines += ["", f"Quelle: {brand.label(site, LEAD_WEBSITE_URL)} / Website / Kampagne {kind}", f"Referenz: {ref}"]
     return {"ref": ref, "kind": kind, "campaign": kind, "title": title[:200], "email": row["email"],
             "contact_name": d.get("name"), "partner_name": d.get("company"), "phone": d.get("phone"),
             "lang": row["lang"], "description": "\n".join(lines)}
@@ -293,10 +303,18 @@ def _origin_ok(request: Request) -> bool:
     return request.headers.get("origin", "").rstrip("/") in LEAD_ALLOWED_ORIGINS
 
 
-def _redirect(lang: str, ok: bool, kind: str = "", status: int = 302) -> RedirectResponse:
-    lang = lang if lang in ("de", "en") else "de"
-    path = f"anfrage/bestaetigt?art={kind}" if ok else "anfrage/fehler"
-    return RedirectResponse(f"{LEAD_WEBSITE_URL}/{lang}/{path}", status_code=status)
+def _target(site: Optional[str], lang: str, ok: bool, kind: str = "") -> str:
+    """After the click: the site's explicit target > its website_url > LEAD_WEBSITE_URL (brand.py)."""
+    b = brand.get(site)
+    lang = lang if lang in ("de", "en") else (b.default_locale if b else "de")
+    if ok:
+        return brand.redirect_url(site, "lead", lang, "confirmed", env_base=LEAD_WEBSITE_URL,
+                                  path=f"/{lang}/anfrage/bestaetigt", params={"art": kind})
+    return brand.redirect_url(site, "lead", lang, "error", env_base=LEAD_WEBSITE_URL, path=f"/{lang}/anfrage/fehler")
+
+
+def _redirect(lang: str, ok: bool, kind: str = "", status: int = 302, site: Optional[str] = None) -> RedirectResponse:
+    return RedirectResponse(_target(site, lang, ok, kind), status_code=status)
 
 
 async def _pending(db: aiosqlite.Connection, token: Optional[str]):
@@ -317,7 +335,7 @@ async def _pending(db: aiosqlite.Connection, token: Optional[str]):
     return row
 
 
-async def _submit_job(db: aiosqlite.Connection, payload) -> None:
+async def _submit_job(db: aiosqlite.Connection, payload, site: str) -> None:
     """Contact-dependent part of POST /api/lead (after the response): throttle, store, DOI mail."""
     await purge(db)
     email = payload.email.lower()
@@ -326,29 +344,55 @@ async def _submit_job(db: aiosqlite.Connection, payload) -> None:
                               exclude_none=True)
     # cap + insert in ONE statement (atomic, no COUNT-then-INSERT race; security review 2026-11-09)
     cur = await db.execute(
-        "INSERT INTO lead_submission (kind, created_at, email, lang, newsletter, page_url, data) "
-        "SELECT ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM lead_submission WHERE email = ? AND created_at >= ?) < ?",
+        "INSERT INTO lead_submission (kind, created_at, email, lang, newsletter, page_url, data, site) "
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM lead_submission WHERE email = ? AND created_at >= ?) < ?",
         (payload.kind, _iso(_now()), email, payload.lang, int(payload.newsletter), payload.page_url,
-         json.dumps(data, ensure_ascii=False), email, since, MAX_PENDING_PER_EMAIL))
+         json.dumps(data, ensure_ascii=False), site, email, since, MAX_PENDING_PER_EMAIL))
     if cur.rowcount != 1:
         await db.commit()  # end the (empty) implicit transaction
         logger.info("LEAD_THROTTLED kind=%s", payload.kind)
         return
     lid = cur.lastrowid
-    token = _signer.dumps({"l": lid})
+    token = _signer.dumps({"l": lid, "b": site})  # b: brand of the neutral page only
     await db.execute("UPDATE lead_submission SET token_hash = ? WHERE id = ?", (_hash(token), lid))
     await db.commit()
-    subject, body = DOI[payload.lang]
-    ok = await mailer.send(email, subject, body.format(
-        what=KIND_LABEL[payload.kind][payload.lang], nl=NL_NOTE[payload.lang] if payload.newsletter else "",
-        link=f"{PUBLIC_BASE_URL}/api/lead/confirm?token={token}", hours=CONFIRM_TOKEN_MAX_AGE // 3600, days=LEAD_PENDING_DAYS),
-        audience="doi", key=f"lead-doi-{lid}")
+    subject, body = doi_mail(site, payload.lang, kind=payload.kind, newsletter=payload.newsletter,
+                             link=f"{PUBLIC_BASE_URL}/api/lead/confirm?token={token}")
+    ok = await mailer.send(email, subject, body, audience="doi", key=f"lead-doi-{lid}", sender=brand.sender(site))
     if not ok:
         await db.execute("DELETE FROM lead_submission WHERE id = ?", (lid,))
         await db.commit()
         logger.error("LEAD_DOI_MAIL_FAILED id=%s", lid)
         return
     logger.info("LEAD_PENDING id=%s kind=%s newsletter=%s", lid, payload.kind, payload.newsletter)
+
+
+def doi_mail(site: str, lang: str, *, kind: str, newsletter: bool, link: str) -> tuple[str, str]:
+    """(subject, body) of the lead DOI mail in the site's brand (server-side text only)."""
+    label = brand.label(site, LEAD_WEBSITE_URL)
+    foot = brand.footer(site, lang)
+    subject, body = DOI[lang]
+    return subject.format(site=label), body.format(
+        site=label, what=KIND_LABEL[kind][lang], nl=NL_NOTE[lang] if newsletter else "", link=link,
+        hours=CONFIRM_TOKEN_MAX_AGE // 3600, days=LEAD_PENDING_DAYS, footer=f"\n\n{foot}" if foot else "")
+
+
+async def route_confirmed(db: aiosqlite.Connection, *, origin: str, origin_id: int, site: str, action: str,
+                          lead: Optional[dict], subscribe: dict, data: dict) -> None:
+    """Delivery of a confirmed lead / self-check: lead_sync (the CRM target, routed or fallback)
+    + one outbox row per other routed target; a ticked newsletter box follows the site's
+    subscribe routing when it has one (shared by leads_api and selfcheck_api)."""
+    lists = list(subscribe.get("lists") or [])
+    if "newsletter" in lists and (nl_to := routing.targets(site, "subscribe")):
+        lists.remove("newsletter")
+        await routing.fan_out(db, site=site, action="subscribe", event_ref=f"{origin}-nl:{origin_id}", to=nl_to, data={
+            "email": subscribe["email"], "locale": subscribe["lang"], "source": subscribe["source"],
+            "page_url": subscribe.get("page_url") or "", "name": subscribe.get("name"),
+            "company": subscribe.get("company"), "lists": ["newsletter"]})
+    await lead_sync.enqueue(db, origin=origin, origin_id=origin_id, lead=lead, subscribe={**subscribe, "lists": lists},
+                            target=routing.crm_target(site, action))
+    if to := routing.targets(site, action):
+        await routing.fan_out(db, site=site, action=action, event_ref=f"{origin}:{origin_id}", to=to, data=data)
 
 
 def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
@@ -366,7 +410,8 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         if not _signer or not PUBLIC_BASE_URL or not mailer.configured():
             logger.error("LEAD_NOT_CONFIGURED")
             return JSONResponse({"status": "service_unavailable"}, status_code=503)
-        jobs.spawn(_submit_job(request.app.state.db, payload), name="lead_submit")
+        site = brand.site_for_origin(request.headers.get("origin"))
+        jobs.spawn(_submit_job(request.app.state.db, payload, site), name="lead_submit")
         return JSONResponse(PENDING)
 
     @router.get("/api/lead/confirm")
@@ -378,8 +423,11 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
             return _redirect("de", False)
         row = await _pending(request.app.state.db, token)
         if row is None:
-            return confirm_page.neutral()
-        return confirm_page.render("lead", row["lang"], "/api/lead/confirm", token, LEAD_WEBSITE_URL)
+            return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_signer, token)))
+        site = brand.lead_site(row["site"])
+        return confirm_page.render("lead", row["lang"], "/api/lead/confirm", token,
+                                   [_target(site, row["lang"], True, row["kind"]), _target(site, row["lang"], False)],
+                                   brand=brand.get(site))
 
     @router.post("/api/lead/confirm")
     @limiter.limit(os.environ.get("CONFIRM_RATE_LIMIT", "30/minute"))
@@ -395,7 +443,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         db: aiosqlite.Connection = request.app.state.db
         row = await _pending(db, token)
         if row is None:
-            return confirm_page.neutral()
+            return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_signer, token)))
         lid = row["id"]
         # burn first, conditionally: a parallel second POST finds no pending row (rowcount 0)
         cur = await db.execute("UPDATE lead_submission SET status = 'confirmed', confirmed_at = ?, token_hash = NULL "
@@ -403,16 +451,21 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         claimed = cur.rowcount == 1
         await db.commit()
         if not claimed:
-            return confirm_page.neutral()
+            return confirm_page.neutral(brand=brand.get(brand.lead_site(row["site"])))
         async with db.execute("SELECT * FROM lead_submission WHERE id = ?", (lid,)) as cur:
             row = await cur.fetchone()
         d = json.loads(row["data"])
+        site = brand.lead_site(row["site"])
         subscribe = {"email": row["email"], "lang": row["lang"], "source": f"lead-{row['kind']}",
                      "page_url": row["page_url"] or "", "name": d.get("name"), "company": d.get("company"),
                      "lists": ["newsletter"] if row["newsletter"] else []}
-        await lead_sync.enqueue(db, origin="lead", origin_id=lid, lead=lead_for(row, lead_sync.new_ref()), subscribe=subscribe)
-        logger.info("LEAD_CONFIRMED id=%s kind=%s", lid, row["kind"])
-        return _redirect(row["lang"], True, row["kind"], status=303)
+        lead = lead_for(row, lead_sync.new_ref())
+        await route_confirmed(db, origin="lead", origin_id=lid, site=site, action="lead", lead=lead, subscribe=subscribe,
+                              data={"ref": lead["ref"], "kind": row["kind"], "email": row["email"], "lang": row["lang"],
+                                    "name": d.get("name"), "company": d.get("company"), "phone": d.get("phone"),
+                                    "newsletter": bool(row["newsletter"]), "page_url": row["page_url"] or ""})
+        logger.info("LEAD_CONFIRMED id=%s kind=%s site=%s", lid, row["kind"], site)
+        return _redirect(row["lang"], True, row["kind"], status=303, site=site)
 
     @router.get("/api/lead/submissions")
     async def lead_submissions(request: Request, status: Literal["pending", "confirmed"] = Query("confirmed"),

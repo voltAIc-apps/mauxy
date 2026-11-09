@@ -67,8 +67,12 @@ KNOWN_VARS = [
         "LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET", "LINKEDIN_REDIRECT_URI",
         "AUTH_ALLOWED_ORIGINS", "AUTH_TOKEN_SECRET", "AUTH_SESSION_TTL", "AUTH_RATE_LIMIT",
         "AUTH_SESSION_RATE_LIMIT",
+        # per-site brand + routing (db-patches/0006); webhook secrets: WEBHOOK_SECRET_<REF> (pattern below)
+        "DEFAULT_SITE", "BRAND_LOGO_MAX_BYTES", "MAIL_SENDER_DOMAINS", "WEBHOOK_ALLOWED_HOSTS", "WEBHOOK_TIMEOUT",
     )),
 ]
+# One secret per webhook target (routing.py secret_ref -> WEBHOOK_SECRET_<REF>): any number, synced too.
+WEBHOOK_SECRET_RE = re.compile(r"^WEBHOOK_SECRET_[A-Z0-9_]{1,40}$")
 
 RENDER_REQUIRED = ["DEPLOY_NAMESPACE", "DEPLOY_IMAGE", "DEPLOY_DOMAIN", "DEPLOY_IMAGE_PULL_SECRET"]
 
@@ -128,7 +132,7 @@ def do_secret(variables: dict):
     ns = variables["DEPLOY_NAMESPACE"]
     args = ["kubectl", "create", "secret", "generic", "mauxy-credentials", "-n", ns,
             "--dry-run=client", "-o", "yaml"]
-    for key in SECRET_KEYS:
+    for key in SECRET_KEYS + sorted(k for k in variables if WEBHOOK_SECRET_RE.match(k)):
         if variables.get(key):
             args += [f"--from-literal={key}={variables[key]}"]
     print(f"==> sync Secret mauxy-credentials (ns {ns})")
@@ -180,7 +184,7 @@ def main():
 
     env_path = Path(args.env_file) if os.path.isabs(args.env_file) else PROJECT_ROOT / args.env_file
     variables = load_dotenv(env_path)
-    for key in KNOWN_VARS:                       # real env vars win over .env
+    for key in KNOWN_VARS + [k for k in os.environ if WEBHOOK_SECRET_RE.match(k)]:  # real env vars win over .env
         if os.environ.get(key):
             variables[key] = os.environ[key]
 

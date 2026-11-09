@@ -15,6 +15,11 @@ with the whole submission to LEAD_NOTIFY_TO (Ashant), so nothing is lost; admin 
 
 Data minimisation: lead text and subscription data are cleared once delivered (the CRM holds
 them); rows are deleted LEAD_RETENTION_DAYS after done / failed.
+
+Per-site routing (routing.py): `target` = the site's routed CRM target ({"sink": "odoo", "params":
+{lists, team_id, tag_ids, utm_*}} or {"sink": "none"}); NULL = the fallback (LEAD_SINK,
+SUBSCRIBER_SINK, ODOO_LIST_*_ID). Every other target of the site gets its own row in
+route_delivery (fan-out), so this row stays the one crm.lead + operator-mail path.
 """
 from __future__ import annotations
 
@@ -82,14 +87,16 @@ async def get_for(db: aiosqlite.Connection, origin: str, origin_id: int) -> Opti
 
 
 async def enqueue(db: aiosqlite.Connection, *, origin: str, origin_id: int, lead: Optional[dict],
-                  subscribe: Optional[dict]) -> Optional[int]:
+                  subscribe: Optional[dict], target: Optional[dict] = None) -> Optional[int]:
     """Store the delivery for one confirmed submission and start it. A second call for the same
-    submission is ignored (UNIQUE) -> None."""
+    submission is ignored (UNIQUE) -> None. target = routed CRM target (module doc) or None."""
     cur = await db.execute(
-        "INSERT OR IGNORE INTO lead_sync (origin, origin_id, ref, created_at, lead, subscribe) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO lead_sync (origin, origin_id, ref, created_at, lead, subscribe, target) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (origin, origin_id, (lead or {}).get("ref") or new_ref(), _iso(_now()),
          json.dumps(lead, ensure_ascii=False) if lead else None,
-         json.dumps(subscribe, ensure_ascii=False) if subscribe and subscribe.get("lists") else None),
+         json.dumps(subscribe, ensure_ascii=False) if subscribe and subscribe.get("lists") else None,
+         json.dumps(target, sort_keys=True) if target else None),
     )
     await db.commit()
     if not cur.rowcount:
@@ -133,21 +140,33 @@ async def _step(db: aiosqlite.Connection, row: dict) -> None:
     """One delivery attempt; persists each finished step. Raises SinkTransient / SinkPermanent."""
     sub = json.loads(row["subscribe"]) if row["subscribe"] else None
     results = json.loads(row["sub_results"] or "{}")
+    target = json.loads(row["target"]) if row.get("target") else None
+    params = (target or {}).get("params") or {}
+    routed_none = target is not None and target.get("sink") != "odoo"
     if sub:
-        sink = sinks.subscriber_sink()
+        sink = None if routed_none else sinks.subscriber_sink("odoo" if target else None)
         for key in sub["lists"]:
             if key in results:
                 continue
-            res = await sink.subscribe(sub["email"], key, lang=sub["lang"], source=sub["source"],
-                                       page_url=sub.get("page_url") or "", name=sub.get("name"), company=sub.get("company"))
-            results[key] = "dnc_skip" if res == "blocked" else res
+            if sink is None:  # routed site without odoo target: lists handled by its other targets
+                results[key] = "routed"
+            else:
+                extra = {"list_id": params.get("lists", {}).get(key)} if target else {}
+                res = await sink.subscribe(sub["email"], key, lang=sub["lang"], source=sub["source"],
+                                           page_url=sub.get("page_url") or "", name=sub.get("name"),
+                                           company=sub.get("company"), **extra)
+                results[key] = "dnc_skip" if res == "blocked" else res
             await db.execute("UPDATE lead_sync SET sub_results = ? WHERE id = ?", (json.dumps(results), row["id"]))
             await db.commit()
     lead = json.loads(row["lead"]) if row["lead"] else None
-    if lead and row["odoo_lead_id"] is None and row["lead_sink"] != "none":
-        sink = sinks.lead_sink()
+    if lead and routed_none and row["lead_sink"] is None:
+        await db.execute("UPDATE lead_sync SET lead_sink = 'none' WHERE id = ?", (row["id"],))
+        await db.commit()
+    elif lead and row["odoo_lead_id"] is None and row["lead_sink"] != "none":
+        sink = sinks.odoo_lead_sink() if target else sinks.lead_sink()
         # any earlier attempt may have created the lead before failing (lost response, follower step)
-        lead_id = await sink.create_lead(lead, maybe_exists=row["attempts"] > 0 or bool(row["last_error"]))
+        lead_id = await sink.create_lead(lead, maybe_exists=row["attempts"] > 0 or bool(row["last_error"]),
+                                         **({"overrides": params} if target else {}))
         await db.execute("UPDATE lead_sync SET odoo_lead_id = ?, lead_sink = ? WHERE id = ?", (lead_id, sink.name, row["id"]))
         await db.commit()
 

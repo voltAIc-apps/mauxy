@@ -25,6 +25,11 @@ SQLite, nothing is written to any sink before the person clicks "Bestätigen" on
 page (GET of the mail link is read-only: scanners prefetch links, confirm_page.py); confirmation
 tokens are signed, time-limited and single-use (stored as SHA-256, compared in constant time).
 
+Per site (owner requirement 2026-11-09, db-patches/0006): brand profile (brand.py: confirm /
+neutral page, DOI mails, redirects, mail sender) and action routing (routing.py: ordered targets
+per site and action, fan-out through the route_delivery outbox). Sites without a profile / routes
+behave exactly as before.
+
 Schema: versioned patches in db-patches/ (db_migrate.py), applied by the deployer
 (`scripts/sqlite_db.py --migrate`, k8s initContainer); startup only checks the version.
 """
@@ -53,14 +58,17 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 import auth_api
+import brand
 import confirm_page
 import db_migrate  # schema patches live in db-patches/; this is the shared runner
 import jobs
 import lead_sync
 import leads_api
 import mailer
+import routing
 import selfcheck_api
 import sinks
+import webhooks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -226,6 +234,8 @@ async def reload_config(db: aiosqlite.Connection) -> None:
             bank.setdefault(topic, []).append({"id": qid, "q": question, "choices": choices, "answer": answer})
     _SITES_BY_KEY = sites
     QUIZ_BANK = bank
+    await brand.load(db)    # per-site brand profiles (db-patches/0006)
+    await routing.load(db)  # per-site action routing (db-patches/0006)
 
 
 async def _seed_if_empty(db: aiosqlite.Connection) -> None:
@@ -357,12 +367,14 @@ async def lifespan(app: FastAPI):
     await leads_api.purge(db)
     await lead_sync.purge(db)
     await auth_api.purge(db)
+    await routing.purge(db)
     mailer.bind(db)  # mail_outbox (idempotency, retries, per-recipient limit)
     await mailer.purge(db)
     app.state.db = db
     logger.info("ACTION_LOG_DB opened: %s sites=%d topics=%d mautic_version=%s",
                 ACTION_LOG_DB, len(_SITES_BY_KEY), len(QUIZ_BANK), get_mautic_version() or "unknown")
     await lead_sync.resume(db)  # CRM deliveries interrupted by a restart
+    await routing.resume(db)    # per-target fan-out deliveries interrupted by a restart
     await mailer.resume(jobs.spawn)  # mails that were queued when the process stopped
     auth_purger = asyncio.get_running_loop().create_task(auth_api.purger(db), name="auth_purger")
     yield
@@ -539,12 +551,14 @@ async def _check_sinks() -> dict:
     return _sink_health
 
 
-def _website_redirect(locale: str, path: str, reason: str | None = None) -> str:
-    """Build redirect URL back to the website. Falls back to EN if locale not valid."""
-    lang = locale if locale in ("en", "de") else "en"
-    base = PUBLIC_WEBSITE_BASE_URL or ""
-    qs = f"?reason={reason}" if reason else ""
-    return f"{base}/{lang}/{path}{qs}"
+def _nl_redirect(site: Optional[str], locale: str, outcome: str, reason: str | None = None) -> str:
+    """Newsletter redirect after the click (brand.redirect_url: the site's explicit target >
+    its website_url > PUBLIC_WEBSITE_BASE_URL). Invalid locale -> the site's default, else EN."""
+    b = brand.get(site)
+    lang = locale if locale in ("en", "de") else (b.default_locale if b else "en")
+    path = f"/{lang}/newsletter/confirmed" if outcome == "confirmed" else f"/{lang}/newsletter/confirm-error"
+    return brand.redirect_url(site, "newsletter", lang, outcome, env_base=PUBLIC_WEBSITE_BASE_URL, path=path,
+                              params={"reason": reason} if reason else None)
 
 
 PENDING = {"status": "pending_confirmation"}
@@ -647,7 +661,10 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
     db: aiosqlite.Connection = request.app.state.db
     log = dict(action="subscribe", site=site["site"])
     try:
-        state = await sinks.subscriber_sink(site["sink"]).status(email, "newsletter")
+        if routing.targets(site["site"], "subscribe"):  # routed site: its first list-holding target
+            state = await routing.status(site["site"], email)
+        else:
+            state = await sinks.subscriber_sink(site["sink"]).status(email, "newsletter")
     except (sinks.SinkTransient, sinks.SinkPermanent) as exc:
         # not returned to the caller (enumeration); no DOI now, the person can retry later
         logger.error("SUBSCRIBE_SINK_ERROR error=%s", str(exc)[:200])
@@ -663,7 +680,7 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
     await purge_newsletter_pending(db)
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
     pid = secrets.token_urlsafe(16)
-    token = _token_signer.dumps({"p": pid})
+    token = _token_signer.dumps({"p": pid, "b": site["site"]})  # b: brand of the neutral page only
     # Cap + insert in ONE statement (security review 2026-11-09, throttle race): a separate
     # COUNT followed by an INSERT let N parallel requests all see "below the cap". SQLite takes
     # the write lock at the start of a writing statement, so the sub-select and the insert are
@@ -682,10 +699,11 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
         return
 
     subject, body = NEWSLETTER_DOI[payload.locale]
-    ok = await mailer.send(email, subject, body.format(
+    body = brand.with_footer(body.format(
         link=f"{PUBLIC_BASE_URL}/api/confirm?token={token}",
         hours=CONFIRM_TOKEN_MAX_AGE // 3600, days=NEWSLETTER_PENDING_DAYS,
-    ), audience="doi", key=f"nl-doi-{pid}")
+    ), site["site"], payload.locale)
+    ok = await mailer.send(email, subject, body, audience="doi", key=f"nl-doi-{pid}", sender=brand.sender(site["site"]))
     if not ok:
         await db.execute("DELETE FROM newsletter_pending WHERE id = ?", (pid,))
         await db.commit()
@@ -733,13 +751,15 @@ async def confirm_page_get(request: Request, token: str = Query(..., min_length=
     written to any sink here. Invalid / expired / used: the uniform neutral page.
     """
     if _confirm_misconfigured():
-        return RedirectResponse(_website_redirect("en", "newsletter/confirm-error", reason="server_misconfigured"),
-                                status_code=302)
+        return RedirectResponse(_nl_redirect(None, "en", "error", reason="server_misconfigured"), status_code=302)
     row, reason = await _pending_for_token(request.app.state.db, token)
     if row is None:
         logger.info("CONFIRM_PAGE_INVALID reason=%s", reason)
-        return confirm_page.neutral()
-    return confirm_page.render("newsletter", row["locale"], "/api/confirm", token, PUBLIC_WEBSITE_BASE_URL)
+        return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_token_signer, token)))
+    site = row["site"]
+    return confirm_page.render("newsletter", row["locale"], "/api/confirm", token,
+                               [_nl_redirect(site, row["locale"], o) for o in ("confirmed", "error")],
+                               brand=brand.get(site))
 
 
 @app.post("/api/confirm")
@@ -757,8 +777,8 @@ async def confirm(request: Request):
     """
     db: aiosqlite.Connection = request.app.state.db
 
-    def fail(locale: str, reason: str) -> RedirectResponse:
-        return RedirectResponse(_website_redirect(locale, "newsletter/confirm-error", reason=reason), status_code=303)
+    def fail(locale: str, reason: str, site: Optional[str] = None) -> RedirectResponse:
+        return RedirectResponse(_nl_redirect(site, locale, "error", reason=reason), status_code=303)
 
     if _confirm_misconfigured():
         return fail("en", "server_misconfigured")
@@ -770,7 +790,7 @@ async def confirm(request: Request):
     if row is None:
         await log_action(request, "", reason, error_detail="not_pending_or_used" if token else "no_token",
                          action="confirm")
-        return confirm_page.neutral()
+        return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_token_signer, token)))
 
     pid, email, locale = row["id"], row["email"], row["locale"]
     log = dict(action="confirm", site=row["site"])
@@ -781,7 +801,18 @@ async def confirm(request: Request):
     await db.commit()
     if not claimed:  # a parallel POST got it first
         await log_action(request, email, "confirm_invalid", error_detail="not_pending_or_used", **log)
-        return confirm_page.neutral()
+        return confirm_page.neutral(brand=brand.get(row["site"]))
+
+    site = row["site"]
+    if to := routing.targets(site, "subscribe"):
+        # Routed site: the click is final; every target gets its own outbox row (retries per target,
+        # a down target neither blocks nor repeats the others). Blocked addresses are refused by
+        # the list-holding target itself (result 'blocked').
+        await routing.fan_out(db, site=site, action="subscribe", event_ref=f"nl:{pid}", to=to, data={
+            "email": email, "locale": locale, "source": row["source"], "page_url": row["page_url"],
+            "segment": row["segment"] or "", "lists": ["newsletter"]})
+        await log_action(request, email, "confirm_ok", error_detail=f"routed:{len(to)}", **log)
+        return RedirectResponse(_nl_redirect(site, locale, "confirmed"), status_code=303)
 
     try:
         result = await sinks.subscriber_sink(row["sink"] or None).subscribe(
@@ -792,13 +823,13 @@ async def confirm(request: Request):
                          (token_hash(token), pid))
         await db.commit()
         await log_action(request, email, "confirm_error", error_detail=str(exc)[:200], **log)
-        return fail(locale, "service_unavailable")  # token stays valid, user can retry
+        return fail(locale, "service_unavailable", site)  # token stays valid, user can retry
     if result == "blocked":
         await log_action(request, email, "confirm_dnc_refused", **log)
-        return fail(locale, "unavailable")
+        return fail(locale, "unavailable", site)
 
     await log_action(request, email, "confirm_ok", error_detail=None if result == "ok" else result, **log)
-    return RedirectResponse(_website_redirect(locale, "newsletter/confirmed"), status_code=303)
+    return RedirectResponse(_nl_redirect(site, locale, "confirmed"), status_code=303)
 
 
 # -- Routes -----------------------------------------------------------------
@@ -824,13 +855,17 @@ async def ready(request: Request):
 
 
 @app.get("/health/detail")
-async def health_detail():
+async def health_detail(request: Request):
     """Operator view: sink reachability (cached 30 s). Always 200."""
     result = await _check_sinks()
     ok = all(not v.startswith("error") for v in result["detail"].values())
     return {
         "status": "ok" if ok else "degraded",
         **result["detail"],
+        "brands": brand.count(),
+        "routes": routing.count(),
+        "webhooks": f"{len(webhooks.allowed_hosts())} allowed host(s)" if webhooks.allowed_hosts() else "disabled",
+        "deliveries_failed": await routing.failed_count(request.app.state.db),
         "auth_linkedin": auth_api.status(),  # 'configured' or the names of missing settings
         "sites": len(_SITES_BY_KEY),
         "quiz": "configured" if CHALLENGE_SECRET and QUIZ_BANK else "disabled",
@@ -862,6 +897,14 @@ async def unsubscribe(payload: UnsubscribeRequest, request: Request):
     if not _verify_challenge(payload.challenge, payload.answer, site["topic"]):
         await log_action(request, email, "quiz_failed", **log)
         return JSONResponse({"status": "quiz_failed"}, status_code=409)
+    to = routing.unsubscribe_targets(site["site"], site["sink"])
+    if to is not None:
+        # Routed site: the opt-out goes to EVERY receiver that may hold the address (routing.py),
+        # each through its own outbox row with retries; failures are mailed to LEAD_NOTIFY_TO.
+        await routing.fan_out(request.app.state.db, site=site["site"], action="unsubscribe",
+                              event_ref=routing.new_event("unsub"), data={"email": email}, to=to)
+        await log_action(request, email, "unsubscribe_queued", error_detail=f"routed:{len(to)}", **log)
+        return JSONResponse({"status": "ok"})
     try:
         result, ref = await sinks.subscriber_sink(site["sink"]).unsubscribe(email)
     except sinks.SinkTransient as exc:
@@ -1081,6 +1124,9 @@ async def admin_set_mautic_instance(payload: MauticInstanceUpdate, request: Requ
     return JSONResponse({"status": "updated", "version": payload.version})
 
 
+# -- Per-site brand profiles and action routing (db-patches/0006) ---------------------------
+app.include_router(brand.build_router(require_admin=_require_admin, on_change=reload_config))
+app.include_router(routing.build_router(require_admin=_require_admin, on_change=reload_config))
 # -- Self-check (flywheel SPEC-020) and CTA leads (SPEC-021) ------------------------
 app.include_router(selfcheck_api.build_router(limiter=limiter, admin_ok=admin_ok))
 app.include_router(leads_api.build_router(limiter=limiter, admin_ok=admin_ok))

@@ -24,6 +24,13 @@ Selbst-Check endpoints (simplify-erp.de /:lang/selbst-check, flywheel SPEC-020).
 Nothing is written to any sink (Odoo / Mautic) before the confirmation. Retention: unconfirmed submissions are
 deleted after SELFCHECK_PENDING_DAYS (7), confirmed ones after SELFCHECK_RETENTION_DAYS (90).
 Rules + engine are vendored from flywheel (vendor/selfcheck, scripts/sync_selfcheck.py there).
+
+Per site (db-patches/0006): site from the Origin (brand.site_for_origin), stored with the submission;
+brand = mail sender, the vendored signature swapped for the site's mail footer (simplify-erp seed =
+the same signature), website base of links / redirects, confirmation page. Routing (routing.py,
+action "selfcheck"): the site's odoo target rides in lead_sync (crm.lead + Radar list), every other
+target (Mautic Radar, flywheel webhook, ...) gets its own outbox row. The self-check CONTENT stays
+the vendored simplify-erp rules.
 """
 from __future__ import annotations
 
@@ -41,6 +48,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+import brand
 import confirm_page
 import jobs
 import lead_sync
@@ -163,21 +171,31 @@ def _picks_block(picks: list[str], lang: str) -> str:
     return "\n".join(f"- {t}" for t in engine.pick_titles(RULES, picks, lang))
 
 
-def _site_url(lang: str) -> str:
-    return f"{SELFCHECK_WEBSITE_URL}/{lang}{RULES['route']}"
+# Signature the vendored mail texts end with; replaced by the site's footer (brand.replace_signature).
+SIGNATURE = {lang: f"Ashant Chalasani\nSimplify-ERP, wapsol GmbH\nhttps://simplify-erp.de/{lang}/impressum"
+             for lang in ("de", "en")}
+
+
+def _site_url(lang: str, site: Optional[str] = None) -> str:
+    return f"{brand.base_url(site, SELFCHECK_WEBSITE_URL)}/{lang}{RULES['route']}"
+
+
+def _row_site(row) -> str:
+    return brand.lead_site(row["site"] if "site" in row.keys() else "")
 
 
 def result_mail(row: aiosqlite.Row) -> tuple[str, str]:
     lang = row["lang"]
+    site = _row_site(row)
     answers = json.loads(row["answers"])
     stay = json.loads(row["stay"]) if row["stay"] else None
     prog = engine.progress(RULES, answers)
     m = RULES["mail"]["result"]
-    url = _site_url(lang)
+    url = _site_url(lang, site)
     head = (m["intro"] if prog["complete"] else m["partial"])[lang].format(
         answered=prog["answered"], total=prog["total"], url=url)
     body = "\n\n".join([head, engine.result_text(RULES, answers, lang, stay), m["outro"][lang].format(url=url)])
-    return m["subject"][lang], body
+    return m["subject"][lang], brand.replace_signature(body, site, lang, SIGNATURE[lang])
 
 
 def _summary(row, radar_result: str, mail_sent: Optional[bool]) -> tuple[str, list[str]]:
@@ -237,7 +255,8 @@ def lead_for(row, ref: str) -> Optional[dict]:
     _, lines = _summary(row, "gewählt" if "radar" in picks else "nicht gewählt", None)
     wanted = [t for p, t in zip(("mail", "call"), ("Ergebnis und Richtangebot per Mail", "30 Minuten Kennenlernen (Meetly)")) if p in picks]
     lines.insert(2, "Angefragt: " + "; ".join(wanted))
-    desc = _body(row, lines) + f"\n\nQuelle: simplify-erp.de / Website / Kampagne selfcheck\nReferenz: {ref}"
+    label = brand.label(_row_site(row), SELFCHECK_WEBSITE_URL)
+    desc = _body(row, lines) + f"\n\nQuelle: {label} / Website / Kampagne selfcheck\nReferenz: {ref}"
     return {"ref": ref, "kind": "selfcheck", "campaign": "selfcheck", "title": title, "email": row["email"],
             "contact_name": None, "partner_name": row["company"], "phone": None, "lang": row["lang"], "description": desc}
 
@@ -289,9 +308,16 @@ def _origin_ok(request: Request) -> bool:
     return request.headers.get("origin", "").rstrip("/") in SELFCHECK_ALLOWED_ORIGINS
 
 
-def _redirect(lang: str, ok: bool, status: int = 302) -> RedirectResponse:
-    lang = lang if lang in ("de", "en") else "de"
-    return RedirectResponse(f"{_site_url(lang)}?bestaetigt={'1' if ok else 'fehler'}", status_code=status)
+def _target(site: Optional[str], lang: str, ok: bool) -> str:
+    """After the click: the site's explicit target > its website_url > SELFCHECK_WEBSITE_URL."""
+    b = brand.get(site)
+    lang = lang if lang in ("de", "en") else (b.default_locale if b else "de")
+    return brand.redirect_url(site, "selfcheck", lang, "confirmed" if ok else "error", env_base=SELFCHECK_WEBSITE_URL,
+                              path=f"/{lang}{RULES['route']}", params={"bestaetigt": "1" if ok else "fehler"})
+
+
+def _redirect(lang: str, ok: bool, status: int = 302, site: Optional[str] = None) -> RedirectResponse:
+    return RedirectResponse(_target(site, lang, ok), status_code=status)
 
 
 async def _pending(db: aiosqlite.Connection, token: Optional[str]):
@@ -313,7 +339,7 @@ async def _pending(db: aiosqlite.Connection, token: Optional[str]):
     return row
 
 
-async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", clean: dict) -> None:
+async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", clean: dict, site: str) -> None:
     """Contact-dependent part of POST /api/selfcheck (runs after the response is sent)."""
     await purge(db)
     email = payload.email.lower()
@@ -322,29 +348,31 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     prog = engine.progress(RULES, clean)
     # cap + insert in ONE statement (atomic, no COUNT-then-INSERT race; security review 2026-11-09)
     cur = await db.execute(
-        "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete, company) "
-        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete, company, "
+        "site) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
         "WHERE (SELECT COUNT(*) FROM selfcheck_submission WHERE email = ? AND created_at >= ?) < ?",
         (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
          json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"]),
-         " ".join(payload.company.split()) if payload.company else None, email, since, MAX_PENDING_PER_EMAIL),
+         " ".join(payload.company.split()) if payload.company else None, site, email, since, MAX_PENDING_PER_EMAIL),
     )
     if cur.rowcount != 1:
         await db.commit()  # end the (empty) implicit transaction
         logger.info("SELFCHECK_THROTTLED")
         return
     sid = cur.lastrowid
-    token = _signer.dumps({"s": sid})
+    token = _signer.dumps({"s": sid, "b": site})  # b: brand of the neutral page only
     await db.execute("UPDATE selfcheck_submission SET token_hash = ? WHERE id = ?", (_hash(token), sid))
     await db.commit()
 
     doi = RULES["mail"]["doi"]
-    ok = await mailer.send(email, doi["subject"][payload.lang], doi["body"][payload.lang].format(
+    body = brand.replace_signature(doi["body"][payload.lang].format(
         picks=_picks_block(payload.picks, payload.lang),
         link=f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}",
         hours=CONFIRM_TOKEN_MAX_AGE // 3600,
         retention_pending_days=SELFCHECK_PENDING_DAYS,
-    ), audience="doi", key=f"sc-doi-{sid}")
+    ), site, payload.lang, SIGNATURE[payload.lang])
+    ok = await mailer.send(email, doi["subject"][payload.lang], body, audience="doi", key=f"sc-doi-{sid}",
+                           sender=brand.sender(site))
     if not ok:
         await db.execute("DELETE FROM selfcheck_submission WHERE id = ?", (sid,))
         await db.commit()
@@ -368,7 +396,8 @@ async def submit(payload: SelfCheckRequest, request: Request) -> JSONResponse:
 
     # From here on the answer is the same for every address, immediately (no enumeration via
     # content, status code or timing); storage + DOI mail run as a job after the response.
-    jobs.spawn(_submit_job(request.app.state.db, payload, clean), name="selfcheck_submit")
+    site = brand.site_for_origin(request.headers.get("origin"))
+    jobs.spawn(_submit_job(request.app.state.db, payload, clean, site), name="selfcheck_submit")
     return JSONResponse(PENDING)
 
 
@@ -389,8 +418,11 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
             return _redirect("de", False)
         row = await _pending(request.app.state.db, token)
         if row is None:
-            return confirm_page.neutral()
-        return confirm_page.render("selfcheck", row["lang"], "/api/selfcheck/confirm", token, SELFCHECK_WEBSITE_URL)
+            return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_signer, token)))
+        site = _row_site(row)
+        return confirm_page.render("selfcheck", row["lang"], "/api/selfcheck/confirm", token,
+                                   [_target(site, row["lang"], True), _target(site, row["lang"], False)],
+                                   brand=brand.get(site))
 
     @router.post("/api/selfcheck/confirm")
     @limiter.limit(os.environ.get("CONFIRM_RATE_LIMIT", "30/minute"))
@@ -406,7 +438,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         db: aiosqlite.Connection = request.app.state.db
         row = await _pending(db, token)
         if row is None:
-            return confirm_page.neutral()
+            return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_signer, token)))
         sid = row["id"]
         confirmed_at = _iso(_now())
         # burn the token first, conditionally: a parallel second POST cannot trigger a second round of mails
@@ -418,26 +450,33 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         claimed = cur.rowcount == 1
         await db.commit()
         if not claimed:
-            return confirm_page.neutral()
+            return confirm_page.neutral(brand=brand.get(_row_site(row)))
         async with db.execute("SELECT * FROM selfcheck_submission WHERE id = ?", (sid,)) as cur:
             row = await cur.fetchone()
+        site = _row_site(row)
 
         picks = json.loads(row["picks"])
         mail_sent = False
         if "mail" in picks:
             subject, body = result_mail(row)
             # address confirmed by the DOI click; the report PDF / images go here as mailer.Attachment
-            mail_sent = await mailer.send(row["email"], subject, body, audience="confirmed", key=f"sc-result-{sid}")
+            mail_sent = await mailer.send(row["email"], subject, body, audience="confirmed", key=f"sc-result-{sid}",
+                                          sender=brand.sender(site))
         await db.execute("UPDATE selfcheck_submission SET mail_sent = ? WHERE id = ?", (int(mail_sent), sid))
         await db.commit()
 
         # Radar subscription + CRM lead + operator mail: outbox with retries (lead_sync, SPEC-021)
+        import leads_api  # local: leads_api imports this module (shared route_confirmed)
         ref = lead_sync.new_ref()
-        subscribe = {"email": row["email"], "lang": row["lang"], "source": "selfcheck", "page_url": _site_url(row["lang"]),
+        page_url = _site_url(row["lang"], site)
+        subscribe = {"email": row["email"], "lang": row["lang"], "source": "selfcheck", "page_url": page_url,
                      "company": row["company"], "lists": ["radar"] if "radar" in picks else []}
-        await lead_sync.enqueue(db, origin="selfcheck", origin_id=sid, lead=lead_for(row, ref), subscribe=subscribe)
-        logger.info("SELFCHECK_CONFIRMED id=%s mail=%s", sid, mail_sent)
-        return _redirect(row["lang"], True, status=303)
+        await leads_api.route_confirmed(
+            db, origin="selfcheck", origin_id=sid, site=site, action="selfcheck", lead=lead_for(row, ref),
+            subscribe=subscribe, data={"ref": ref, "email": row["email"], "lang": row["lang"], "picks": picks,
+                                       "company": row["company"], "source": "selfcheck", "page_url": page_url})
+        logger.info("SELFCHECK_CONFIRMED id=%s mail=%s site=%s", sid, mail_sent, site)
+        return _redirect(row["lang"], True, status=303, site=site)
 
     @router.post(EVENT_PATH, status_code=204)
     @limiter.limit(SELFCHECK_EVENT_RATE_LIMIT, key_func=_global_key)

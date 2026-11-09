@@ -10,7 +10,8 @@ sink / creates the crm.lead. Same for all three flows: newsletter, CTA lead, Sel
                   noindex, no framing, Referrer-Policy, every element has a unique id, no external
                   resources, no script
   T-SEC-037       uniform neutral page: identical bytes for bad signature, expired, used, unknown,
-                  foreign salt -- across all flows, GET and POST
+                  foreign salt -- across all flows, GET and POST (per brand since db-patches/0006: the
+                  brand comes from the token text, never from its validity)
   T-SEC-038       N parallel POSTs of one token -> exactly one confirmation
 """
 import asyncio
@@ -24,6 +25,8 @@ from urllib.parse import urlencode
 import httpx
 import pytest
 
+import brand
+import confirm_page
 import leads_api
 import main as mauxy_main
 import selfcheck_api
@@ -153,7 +156,7 @@ class _Tags(HTMLParser):
     handle_startendtag = handle_starttag
 
 
-def _hardened(resp, form_action):
+def _hardened(resp, form_action, allowed_hrefs=()):
     h = resp.headers
     csp = h["content-security-policy"]
     assert "default-src 'none'" in csp and "frame-ancestors 'none'" in csp and "base-uri 'none'" in csp
@@ -171,14 +174,19 @@ def _hardened(resp, form_action):
     ids = [a.get("id") for _, a in p.tags]
     assert all(ids) and len(ids) == len(set(ids)), ids  # every element has a unique id
     assert not [t for t, _ in p.tags if t in ("script", "img", "link", "iframe", "object", "embed")]
-    assert not re.search(r"\b(src|href)=|url\(|@import", resp.text)  # no external resources
+    text = resp.text
+    for href in allowed_hrefs:  # brand legal links (validated https, navigation only, not a resource)
+        assert f'href="{href}" rel="noopener noreferrer"' in text
+        text = text.replace(f'href="{href}"', "")
+    assert not re.search(r"\b(src|href)=|url\(|@import", text)  # no external resources
 
 
 @pytest.mark.parametrize("flow", FLOWS)
 def test_t_sec_036_page_hardening(flow, client, outbox, odoo):
     token = submit(client, outbox, flow)
     page = client.get(f"{PATH[flow]}?token={token}")
-    _hardened(page, "'self' https://site.test")
+    # newsletter: test site simplify-web (no profile); lead / selfcheck: DEFAULT_SITE simplify-erp (seeded profile)
+    _hardened(page, "'self' https://site.test", () if flow == "newsletter" else ("https://simplify-erp.de/de/impressum",))
     assert '<meta id="mx-robots" name="robots" content="noindex, nofollow">' in page.text
     neutral = client.get(f"{PATH[flow]}?token=garbage")
     _hardened(neutral, "'none'")
@@ -211,7 +219,10 @@ def test_t_sec_037_neutral_page_uniform(client, outbox, odoo, monkeypatch):
         for resp in (client.get(f"{PATH[f]}?token={fresh[f]}"), post(client, f, fresh[f])):
             assert is_neutral(resp)
             bodies.add(resp.content)
-    assert len(bodies) == 1  # one page for every reason and every flow
+    # one page for every reason and every flow -- per brand: the newsletter test site has no profile,
+    # lead / selfcheck tokens carry the simplify-erp claim (garbage / minted-without-claim -> generic)
+    generic, branded = confirm_page.neutral().body, confirm_page.neutral(brand=brand.get("simplify-erp")).body
+    assert bodies == {generic, branded}
 
 
 async def _parallel_posts(app, path, token, n):
