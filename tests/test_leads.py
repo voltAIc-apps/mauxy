@@ -29,7 +29,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 import jobs
 import lead_sync
@@ -347,10 +349,14 @@ def test_t_lead_048_timing_identical(client, outbox, odoo, monkeypatch):
     assert len(outbox) == 2
 
 
-def test_t_lead_049_health(client, odoo):
+@respx.mock(assert_all_called=False)
+def test_t_lead_049_health(respx_mock, client, odoo):
+    # sites pinned to Mautic (test ludo / re-cloud) are reported too: Mautic mocked reachable
+    respx_mock.get("https://mautic.test/api/contacts?limit=1").mock(return_value=httpx.Response(200, json={}))
     assert client.get("/health").json() == {"status": "ok"}
     d = client.get("/health/detail").json()
     assert d["status"] == "ok" and d["lead_sink"].startswith("odoo: reachable") and d["subscriber_sink"].startswith("odoo: reachable")
+    assert d["subscriber_sink_mautic"] == "mautic: reachable"
     assert "test-key-not-real" not in json.dumps(d)
 
 

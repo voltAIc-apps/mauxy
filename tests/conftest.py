@@ -4,6 +4,7 @@ Shared fixtures for mauxy tests.
 Env vars are set BEFORE importing `main` because mauxy reads configuration at
 module load time. Keep this file's top-level imports minimal.
 """
+import json
 import os
 import sys
 from pathlib import Path
@@ -57,6 +58,30 @@ os.environ.setdefault("AUTH_TOKEN_SECRET", "auth-test-secret-for-pytest-only-012
 os.environ.setdefault("AUTH_RATE_LIMIT", "10000/minute")
 os.environ.setdefault("AUTH_SESSION_RATE_LIMIT", "10000/minute")
 
+# Newsletter authority gates (per-site key + bot-defence quiz). One test site on the seeded quiz
+# topic simplify-erp (db-patches/0002). The client fixture adds key + solved challenge to
+# /api/subscribe and /api/unsubscribe unless the test sets them itself (see _gate).
+# Sites (mirror of prod, db-patches/0004):
+#   SITE_KEY    simplify-erp  quiz on, global sink, mauxy DOI, no segment (legacy suites: Mautic tag only)
+#   WEB_KEY     simplify-web  the website contract: quiz OFF on subscribe, pinned to Odoo, mauxy DOI
+#   LUDO_KEY    ludo          upstream behaviour: pinned to Mautic, Mautic runs the DOI (doi_owner sink)
+#   RECLOUD_KEY re-cloud      pinned to Mautic with a segment, mauxy DOI (segment added after the click)
+SITE_KEY = "test-site-key-0123456789"
+WEB_KEY = "test-web-public-key-0123456789"
+LUDO_KEY = "test-ludo-key-0123456789"
+RECLOUD_KEY = "test-recloud-key-0123456789"
+os.environ.setdefault("MAUXY_SITES", json.dumps([
+    {"key": SITE_KEY, "site": "simplify-erp", "segment": "", "topic": "simplify-erp"},
+    {"key": WEB_KEY, "site": "simplify-web", "segment": "", "topic": "simplify-erp",
+     "subscribe_quiz": False, "subscriber_sink": "odoo"},
+    {"key": LUDO_KEY, "site": "ludo", "segment": "ludo", "topic": "ludo",
+     "subscriber_sink": "mautic", "doi_owner": "sink"},
+    {"key": RECLOUD_KEY, "site": "re-cloud", "segment": "re-cloud", "topic": "re-cloud", "subscriber_sink": "mautic"},
+]))
+os.environ.setdefault("CHALLENGE_SECRET", "challenge-test-secret-for-pytest-only")
+os.environ.setdefault("CHALLENGE_RATE_LIMIT", "10000/minute")
+os.environ.setdefault("SUBSCRIBE_RATE_LIMIT", "10000/minute")
+
 # Make the repo root importable so `import main` finds mauxy/main.py
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -92,6 +117,34 @@ def outbox():
     mailer.OUTBOX.clear()
 
 
+GATED = ("/api/subscribe", "/api/unsubscribe")
+
+
+def solve_challenge(c, key: str = SITE_KEY, send=None) -> dict:
+    """GET /api/challenge with the site key, answer from the server-side bank (what a human does).
+    `send` = the undrained request function (the gate must not wait for running jobs)."""
+    r = (send or c.request)("GET", "/api/challenge", headers={"Authorization": f"Bearer {key}"})
+    assert r.status_code == 200, r.text
+    token = r.json()["challenge"]
+    topic, qid = token.split(".")[:2]
+    (q,) = [q for q in mauxy_main.QUIZ_BANK[topic] if q["id"] == qid]
+    return {"challenge": token, "answer": q["answer"]}
+
+
+def _gate(c, send, method, url, kwargs):
+    """Add the site key and a solved challenge to a newsletter call that does not set them.
+    A test that checks the gates passes its own Authorization header / challenge."""
+    if method.upper() == "POST" and str(url) in GATED:
+        headers = dict(kwargs.get("headers") or {})
+        if not any(h.lower() == "authorization" for h in headers):
+            headers["Authorization"] = f"Bearer {SITE_KEY}"
+        kwargs["headers"] = headers
+        body = kwargs.get("json")
+        if isinstance(body, dict) and "challenge" not in body and headers["Authorization"] == f"Bearer {SITE_KEY}":
+            kwargs["json"] = {**body, **solve_challenge(c, send=send)}
+    return send(method, url, **kwargs)
+
+
 @pytest.fixture
 def client(app):
     # `with TestClient(app)` triggers lifespan so the SQLite action log opens.
@@ -101,12 +154,16 @@ def client(app):
         # use c.request_nodrain to observe the response before any job ran.
         orig = c.request
 
-        def request_and_drain(*args, **kwargs):
-            resp = orig(*args, **kwargs)
+        def request_nodrain(method, url, **kwargs):
+            return _gate(c, orig, method, url, kwargs)
+
+        def request_and_drain(method, url, **kwargs):
+            resp = request_nodrain(method, url, **kwargs)
             c.portal.call(jobs.drain)
             return resp
 
-        c.request_nodrain = orig
+        c.request_raw = orig  # no gate, no drain (tests of the gates themselves)
+        c.request_nodrain = request_nodrain
         c.request = request_and_drain
         yield c
     # slowapi keeps in-memory counters; reset so other tests start fresh.

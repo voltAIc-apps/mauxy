@@ -2,5 +2,6 @@
 *.db
 __pycache__/
 k8s/rendered/
+.venv/
 tests/venv/
 .pytest_cache/

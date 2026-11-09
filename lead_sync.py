@@ -62,31 +62,7 @@ def new_ref() -> str:
     return "mauxy-" + secrets.token_hex(12)
 
 
-async def init_db(db: aiosqlite.Connection) -> None:
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS lead_sync (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            origin          TEXT NOT NULL,
-            origin_id       INTEGER NOT NULL,
-            ref             TEXT NOT NULL,
-            created_at      TEXT NOT NULL,
-            lead            TEXT,
-            subscribe       TEXT,
-            sub_results     TEXT NOT NULL DEFAULT '{}',
-            lead_sink       TEXT,
-            odoo_lead_id    INTEGER,
-            state           TEXT NOT NULL DEFAULT 'queued',
-            attempts        INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at TEXT,
-            last_error      TEXT,
-            done_at         TEXT,
-            failure_mailed  INTEGER NOT NULL DEFAULT 0,
-            UNIQUE (origin, origin_id)
-        )
-    """)
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_lead_sync_state ON lead_sync(state)")
-
-
+# schema: db-patches/0003_website_consent.sql (applied by scripts/sqlite_db.py --migrate)
 async def purge(db: aiosqlite.Connection) -> None:
     cutoff = _iso(_now() - timedelta(days=RETENTION_DAYS))
     await db.execute("DELETE FROM lead_sync WHERE state IN ('done', 'failed') AND COALESCE(done_at, created_at) < ?", (cutoff,))

@@ -5,7 +5,10 @@ switch can be rolled back by env until Mautic is shut down; delete this file wit
 
 Behaviour is the pre-2026-11-08 one (tests T-SEC-0xx, T-SC-120/122 run against it):
   status      read the contact; tag newsletter_confirmed / radar tag -> subscribed; DNC -> blocked
-  subscribe   after DOI only: upsert contact with tags + consent fields; DNC -> blocked
+  subscribe   after DOI only: upsert contact with tags + consent fields; DNC -> blocked;
+              with the calling site's `segment` (site registry, upstream newsletter authority):
+              also add the contact to that segment (alias, created when missing). mauxy owns the
+              DOI, so a Mautic DOI campaign on that segment must be switched off (double mail).
   unsubscribe add the contact to the e-mail DNC list
 Credentials (MAUTIC_BASE_URL / MAUTIC_USERNAME / MAUTIC_PASSWORD) from env, never logged.
 """
@@ -88,6 +91,57 @@ async def upsert_contact(client: httpx.AsyncClient, *, existing_id: str | None, 
     return resp.status_code, resp.json().get("contact")
 
 
+async def resolve_segment_id(client: httpx.AsyncClient, alias: str) -> tuple[str | None, str | None]:
+    """Mautic segment id by alias, created when absent (from upstream main.py, newsletter
+    authority). (segment_id, None) or (None, error detail)."""
+    resp = await client.get(f"{MAUTIC_BASE_URL}/api/segments", params={"limit": 200}, auth=_auth())
+    if resp.status_code != 200:
+        return None, f"segments_list_status={resp.status_code}"
+    lists = resp.json().get("lists", {})
+    items = lists.values() if isinstance(lists, dict) else (lists or [])
+    for item in items:
+        if (item.get("alias") or "").lower() == alias.lower():
+            return str(item.get("id")), None
+    created = await client.post(
+        f"{MAUTIC_BASE_URL}/api/segments/new",
+        json={"name": alias, "alias": alias, "isPublished": True}, auth=_auth())
+    if created.status_code in (200, 201):
+        new_id = created.json().get("list", {}).get("id")
+        logger.info("SEGMENT_CREATED alias=%s id=%s", alias, new_id)
+        return str(new_id), None
+    return None, f"segment_create_status={created.status_code}"
+
+
+async def add_to_segment_now(email: str, segment: str) -> tuple[str, Optional[str], Optional[str]]:
+    """Upstream newsletter-authority subscribe, unchanged, for sites with doi_owner='sink' (ludo):
+    find/create the contact and add it to the site's segment AT ONCE; a Mautic campaign on that
+    segment runs the opt-in. Returns (result, contact_id, error_detail), result one of
+    ok | unreachable (-> 503) | error (-> 502) | unexpected (-> 500)."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            status, contact = await search_contact(client, email)
+            if status != 200:
+                return "unreachable", None, f"search_status={status}"
+            if contact is None:
+                created = await client.post(f"{MAUTIC_BASE_URL}/api/contacts/new", json={"email": email}, auth=_auth())
+                if created.status_code not in (200, 201):
+                    return "error", None, f"contact_create_status={created.status_code}"
+                contact_id = str(created.json().get("contact", {}).get("id"))
+            else:
+                contact_id = str(contact["id"])
+            segment_id, err = await resolve_segment_id(client, segment)
+            if segment_id is None:
+                return "error", contact_id, err
+            add = await client.post(f"{MAUTIC_BASE_URL}/api/segments/{segment_id}/contact/{contact_id}/add", auth=_auth())
+            if add.status_code in (200, 201):
+                return "ok", contact_id, None
+            return "error", contact_id, f"segment_add_status={add.status_code}"
+    except httpx.RequestError as exc:
+        return "unreachable", None, f"httpx_error: {exc.__class__.__name__}"
+    except Exception as exc:  # upstream: 500 on anything unexpected
+        return "unexpected", None, f"unexpected: {exc.__class__.__name__}"
+
+
 class MauticSubscriberSink:
     name = "mautic"
 
@@ -109,7 +163,7 @@ class MauticSubscriberSink:
             return "blocked"
         return "none"
 
-    async def subscribe(self, email, list_key, *, lang, source, page_url, name=None, company=None):
+    async def subscribe(self, email, list_key, *, lang, source, page_url, name=None, company=None, segment=None):
         fields = {"newsletter_locale": lang, "newsletter_source": source,
                   "newsletter_consented_at": _now_iso(), "newsletter_page_url": page_url}
         remove: list[str] = []
@@ -126,6 +180,14 @@ class MauticSubscriberSink:
                     payload_fields=fields, add_tags=[LIST_TAGS[list_key]], remove_tags=remove)
                 if not upserted:
                     raise SinkTransient(f"mautic upsert_status={status}")
+                if segment:  # calling site's segment (newsletter, site registry)
+                    seg_id, err = await resolve_segment_id(client, segment)
+                    if seg_id is None:
+                        raise SinkTransient(f"mautic {err}")
+                    resp = await client.post(
+                        f"{MAUTIC_BASE_URL}/api/segments/{seg_id}/contact/{upserted.get('id')}/add", auth=_auth())
+                    if resp.status_code not in (200, 201):
+                        raise SinkTransient(f"mautic segment_status={resp.status_code}")
                 if list_key == "radar" and MAUTIC_RADAR_SEGMENT_ID:
                     resp = await client.post(
                         f"{MAUTIC_BASE_URL}/api/segments/{MAUTIC_RADAR_SEGMENT_ID}/contact/{upserted.get('id')}/add",

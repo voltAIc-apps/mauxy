@@ -5,6 +5,7 @@ Tests for every endpoint. Mautic is mocked via `respx`; Odoo is ALWAYS the in-me
 
 | Prefix | Suite |
 |---|---|
+| T-NL-0xx | newsletter authority: site key + quiz gate matrix (cases/newsletter_gate_cases.json), per-site policy (quiz off, pinned sink, doi_owner), website contract, ludo upstream flow, admin CRUD, db-patches upgrade / strict start, k8s Recreate (test_newsletter_gate) |
 | T-SEC-0xx | newsletter DOI security (test_subscribe, test_confirm, test_timing) |
 | T-SC-1xx | Selbst-Check (test_selfcheck, cases/selfcheck_api_cases.json) |
 | T-ODOO-0xx | Odoo client: https, allowlist, errors, no key leaks (test_odoo_client) |
@@ -23,5 +24,10 @@ PYTHONPATH=. pytest tests/ -v
 ```
 
 Env vars are set by `tests/conftest.py` before `main` is imported, so you do
-not need a real `.env`. Tests use an in-memory SQLite action log and point
-Mautic at `https://mautic.test` which `respx` intercepts.
+not need a real `.env`. Tests use an in-memory SQLite DB (`:memory:`, the db-patches are applied
+in-process) and point Mautic at `https://mautic.test` which `respx` intercepts.
+
+Test sites (conftest): `simplify-erp` (quiz on, global sink), `simplify-web` (the website contract:
+quiz off, Odoo), `ludo` (upstream: Mautic, `doi_owner=sink`), `re-cloud` (Mautic + segment, mauxy DOI).
+The `client` fixture adds the `simplify-erp` key and a solved challenge to `/api/subscribe` and
+`/api/unsubscribe` calls that do not set them; gate tests use `client.request_raw`.

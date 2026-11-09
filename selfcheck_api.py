@@ -86,46 +86,7 @@ def _hash(token: str) -> str:
 # --------------------------------------------------------------------------- storage
 
 
-async def init_db(db: aiosqlite.Connection) -> None:
-    # Minimal: what the DOI and the indicative quote need. No IP, no user agent.
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS selfcheck_submission (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at    TEXT NOT NULL,
-            email         TEXT NOT NULL,
-            lang          TEXT NOT NULL,
-            picks         TEXT NOT NULL,
-            answers       TEXT NOT NULL,
-            stay          TEXT,
-            rules_version TEXT NOT NULL,
-            complete      INTEGER NOT NULL,
-            token_hash    TEXT,
-            status        TEXT NOT NULL DEFAULT 'pending',
-            confirmed_at  TEXT,
-            mail_sent     INTEGER,
-            notify_sent   INTEGER,
-            radar_result  TEXT,
-            company       TEXT
-        )
-    """)
-    # migration for databases created before SPEC-021 (optional company field)
-    async with db.execute("PRAGMA table_info(selfcheck_submission)") as cur:
-        cols = {r[1] for r in await cur.fetchall()}
-    if "company" not in cols:
-        await db.execute("ALTER TABLE selfcheck_submission ADD COLUMN company TEXT")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_sc_email ON selfcheck_submission(email, created_at)")
-    # Anonymous counters: day + event + lang, nothing else.
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS selfcheck_counter (
-            day    TEXT NOT NULL,
-            event  TEXT NOT NULL,
-            lang   TEXT NOT NULL,
-            count  INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (day, event, lang)
-        )
-    """)
-
-
+# schema: db-patches/0003_website_consent.sql (applied by scripts/sqlite_db.py --migrate)
 async def purge(db: aiosqlite.Connection) -> None:
     """Retention: unconfirmed after SELFCHECK_PENDING_DAYS, confirmed after SELFCHECK_RETENTION_DAYS."""
     now = _now()

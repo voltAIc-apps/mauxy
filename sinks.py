@@ -7,6 +7,8 @@ Sinks: where mauxy delivers confirmed website data (flywheel SPEC-021).
 Selected by env (12-factor), one each:
   LEAD_SINK        odoo (default) | none   (none: no CRM write, the notification mail carries the lead)
   SUBSCRIBER_SINK  odoo (default) | mautic (DEPRECATED, Mautic is being retired) | none
+                   = the FALLBACK; a calling site may pin its own (sites.subscriber_sink, newsletter
+                   authority: e.g. ludo -> mautic, simplify-erp -> odoo), see subscriber_sink(kind)
 
 Contract (every sink):
   - called only AFTER the double opt-in (never on submit)
@@ -20,7 +22,8 @@ Odoo specifics (Odoo 18, erp.wapsol.de, dedicated bot user, see README "erp.waps
         partner_id only when exactly ONE active partner has that e-mail; then email_from / phone
         are NOT sent (crm.lead's inverse would write them back onto the partner). Otherwise
         contact_name / partner_name / email_from / phone.
-  subscriber: mailing.contact + mailing.subscription on ODOO_LIST_NEWSLETTER_ID / ODOO_LIST_RADAR_ID;
+  subscriber: mailing.contact + mailing.subscription on ODOO_LIST_NEWSLETTER_ID / ODOO_LIST_RADAR_ID
+        (same list for every calling site; the site's registry `segment` is used by Mautic only);
         opt-out = mailing.subscription.opt_out; blacklisted addresses (mail.blacklist) are skipped.
 """
 from __future__ import annotations
@@ -68,8 +71,11 @@ class SubscriberSink(Protocol):
         """Read only. 'blocked' = DNC / blacklist (no DOI mail)."""
 
     async def subscribe(self, email: str, list_key: str, *, lang: str, source: str, page_url: str,
-                        name: Optional[str] = None, company: Optional[str] = None
-                        ) -> Literal["ok", "already", "blocked"]: ...
+                        name: Optional[str] = None, company: Optional[str] = None,
+                        segment: Optional[str] = None) -> Literal["ok", "already", "blocked"]:
+        """segment = target of the calling site (per-site key registry, newsletter only).
+        Mautic: segment alias (resolved / created). Odoo: not used yet, the list comes from
+        ODOO_LIST_<KEY>_ID (per-site Odoo lists = open owner decision)."""
 
     async def unsubscribe(self, email: str) -> tuple[str, Optional[str]]:
         """(result 'ok' | 'not_found' | 'error', reference or None)."""
@@ -252,8 +258,8 @@ class OdooSubscriberSink:
                 return "subscribed"
         return "none"
 
-    async def subscribe(self, email, list_key, *, lang, source, page_url, name=None, company=None):
-        """After DOI. Opted out earlier on this list -> the new confirmation re-subscribes (opt_out
+    async def subscribe(self, email, list_key, *, lang, source, page_url, name=None, company=None, segment=None):
+        """After DOI. `segment` (site registry) is not used: one list per list_key (see protocol). Opted out earlier on this list -> the new confirmation re-subscribes (opt_out
         False); blacklist stays authoritative. Existing mailing.contact -> new subscription line
         only; the contact itself is never changed."""
         norm = normalize_email(email)
@@ -331,9 +337,11 @@ class NoSubscriberSink:
 
 # ---------------------------------------------------------------------------- factory
 
+SUBSCRIBER_KINDS = ("odoo", "mautic", "none")
+
 _client: Optional[OdooClient] = None
 _lead: Optional[LeadSink] = None
-_subscriber: Optional[SubscriberSink] = None
+_subscribers: dict[str, SubscriberSink] = {}
 
 
 def odoo() -> OdooClient:
@@ -360,37 +368,47 @@ def lead_sink() -> LeadSink:
     return _lead
 
 
-def subscriber_sink() -> SubscriberSink:
-    global _subscriber
-    if _subscriber is None:
-        kind = os.environ.get("SUBSCRIBER_SINK", "odoo").strip().lower()
+def default_subscriber_kind() -> str:
+    """Global SUBSCRIBER_SINK (fallback for sites without their own)."""
+    return os.environ.get("SUBSCRIBER_SINK", "odoo").strip().lower()
+
+
+def subscriber_sink(kind: Optional[str] = None) -> SubscriberSink:
+    """Subscriber sink of `kind` (a site's pinned sink) or the global SUBSCRIBER_SINK; cached per kind."""
+    kind = (kind or default_subscriber_kind()).strip().lower()
+    if kind not in _subscribers:
         if kind == "none":
-            _subscriber = NoSubscriberSink()
+            _subscribers[kind] = NoSubscriberSink()
         elif kind == "mautic":
             import mautic_sink  # deprecated, only loaded on demand
             logger.warning("SUBSCRIBER_SINK=mautic is DEPRECATED (Mautic is being retired)")
-            _subscriber = mautic_sink.MauticSubscriberSink()
+            _subscribers[kind] = mautic_sink.MauticSubscriberSink()
         elif kind == "odoo":
             try:
-                _subscriber = OdooSubscriberSink(odoo())
+                _subscribers[kind] = OdooSubscriberSink(odoo())
             except OdooPermanent as exc:
                 logger.error("SUBSCRIBER_SINK=odoo misconfigured: %s", exc)
                 raise SinkPermanent(str(exc)) from None
         else:
             raise SinkPermanent(f"unknown SUBSCRIBER_SINK={kind}")
-    return _subscriber
+    return _subscribers[kind]
 
 
 def reset() -> None:
     """Forget the cached sinks / client (tests, config reload)."""
-    global _client, _lead, _subscriber
-    _client = _lead = _subscriber = None
+    global _client, _lead
+    _client = _lead = None
+    _subscribers.clear()
 
 
-async def health() -> dict:
-    """Per sink: 'reachable (..)' / 'disabled' / 'error: ..'. Never raises."""
+async def health(site_kinds: tuple[str, ...] = ()) -> dict:
+    """Per sink: 'reachable (..)' / 'disabled' / 'error: ..'. Never raises. `site_kinds` = sinks
+    pinned by sites besides the global one (reported as subscriber_sink_<kind>)."""
     out = {}
-    for label, getter in (("lead_sink", lead_sink), ("subscriber_sink", subscriber_sink)):
+    checks = [("lead_sink", lead_sink), ("subscriber_sink", subscriber_sink)]
+    checks += [(f"subscriber_sink_{k}", lambda k=k: subscriber_sink(k))
+               for k in sorted(set(site_kinds)) if k != default_subscriber_kind()]
+    for label, getter in checks:
         try:
             sink = getter()
             out[label] = f"{sink.name}: {await sink.health()}"

@@ -7,11 +7,11 @@ metadata:
     app.kubernetes.io/name: mauxy
 spec:
   replicas: 1
+  # Recreate, never RollingUpdate: ONE ReadWriteOnce PVC (Longhorn) holds the SQLite DB, and the
+  # outbox / jobs run in-process. A surge pod could not mount the volume (or would write the same
+  # SQLite file twice). Short downtime per rollout is accepted.
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: mauxy
@@ -26,6 +26,19 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: mauxy-data
+      # Deployer's schema-apply step: run pending db-patches/ against the PVC DB before the
+      # app starts. Idempotent (records applied patches); first boot creates the schema.
+      initContainers:
+        - name: migrate
+          image: ${DEPLOY_IMAGE}
+          imagePullPolicy: Always
+          command: ["python", "scripts/sqlite_db.py", "--migrate"]
+          envFrom:
+            - secretRef:
+                name: mauxy-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /data
       containers:
         - name: mauxy
           image: ${DEPLOY_IMAGE}
@@ -46,6 +59,7 @@ spec:
             limits:
               memory: "128Mi"
               cpu: "100m"
+          # Liveness hits /health (Mautic-independent: only restarts a wedged process).
           livenessProbe:
             httpGet:
               path: /health
@@ -54,10 +68,13 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          # Readiness hits /ready (local only: the SQLite DB answers; NOT tied to a sink, every
+          # endpoint degrades gracefully while erp.wapsol / Mautic is down).
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             initialDelaySeconds: 3
-            periodSeconds: 5
-            timeoutSeconds: 8
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3

@@ -176,26 +176,7 @@ LeadRequest = Annotated[Union[ContactLead, InquiryLead, WebinarLead, CheckoutLea
 # --------------------------------------------------------------------------- storage
 
 
-async def init_db(db: aiosqlite.Connection) -> None:
-    # data = the validated kind-specific fields (JSON); no IP, no user agent
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS lead_submission (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind         TEXT NOT NULL,
-            created_at   TEXT NOT NULL,
-            email        TEXT NOT NULL,
-            lang         TEXT NOT NULL,
-            newsletter   INTEGER NOT NULL DEFAULT 0,
-            page_url     TEXT,
-            data         TEXT NOT NULL,
-            token_hash   TEXT,
-            status       TEXT NOT NULL DEFAULT 'pending',
-            confirmed_at TEXT
-        )
-    """)
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_lead_email ON lead_submission(email, created_at)")
-
-
+# schema: db-patches/0003_website_consent.sql (applied by scripts/sqlite_db.py --migrate)
 async def purge(db: aiosqlite.Connection) -> None:
     now = _now()
     await db.execute("DELETE FROM lead_submission WHERE status = 'pending' AND created_at < ?",

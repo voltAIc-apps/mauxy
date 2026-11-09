@@ -53,6 +53,9 @@ DEFAULTS = {
     "AUTH_ALLOWED_ORIGINS": SITE,
     "AUTH_TOKEN_SECRET": "local-dev-only-auth-secret-not-a-secret",
     "RATE_LIMIT": "60/minute",
+    # newsletter gate: one local site key + quiz (topic simplify-erp from db-patches/0002)
+    "MAUXY_SITES": '[{"key":"local-site-key-not-a-secret","site":"simplify-erp","segment":"simplify-erp","topic":"simplify-erp"}]',
+    "CHALLENGE_SECRET": "local-dev-only-challenge-secret",
     "SELFCHECK_RATE_LIMIT": "60/minute",
     "LEAD_RATE_LIMIT": "60/minute",
 }
@@ -71,6 +74,10 @@ from tests.fake_odoo import FakeOdoo  # noqa: E402
 
 fake = FakeOdoo()
 odoo_client.TRANSPORT = httpx.MockTransport(fake.handle)
+
+import db_migrate  # noqa: E402
+
+db_migrate.apply_pending(os.environ["ACTION_LOG_DB"])  # the deployer step (k8s initContainer)
 
 import main  # noqa: E402
 

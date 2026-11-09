@@ -1,0 +1,27 @@
+{
+  "suite": "Newsletter authority gates on POST /api/subscribe and /api/unsubscribe (per-site key + quiz + per-site policy, merged 2026-11-09)",
+  "description": "auth: 'site' = simplify-erp test key (quiz on), 'web' = public website key (quiz OFF on subscribe, Odoo), 'wrong' = unknown key, 'none' = no Authorization header, 'basic' = non-Bearer scheme. challenge: 'solved' = token for the key's topic + correct answer, 'wrong_answer', 'missing', 'garbage', 'other_topic' (correctly solved for re-cloud's topic), 'expired', 'tampered' (qid swapped, same signature). honeypot: company_website filled. Sinks: global = Odoo fake here. Every case: no mail unless expect_mail, never a sink write before confirmation, no sink lookup when rejected.",
+  "cases": [
+    {"id": "T-NL-001", "path": "/api/subscribe", "auth": "none", "challenge": "solved", "expect_status": 401, "expect_body": {"error": "unauthorized"}, "expect_mail": false},
+    {"id": "T-NL-002", "path": "/api/subscribe", "auth": "wrong", "challenge": "solved", "expect_status": 401, "expect_body": {"error": "unauthorized"}, "expect_mail": false},
+    {"id": "T-NL-003", "path": "/api/subscribe", "auth": "basic", "challenge": "solved", "expect_status": 401, "expect_body": {"error": "unauthorized"}, "expect_mail": false},
+    {"id": "T-NL-004", "path": "/api/subscribe", "auth": "site", "challenge": "missing", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-005", "path": "/api/subscribe", "auth": "site", "challenge": "wrong_answer", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-006", "path": "/api/subscribe", "auth": "site", "challenge": "garbage", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-007", "path": "/api/subscribe", "auth": "site", "challenge": "other_topic", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-008", "path": "/api/subscribe", "auth": "site", "challenge": "expired", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-009", "path": "/api/subscribe", "auth": "site", "challenge": "tampered", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-010", "path": "/api/subscribe", "auth": "site", "challenge": "missing", "honeypot": true, "expect_status": 200, "expect_body": {"status": "pending_confirmation"}, "expect_mail": false},
+    {"id": "T-NL-011", "path": "/api/subscribe", "auth": "site", "challenge": "solved", "expect_status": 200, "expect_body": {"status": "pending_confirmation"}, "expect_mail": true},
+    {"id": "T-NL-012", "path": "/api/subscribe", "auth": "web", "challenge": "missing", "expect_status": 200, "expect_body": {"status": "pending_confirmation"}, "expect_mail": true},
+    {"id": "T-NL-013", "path": "/api/subscribe", "auth": "web", "challenge": "garbage", "expect_status": 200, "expect_body": {"status": "pending_confirmation"}, "expect_mail": true},
+    {"id": "T-NL-014", "path": "/api/subscribe", "auth": "web", "challenge": "missing", "honeypot": true, "expect_status": 200, "expect_body": {"status": "pending_confirmation"}, "expect_mail": false},
+    {"id": "T-NL-015", "path": "/api/unsubscribe", "auth": "none", "challenge": "solved", "expect_status": 401, "expect_body": {"error": "unauthorized"}, "expect_mail": false},
+    {"id": "T-NL-016", "path": "/api/unsubscribe", "auth": "site", "challenge": "wrong_answer", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-017", "path": "/api/unsubscribe", "auth": "site", "challenge": "missing", "honeypot": true, "expect_status": 200, "expect_body": {"status": "ok"}, "expect_mail": false},
+    {"id": "T-NL-018", "path": "/api/unsubscribe", "auth": "site", "challenge": "solved", "expect_status": 200, "expect_body": {"status": "ok"}, "expect_mail": false},
+    {"id": "T-NL-019", "path": "/api/unsubscribe", "auth": "web", "challenge": "missing", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-020", "path": "/api/unsubscribe", "auth": "web", "challenge": "wrong_answer", "expect_status": 409, "expect_body": {"status": "quiz_failed"}, "expect_mail": false},
+    {"id": "T-NL-021", "path": "/api/unsubscribe", "auth": "web", "challenge": "solved", "expect_status": 200, "expect_body": {"status": "ok"}, "expect_mail": false}
+  ]
+}

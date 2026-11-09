@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-**mauxy** -- the website's interface to other systems (owner decision 2026-11-08, flywheel SPEC-021). Python (FastAPI). Public consent service of simplify-erp.de: newsletter + Migration Radar double opt-in, Selbst-Check (`selfcheck_api.py`, SPEC-020), every lead CTA (`leads_api.py`: contact, inquiry, webinar, checkout) and the visitor LinkedIn login (`auth_api.py`, sign-in only `openid profile email`, replaces app2li; LinkedIn posting is NOT mauxy's job, no publishing scopes or member tokens here). After the DOI click, `lead_sync.py` delivers to the sinks (`sinks.py`): `crm.lead` + Email Marketing lists in erp.wapsol (Odoo 18) via `odoo_client.py` -- the ONE sanctioned write path into erp.wapsol, create-only, own bot user, allowlist of (model, method). Mautic = deprecated `SUBSCRIBER_SINK=mautic` (`mautic_sink.py`), delete with Mautic. Responses are uniform and immediate (no enumeration); nothing is written to any sink before the confirmation. Credentials from env only, never logged.
+**mauxy** -- the single newsletter (un)subscribe authority for all sites (ludo, simplify-erp, re-cloud, ...) and the website's interface to other systems (owner decision 2026-11-08, flywheel SPEC-021). Python (FastAPI). Every newsletter (un)subscribe is gated by (1) a **per-site Bearer key** (`sites` table, seeded from `MAUXY_SITES`: key -> site, segment, quiz topic, policy) and (2) the **bot-defence quiz** (`GET /api/challenge`, signed expiring token, answer verified server-side). Per-site policy (db-patches/0004): `subscribe_quiz` (off = the site relies on mauxy's DOI; unsubscribe ALWAYS needs the quiz), `subscriber_sink` (odoo / mautic / none; NULL = global `SUBSCRIBER_SINK`), `doi_owner` (`mauxy` = mauxy mails the DOI and nothing reaches a sink before the click; `sink` = upstream behaviour for ludo: contact into the Mautic segment at once, Mautic campaign runs the opt-in). Also: Selbst-Check (`selfcheck_api.py`, SPEC-020), every lead CTA (`leads_api.py`: contact, inquiry, webinar, checkout) and the visitor LinkedIn login (`auth_api.py`, sign-in only `openid profile email`, replaces app2li; no publishing scopes or member tokens). After the DOI click, `lead_sync.py` delivers to the sinks (`sinks.py`): `crm.lead` + Email Marketing lists in erp.wapsol (Odoo 18) via `odoo_client.py` -- the ONE sanctioned write path into erp.wapsol, create-only, own bot user, allowlist of (model, method). Mautic = deprecated sink (`mautic_sink.py`), delete with Mautic. Responses are uniform and immediate (no enumeration). Credentials from env only, never logged.
 
 ## Development
 
@@ -22,65 +22,88 @@ Tests (respx mocks Mautic, mails captured with `MAIL_MODE=memory`):
 PYTHONPATH=. tests/venv/bin/python -m pytest tests -q
 ```
 
-Numbered: T-AUTH-0xx (LinkedIn login, LinkedIn mocked with respx, cases in `tests/cases/auth_cases.json`), T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check), T-ODOO-0xx (Odoo client), T-SINK-0xx (sinks), T-LEAD-0xx (CTA leads, outbox; cases in `tests/cases/`). Odoo is ALWAYS the in-memory fake (`tests/fake_odoo.py`, `odoo` fixture); legacy suites run with `LEAD_SINK=none`, `SUBSCRIBER_SINK=mautic`. Local run with the fake: `tests/scripts/run_local.py` (10.0.99.1:8020; also a mocked LinkedIn at `/__mock_linkedin`). Read-only check against the real erp.wapsol (only with the bot credentials): `scripts/odoo_smoke.py`.
+Numbered: T-NL-0xx (newsletter authority: site key, quiz, per-site policy, ludo upstream flow, db-patches; cases in `tests/cases/newsletter_gate_cases.json`), T-AUTH-0xx (LinkedIn login, LinkedIn mocked with respx, cases in `tests/cases/auth_cases.json`), T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check), T-ODOO-0xx (Odoo client), T-SINK-0xx (sinks), T-LEAD-0xx (CTA leads, outbox; cases in `tests/cases/`). Odoo is ALWAYS the in-memory fake (`tests/fake_odoo.py`, `odoo` fixture); legacy suites run with `LEAD_SINK=none`, `SUBSCRIBER_SINK=mautic`. Local run with the fake: `tests/scripts/run_local.py` (10.0.99.1:8020; also a mocked LinkedIn at `/__mock_linkedin`). Read-only check against the real erp.wapsol (only with the bot credentials): `scripts/odoo_smoke.py`.
 
 ## Build & Deploy
 
-```bash
-docker build -t <your-registry>/mauxy:latest .
-docker push <your-registry>/mauxy:latest
-```
-
-Deployed to Kubernetes with manifests in `k8s/`. The manifests contain `${VAR}` placeholders -- use `scripts/deploy.py` to render them from `.env` values:
+`scripts/deploy.py` is the single deploy tool — it reads everything from `.env`
+(gitignored; no secrets in the repo) and runs into its own `mauxy` namespace:
 
 ```bash
-python scripts/deploy.py --dry-run   # preview
-python scripts/deploy.py --apply     # render + kubectl apply
+python scripts/deploy.py --dry-run                  # preview manifests
+python scripts/deploy.py --build                    # docker login + build + push
+python scripts/deploy.py --secret                   # sync mauxy-credentials Secret
+python scripts/deploy.py --apply                    # render + kubectl apply
+python scripts/deploy.py --build --secret --apply   # full deploy
 ```
 
-Credentials are stored in a k8s Secret (`mauxy-credentials`), not committed -- create via `kubectl create secret generic` (see `k8s/secret.yaml` for the template).
+`--build` uses `REGISTRY_URL/USER/PASSWORD`; `--secret` writes every runtime variable
+(`SECRET_KEYS` = `KNOWN_VARS` minus deploy/registry: Odoo, SMTP, LinkedIn, `MAUXY_SITES`, `CHALLENGE_SECRET`, …) into the
+`mauxy-credentials` Secret that the deployment is `envFrom`. `k8s/secret.yaml.example`
+is a documentation template only — the `.example` suffix keeps it out of the `k8s/*.yaml`
+glob that `--apply` applies, so it can never clobber the real Secret. The Dockerfile ships the app modules, `vendor/`, `db_migrate.py`, the
+`db-patches/` schema patches and `scripts/{deploy,sqlite_db}.py`. The deployment runs
+`sqlite_db.py --migrate` as an initContainer to apply pending patches before the app starts.
 
 ## Architecture
 
-- `main.py` newsletter (`/api/subscribe`, `/api/confirm`, `/api/unsubscribe` via the subscriber sink), `/health` (cheap), `/health/detail` (sinks), `/api/actions` (admin), lifespan (DB, purge, outbox resume, drain with timeout).
+- `main.py` newsletter authority (below), `/api/actions` (admin), lifespan (schema check, site seed, config load, purge, outbox resume, drain with timeout).
 - `selfcheck_api.py` `/api/selfcheck*` (SPEC-020); confirm sends the result mail, then queues Radar + lead + operator mail in the outbox. `vendor/selfcheck/` = rules engine from flywheel (`scripts/sync_selfcheck.py` there; T-SC-150 checks the sha256, never edit).
 - `leads_api.py` `POST /api/lead` (kinds contact/inquiry/webinar/checkout/selfcheck), `GET /api/lead/confirm`, admin `GET /api/lead/submissions`, `POST /api/lead/sync/{id}/retry`; renders the lead title + plain-text description.
 - `lead_sync.py` outbox table `lead_sync` (UNIQUE per submission), retries with backoff via `jobs.py`, marker search against duplicates, failure mail to `LEAD_NOTIFY_TO`, data cleared after delivery.
-- `sinks.py` `OdooLeadSink`, `OdooSubscriberSink`, none sinks, factory (`LEAD_SINK`, `SUBSCRIBER_SINK`). `odoo_client.py` JSON-RPC over verified HTTPS, `ALLOWED` / `WRITE_FIELDS`.
+- `sinks.py` `OdooLeadSink`, `OdooSubscriberSink`, none sinks, factory (`LEAD_SINK`, `subscriber_sink(kind)` per site, fallback `SUBSCRIBER_SINK`). `odoo_client.py` JSON-RPC over verified HTTPS, `ALLOWED` / `WRITE_FIELDS`.
 - `auth_api.py` `GET /api/auth/linkedin/start|callback`, `POST /api/auth/session`: return path = same-site path on `AUTH_ALLOWED_ORIGINS`; state signed 10 min, single use, bound by cookie `__Host-mauxy_li`; one-time code (60 s, single use, bound to the tab's `binding`) instead of PII in URLs; tables `auth_state`, `auth_code` (purged every 30 s); audit line without PII. Config problems disable only the login (`/health/detail` `auth_linkedin`).
 - `mailer.py` SMTP / console / memory. `jobs.py` fire-and-forget tasks (after the response).
 - Owner setup of erp.wapsol (bot user, group, rules, lists, UTM): README "erp.wapsol setup".
 
-### Mautic prerequisites (DEPRECATED, only with SUBSCRIBER_SINK=mautic)
+
+- Newsletter authority in `main.py`: `GET /api/challenge` (per site key), `POST /api/subscribe` (key -> body model per policy -> honeypot -> quiz unless `subscribe_quiz` off -> mauxy DOI job, or immediate Mautic segment for `doi_owner=sink`), `GET /api/confirm` (sink stored in the pending row), `POST /api/unsubscribe` (key + quiz, the site's sink). Admin CRUD `/api/admin/sites|quiz|mautic-instance` (Bearer `ADMIN_API_KEY`, every write -> `reload_config`). `/health` liveness (always 200), `/ready` readiness (local SQLite only, NOT tied to a sink), `/health/detail` (sinks incl. per-site ones, login, sites, quiz, `mautic_version`).
+- Website contract (simplify-erp.de): README "Website contract".
+
+### Mautic prerequisites (DEPRECATED, only for sites on the Mautic sink)
 
 - Custom contact fields `newsletter_locale`, `newsletter_source`, `newsletter_consented_at` (datetime), `newsletter_page_url` (`confirmation_token` only for clearing old values).
 - Tags `newsletter_confirmed`, `migration_radar_confirmed` (self-check Radar); optional segment id `MAUTIC_RADAR_SEGMENT_ID`.
-- No Mautic e-mail templates needed any more (DOI mails go out via SMTP).
+- `doi_owner=sink` sites (ludo): a DOI campaign on the site's segment (Mautic sends the opt-in). `doi_owner=mauxy` sites on Mautic: NO DOI campaign on their segment (mauxy already confirmed; else a second mail).
 
 ### Persistent storage
 
-SQLite via `aiosqlite` at `ACTION_LOG_DB` (default `/data/actions.db`): `action_log`, `newsletter_pending` (deleted after `NEWSLETTER_PENDING_DAYS`), `selfcheck_submission` (pending 7 d / confirmed 90 d), `selfcheck_counter` (day, event, lang, count only), `lead_submission` (pending 7 d / confirmed 30 d), `lead_sync` (outbox; deleted 30 d after done / failed). One replica only (SQLite RWO + in-process outbox). In k8s, `/data` is backed by a 256Mi `ReadWriteOnce` PVC (`mauxy-data`). Apply `k8s/pvc.yaml` before the deployment.
+SQLite via `aiosqlite` at `ACTION_LOG_DB` (default `/data/actions.db`): `action_log` (`action`, `site`, `result`), `sites` (key registry + policy; keys plaintext, deliberate upstream decision: TLS + PVC RBAC are the controls), `quiz_questions`, `mautic_instance`, `schema_migrations`, `newsletter_pending` (deleted after `NEWSLETTER_PENDING_DAYS`), `selfcheck_submission` (pending 7 d / confirmed 90 d), `selfcheck_counter` (day, event, lang, count only), `lead_submission` (pending 7 d / confirmed 30 d), `lead_sync` (outbox; deleted 30 d after done / failed), `auth_state`, `auth_code`. One replica only, deployment strategy `Recreate` (SQLite on ONE RWO Longhorn PVC + in-process outbox). In k8s, `/data` is a 256Mi `ReadWriteOnce` PVC (`mauxy-data`); apply `k8s/pvc.yaml` before the deployment.
+
+### Schema as a versioned artifact (db-patches/)
+
+The schema is **not** created at runtime. It is owned by integer-numbered SQL patches in `db-patches/` (`NNNN_name.sql`): 0001 init, 0002 quiz seed, 0003 website consent tables (DOI pending, self-check, leads, outbox, login), 0004 per-site policy. `db_migrate.py` is the shared runner; `schema_migrations` records what's applied.
+
+- **Deployers apply** patches: `python scripts/sqlite_db.py --migrate` (k8s initContainer). First boot creates the schema this way.
+- **App startup only checks**: DB behind the shipped patches -> refuses to start (`MIGRATE_STRICT=false` warns instead). Exception: `ACTION_LOG_DB=:memory:` (tests) applies the patches in-process.
+- **Dev workflow**: `--generate <name>` writes the next patch from a schema diff; `--new <name>` scaffolds one (DML); `--status`; `--dump-quiz`. Never edit a deployed patch, add a new one.
+- The local `data/actions.db` is git-ignored (`*.db`); rebuild with `--migrate`, or pull the live one with `--pull`.
 
 ## Environment Variables
 
 | Variable | Purpose |
 |---|---|
-| `LEAD_SINK`, `SUBSCRIBER_SINK` | `odoo` (default) / `none`; subscriber also `mautic` (deprecated) |
+| `LEAD_SINK`, `SUBSCRIBER_SINK` | `odoo` (default) / `none`; subscriber also `mautic` (deprecated); `SUBSCRIBER_SINK` = fallback for sites without own sink |
 | `ODOO_URL`, `ODOO_DB`, `ODOO_USER`, `ODOO_API_KEY`, `ODOO_TIMEOUT` | erp.wapsol, mauxy's own bot user, https only |
 | `ODOO_LEAD_USER_ID`, `ODOO_LEAD_TEAM_ID`, `ODOO_LEAD_TAG_IDS` | salesperson (+ follower), optional team / tags |
 | `ODOO_UTM_SOURCE`, `ODOO_UTM_MEDIUM` | UTM names (default `simplify-erp.de`, `Website`); campaign = kind |
 | `ODOO_LIST_NEWSLETTER_ID`, `ODOO_LIST_RADAR_ID` | Email Marketing lists |
 | `LEAD_ALLOWED_ORIGINS`, `LEAD_WEBSITE_URL`, `LEAD_RATE_LIMIT`, `LEAD_NOTIFY_TO`, `LEAD_PENDING_DAYS`, `LEAD_RETENTION_DAYS` | CTA leads |
 | `LEAD_SYNC_MAX_ATTEMPTS`, `LEAD_SYNC_BACKOFF_SECONDS`, `SHUTDOWN_DRAIN_SECONDS` | outbox retries / shutdown |
-| `MAUTIC_BASE_URL`, `MAUTIC_USERNAME`, `MAUTIC_PASSWORD` | DEPRECATED Mautic sink |
+| `MAUTIC_BASE_URL`, `MAUTIC_USERNAME`, `MAUTIC_PASSWORD` | DEPRECATED Mautic sink (ludo: still in use) |
+| `MAUTIC_VERSION` | Target Mautic version (manual), seeds `mautic_instance`; `/health/detail` |
+| `MIGRATE_STRICT` | Refuse to start if the DB is behind `db-patches/` (default true) |
+| `MAUXY_SITES` | JSON array `{key, site, segment, topic, subscribe_quiz?, subscriber_sink?, doi_owner?}` -- **seed-only** for an empty `sites` table |
+| `CHALLENGE_SECRET`, `CHALLENGE_TTL` | HMAC secret of the quiz tokens (quiz + newsletter (un)subscribe off if unset); lifetime 600 s |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
-| `RATE_LIMIT` | slowapi rate limit for subscribe/unsubscribe (default `5/minute`) |
+| `RATE_LIMIT` | slowapi rate limit for unsubscribe (default `5/minute`) |
+| `SUBSCRIBE_RATE_LIMIT`, `CHALLENGE_RATE_LIMIT` | subscribe (default `60/minute`, upstream) / challenge (`30/minute`) per IP |
 | `CONFIRM_RATE_LIMIT` | slowapi rate limit for `/api/confirm` (default `30/minute`) |
 | `ACTION_LOG_DB` | SQLite database path (default `/data/actions.db`) |
-| `ADMIN_API_KEY` | Bearer token for `/api/actions` (disabled if unset) |
+| `ADMIN_API_KEY` | Bearer token for `/api/actions`, `/api/admin/*`, lead admin (disabled if unset) |
 | `CONFIRM_TOKEN_SECRET` | `itsdangerous` signing key for double opt-in tokens |
 | `CONFIRM_TOKEN_MAX_AGE` | Token lifetime in seconds (default 86400) |
-| `PUBLIC_BASE_URL` | Public URL of mauxy; embedded in Mautic email template |
+| `PUBLIC_BASE_URL` | Public URL of mauxy; base of the DOI confirm link |
 | `PUBLIC_WEBSITE_BASE_URL` | Public URL of the website; confirm endpoint redirects here |
 | `NEWSLETTER_PENDING_DAYS`, `MAX_PENDING_PER_EMAIL` | Pending retention (7) / DOI mails per address and 24 h (3) |
 | `MAIL_MODE` | `smtp` / `console` (dry run) / `memory` (tests) |

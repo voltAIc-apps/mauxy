@@ -159,30 +159,7 @@ def _same(stored_hash: Optional[str], value: str) -> bool:
 
 
 # -- storage ------------------------------------------------------------------------------------
-async def init_db(db: aiosqlite.Connection) -> None:
-    # pending logins: no PII (hashes + timestamps only)
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS auth_state (
-            id           TEXT PRIMARY KEY,
-            cookie_hash  TEXT NOT NULL,
-            binding_hash TEXT NOT NULL,
-            created_at   TEXT NOT NULL,
-            used_at      TEXT
-        )
-    """)
-    # finished logins waiting for the site's exchange: profile for max CODE_TTL seconds
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS auth_code (
-            code_hash    TEXT PRIMARY KEY,
-            binding_hash TEXT NOT NULL,
-            origin       TEXT NOT NULL,
-            ret          TEXT NOT NULL,
-            profile      TEXT NOT NULL,
-            created_at   TEXT NOT NULL
-        )
-    """)
-
-
+# schema: db-patches/0003_website_consent.sql (applied by scripts/sqlite_db.py --migrate)
 async def purge(db: aiosqlite.Connection) -> None:
     now = _now()
     await db.execute("DELETE FROM auth_state WHERE created_at < ?", (_iso(now - timedelta(seconds=STATE_TTL)),))
