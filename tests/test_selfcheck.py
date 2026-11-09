@@ -6,6 +6,9 @@ Self-check endpoints (flywheel SPEC-020): T-SC-101 .. T-SC-150.
   T-SC-130..133  anonymous counter: no IP, no identifier
   T-SC-140       admin endpoints
   T-SC-150       vendored rules engine unchanged (sha256 vs SOURCE.json)
+  T-SC-160..183  name / phone validation (cases in selfcheck_api_cases.json, owner request 2026-11-09)
+  T-SC-190..199  name / phone delivery: crm.lead fields, result mail greeting (escaped), operator mail,
+                 rollout flag SELFCHECK_NAME_REQUIRED, /api/lead alias, admin, db-patches/0010
 """
 import copy
 import hashlib
@@ -21,7 +24,7 @@ import respx
 
 import main as mauxy_main
 import selfcheck_api
-from tests.conftest import click_confirm, is_neutral
+from tests.conftest import click_confirm, drain, is_neutral
 
 HERE = Path(__file__).parent
 CASES = json.loads((HERE / "cases" / "selfcheck_api_cases.json").read_text(encoding="utf-8"))
@@ -37,9 +40,15 @@ COMPLETE = {
 }
 
 
+def _expand(v):
+    """'{x500}' -> 'x' * 500 (keeps the case file readable)."""
+    m = re.fullmatch(r"\{x(\d+)\}", v) if isinstance(v, str) else None
+    return "x" * int(m.group(1)) if m else v
+
+
 def body(**overrides):
     b = copy.deepcopy(CASES["base"])
-    b.update(overrides)
+    b.update({k: _expand(v) for k, v in overrides.items()})
     return b
 
 
@@ -61,7 +70,8 @@ def token_of(mail):
 
 @pytest.mark.parametrize("case", CASES["cases"], ids=[c["id"] for c in CASES["cases"]])
 @respx.mock(assert_all_called=False)
-def test_submit_validation(case, respx_mock, client, outbox):
+def test_submit_validation(case, respx_mock, client, outbox, monkeypatch):
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_NAME_REQUIRED", case.get("flag", True))
     mautic = respx_mock.route(url__regex=MAUTIC_ANY.pattern).mock(return_value=httpx.Response(500))
     b = body(**case.get("set", {}))
     for k in case.get("delete", []):
@@ -75,6 +85,9 @@ def test_submit_validation(case, respx_mock, client, outbox):
     assert (len(outbox) == 1) == case["expect_mail"]
     assert bool(rows(client, "SELECT id FROM selfcheck_submission")) == case["expect_row"]
     assert not mautic.called  # never any Mautic call before confirmation
+    if "expect_stored" in case:
+        cols = ", ".join(case["expect_stored"])
+        assert rows(client, f"SELECT {cols} FROM selfcheck_submission")[0] == case["expect_stored"]
 
 
 # ------------------------------------------------------------------ T-SC-120..128 DOI flow
@@ -262,3 +275,131 @@ def test_t_sc_150_vendored_files_untouched():
         assert hashlib.sha256((vendor / name).read_bytes()).hexdigest() == digest, f"{name} edited by hand -- sync from flywheel"
     assert selfcheck_api.RULES["version"] == src["rules_version"]
     assert mauxy_main.app is not None
+
+
+# ------------------------------------------------------------------ T-SC-190..199 name / phone delivery
+
+PHONE = "+49 (0)30 / 123-45"
+
+
+def _confirm(client, outbox):
+    r = click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0])}")
+    drain(client)
+    return r
+
+
+def _mail_to(outbox, to, subject_part):
+    return next(m for m in outbox if m["to"] == to and subject_part in m["subject"])
+
+
+def test_t_sc_190_crm_lead_gets_contact_name_and_phone(client, outbox, odoo):
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail", "call"], answers=COMPLETE,
+                                                            company="Muster GmbH", phone=PHONE))
+    assert odoo.calls == []  # nothing in Odoo before the click
+    _confirm(client, outbox)
+    (lead,) = odoo.leads()
+    assert lead["contact_name"] == "Bob Beispiel" and lead["phone"] == PHONE
+    assert lead["partner_name"] == "Muster GmbH" and lead["email_from"] == "bob@example.com"
+    assert lead["name"].endswith("– Muster GmbH")  # company still names the lead
+    assert "Name: Bob Beispiel" in lead["description"] and f"Telefon: {PHONE}" in lead["description"]
+
+
+def test_t_sc_191_without_company_the_name_titles_the_lead(client, outbox, odoo):
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["call"], answers=COMPLETE))
+    _confirm(client, outbox)
+    (lead,) = odoo.leads()
+    assert lead["name"].endswith("– Bob Beispiel") and lead["contact_name"] == "Bob Beispiel"
+    assert "phone" not in lead and "partner_name" not in lead  # nothing invented
+
+
+def test_t_sc_192_known_partner_name_but_no_phone_write(client, outbox, odoo):
+    """Linked partner (exactly one with this e-mail): contact_name set; phone stays off the lead (crm.lead's
+    inverse would write it onto the existing partner, sinks.py), it is in the description."""
+    odoo.add("res.partner", id=81, name="Bob Alt", email="bob@example.com")
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["call"], answers=COMPLETE, phone=PHONE))
+    _confirm(client, outbox)
+    (lead,) = odoo.leads()
+    assert lead["partner_id"] == 81 and lead["contact_name"] == "Bob Beispiel"
+    assert "phone" not in lead and f"Telefon: {PHONE}" in lead["description"]
+
+
+@pytest.mark.parametrize("lang,greeting,neutral", [("de", "Guten Tag Bob Beispiel,\n\ndanke", "Guten Tag,"),
+                                                    ("en", "Hello Bob Beispiel,\n\nthank you", "Hello,")])
+@respx.mock(assert_all_called=False)
+def test_t_sc_193_result_mail_greets_by_name(respx_mock, client, outbox, lang, greeting, neutral):
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail"], lang=lang, phone=PHONE))
+    doi = outbox[0]["body"]
+    assert doi.startswith(neutral + "\n") and "Bob" not in doi and PHONE not in doi  # DOI: server text only
+    _confirm(client, outbox)
+    result = outbox[1]
+    assert result["to"] == "bob@example.com" and result["body"].startswith(greeting)
+    assert PHONE not in result["body"]
+
+
+@respx.mock(assert_all_called=False)
+def test_t_sc_194_greeting_is_html_escaped(respx_mock, client, outbox):
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail"], name="<b>Bob</b> & Co"))
+    _confirm(client, outbox)
+    result = outbox[1]
+    first = result["body"].split("\n", 1)[0]
+    assert first == "Guten Tag &lt;b&gt;Bob&lt;/b&gt; &amp; Co,"
+    assert "<b>" not in result["body"] and result["html"] is None  # plain-text mail, no markup anywhere
+    assert selfcheck_api.greet("Hello,\nx", "O'Brien \"Jr\"", "en") == "Hello O'Brien \"Jr\",\nx"  # quotes stay
+    assert selfcheck_api.greet("Hi there", "Bob", "en") == "Hi there"  # foreign opening: unchanged
+
+
+@respx.mock(assert_all_called=False)
+def test_t_sc_195_operator_mail_shows_name_and_phone(respx_mock, client, outbox):
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["call"], phone=PHONE))
+    _confirm(client, outbox)
+    note = next(m for m in outbox if m["to"] == "owner@site.test")
+    assert "Name: Bob Beispiel" in note["body"] and f"Telefon: {PHONE}" in note["body"]
+    outbox.clear()
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(email="eva@example.com", name="Eva Ohnetelefon", picks=["call"]))
+    _confirm(client, outbox)
+    note = next(m for m in outbox if m["to"] == "owner@site.test")
+    assert "Name: Eva Ohnetelefon" in note["body"] and "Telefon:" not in note["body"]
+
+
+def test_t_sc_196_flag_off_missing_name_delivers_as_before(client, outbox, odoo, monkeypatch):
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_NAME_REQUIRED", False)
+    b = body(picks=["mail", "call"], answers=COMPLETE)
+    b.pop("name")
+    assert client.post("/api/selfcheck", headers=ORIGIN, json=b).json() == {"status": "pending_confirmation"}
+    _confirm(client, outbox)
+    assert outbox[1]["body"].startswith("Guten Tag,\n")  # neutral greeting
+    (lead,) = odoo.leads()
+    assert "contact_name" not in lead and lead["name"].endswith("– bob@example.com")
+    note = next(m for m in outbox if m["to"] == "owner@site.test")
+    assert "Name:" not in note["body"]
+
+
+def test_t_sc_197_lead_alias_follows_the_flag(client, outbox, monkeypatch):
+    b = body(kind="selfcheck")
+    b.pop("name")
+    assert client.post("/api/lead", headers=ORIGIN, json=b).status_code == 422
+    assert client.post("/api/lead", headers=ORIGIN, json={**b, "name": " \t "}).status_code == 422
+    assert outbox == []
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_NAME_REQUIRED", False)
+    assert client.post("/api/lead", headers=ORIGIN, json=b).json() == {"status": "pending_confirmation"}
+    assert client.post("/api/lead", headers=ORIGIN, json={**b, "name": "Bob Beispiel", "phone": "abc"}).status_code == 422
+    assert len(outbox) == 1
+
+
+@respx.mock(assert_all_called=False)
+def test_t_sc_198_admin_lists_name_and_phone(respx_mock, client, outbox):
+    client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail"], phone=PHONE))
+    _confirm(client, outbox)
+    (sub,) = client.get("/api/selfcheck/submissions", headers=ADMIN).json()["submissions"]
+    assert sub["name"] == "Bob Beispiel" and sub["phone"] == PHONE
+
+
+def test_t_sc_199_patch_0010_and_flag_parsing(client):
+    cols = {r["name"] for r in rows(client, "PRAGMA table_info(selfcheck_submission)")}
+    assert {"name", "phone"} <= cols
+    patch = HERE.parent / "db-patches" / "0010_selfcheck_name_phone.sql"
+    assert patch.is_file()
+    f = selfcheck_api.env_flag
+    assert f(None) is True and f("") is True and f("true") is True and f("1") is True and f("yes") is True
+    assert f("false") is False and f(" FALSE ") is False and f("0") is False and f("off") is False and f("no") is False
+    assert selfcheck_api.SELFCHECK_NAME_REQUIRED is True  # default when unset (conftest does not set it)

@@ -160,7 +160,8 @@ COMPLETE = {"system": ["ecc"], "why": ["eol"], "s4": "no", "when": "12"}
 
 def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo):
     payload = {"kind": "selfcheck", "email": "bob@example.com", "lang": "de", "picks": ["mail", "call", "radar"],
-               "answers": COMPLETE, "rules_version": "x", "consent": True, "company": "Muster GmbH"}
+               "answers": COMPLETE, "rules_version": "x", "consent": True, "company": "Muster GmbH",
+               "name": "Bob Beispiel", "phone": "+49 (0)30 / 123-45"}
     assert client.post("/api/lead", headers=ORIGIN, json=payload).json() == {"status": "pending_confirmation"}
     assert odoo.calls == []
     r = click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
@@ -169,6 +170,7 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
     (lead,) = odoo.leads()
     assert lead["name"] == "Website: Selbst-Check SAP ECC / R/3 – Muster GmbH"
     assert lead["campaign_id"] == 20 and lead["partner_name"] == "Muster GmbH"
+    assert lead["contact_name"] == "Bob Beispiel" and lead["phone"] == "+49 (0)30 / 123-45"
     assert "Angefragt: Ergebnis und Richtangebot per Mail; 30 Minuten Kennenlernen (Meetly)" in lead["description"]
     assert "Ihre Antworten" in lead["description"]  # answers summary from the shared rules engine
     (sub,) = odoo.db["mailing.subscription"].values()
@@ -181,7 +183,8 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
 
 def test_t_lead_035_radar_only_is_no_lead(client, outbox, odoo):
     client.post("/api/selfcheck", headers=ORIGIN, json={"email": "bob@example.com", "lang": "de", "picks": ["radar"],
-                                                        "answers": {}, "rules_version": "x", "consent": True})
+                                                        "answers": {}, "rules_version": "x", "consent": True,
+                                                        "name": "Bob Beispiel"})
     click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
     drain(client)
     assert odoo.leads() == [] and len(odoo.db["mailing.subscription"]) == 1

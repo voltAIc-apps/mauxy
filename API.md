@@ -320,3 +320,23 @@ allowed, 429 = rate limit, 503 = DOI not configured. Sink/mail errors after vali
 returned (they run after the response, see jobs.py). These endpoints use their Origin allowlists, not
 the per-site key / quiz.
 
+
+### Website contract: Selbst-Check body (2026-11-09, db-patches/0010)
+
+`POST /api/selfcheck` (or `POST /api/lead` with `kind: "selfcheck"`), every step that asks for the e-mail
+(result step and the premature-exit Richtangebot, both picks `mail` / `call` / `radar` of the same kind):
+
+```json
+{"email": "...", "name": "Max Mustermann", "phone": "+49 30 123456", "lang": "de",
+ "picks": ["mail"], "answers": {...}, "stay": null, "rules_version": "...", "consent": true,
+ "company": "Muster GmbH", "company_website": ""}
+```
+
+- `name` required: string, <= 100 chars after cleaning (whitespace collapsed, control / direction
+  characters removed), not blank -> else 422.
+- `phone` optional: `^[0-9+()/ -]+$`, at least one digit, <= 40 chars; blank or omitted = none -> else 422.
+- Response unchanged and uniform (`200 pending_confirmation`, 403, 422, 429, 503).
+- Transition: while `SELFCHECK_NAME_REQUIRED=false` a request WITHOUT `name` is accepted (old website);
+  `true` (default) after the website ships the field. Order: mauxy (false) -> website -> flip to true.
+- Effect after the DOI click: `crm.lead.contact_name` / `phone`, result mail greeting by name (Sie-form),
+  operator mail shows Name + Telefon. README "Selbst-Check".

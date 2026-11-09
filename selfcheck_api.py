@@ -1,7 +1,9 @@
 """
 Selbst-Check endpoints (simplify-erp.de /:lang/selbst-check, flywheel SPEC-020).
 
-  POST /api/selfcheck            submission: e-mail + picks (mail/call/radar) + answers.
+  POST /api/selfcheck            submission: e-mail + name + optional phone + picks (mail/call/radar)
+                                 + answers. name required unless SELFCHECK_NAME_REQUIRED=false
+                                 (rollout transition, db-patches/0010).
                                  Validated against the vendored rules, stored minimally, ONE
                                  double opt-in mail. Uniform 200 for every contact-specific outcome.
   GET  /api/selfcheck/confirm    DOI mail link, READ-ONLY: confirmation page with a "Bestätigen"
@@ -36,9 +38,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
+import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal, Optional
 
@@ -46,7 +51,7 @@ import aiosqlite
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 import brand
 import confirm_page
@@ -72,6 +77,18 @@ CONFIRM_TOKEN_MAX_AGE = int(os.environ.get("CONFIRM_TOKEN_MAX_AGE", "86400"))
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 SELFCHECK_WEBSITE_URL = os.environ.get("SELFCHECK_WEBSITE_URL", RULES["website"]).rstrip("/")
 MAX_PENDING_PER_EMAIL = int(os.environ.get("MAX_PENDING_PER_EMAIL", "3"))
+
+
+def env_flag(raw: Optional[str], default: bool = True) -> bool:
+    """'false' / '0' / 'no' / 'off' (any case) -> False, anything else -> True; unset / empty -> default."""
+    raw = (raw or "").strip().lower()
+    return default if not raw else raw not in ("0", "false", "no", "off")
+
+
+# Rollout switch (owner 2026-11-09): name is required (default). Deploy mauxy with false first (the
+# live website does not send it yet), then the website, then flip to true. Only a MISSING name is
+# tolerated while false; a sent but blank / too long name is always 422.
+SELFCHECK_NAME_REQUIRED = env_flag(os.environ.get("SELFCHECK_NAME_REQUIRED"))
 
 if not SELFCHECK_ALLOWED_ORIGINS:
     logger.warning("SELFCHECK_ALLOWED_ORIGINS is not set -- /api/selfcheck rejects every browser origin")
@@ -115,6 +132,46 @@ async def purge(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+# --------------------------------------------------------------------------- name / phone
+
+NAME_MAX = 100   # first + last name in one field (website maxLength 100)
+PHONE_MAX = 40
+PHONE_RE = re.compile(r"^[0-9+()/ -]+$")  # loose: digits, spaces, + ( ) / - only (same as the website)
+# invisible direction / line controls (category Cf / Zl / Zp): could reorder the operator mail or CRM text
+_INVISIBLE = {"\u200e", "\u200f", "\u2028", "\u2029", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+              "\u2066", "\u2067", "\u2068", "\u2069", "\ufeff"}
+
+
+def clean_name(v: str) -> str:
+    """Single line, no control characters: whitespace runs (incl. tab / newline) -> one space,
+    other control (Cc) and direction characters removed, trimmed."""
+    v = " ".join(v.split())
+    v = "".join(ch for ch in v if unicodedata.category(ch) != "Cc" and ch not in _INVISIBLE)
+    return " ".join(v.split())
+
+
+def clean_phone(v: str) -> Optional[str]:
+    """Trimmed phone or None when empty; ValueError for a foreign character / no digit / too long."""
+    v = v.strip()
+    if not v:
+        return None
+    if len(v) > PHONE_MAX or not PHONE_RE.match(v) or not any(ch.isdigit() for ch in v):
+        raise ValueError("phone: digits, spaces, + ( ) / - only, max 40")
+    return v
+
+
+# Personal greeting of the result mail (Sie-form, after the DOI click only): replaces the vendored
+# neutral opening line. The name is HTML-escaped (owner requirement: safe if the mail gets an HTML part).
+GREETING = {"de": ("Guten Tag,", "Guten Tag {name},"), "en": ("Hello,", "Hello {name},")}
+
+
+def greet(text: str, name: Optional[str], lang: str) -> str:
+    plain, personal = GREETING[lang]
+    if not name or not text.startswith(plain):
+        return text
+    return personal.format(name=html.escape(name, quote=False)) + text[len(plain):]
+
+
 # --------------------------------------------------------------------------- models
 
 
@@ -139,6 +196,32 @@ class SelfCheckRequest(BaseModel):
     # optional (SPEC-021): only used to name the CRM lead; letters, digits, punctuation, no controls
     company: Optional[str] = Field(default=None, min_length=1, max_length=160, pattern=r"^[^\x00-\x1f\x7f]+$")
     company_website: Optional[str] = Field(default=None, max_length=200)
+    # first + last name (CRM contact_name, result mail greeting); raw cap here, NAME_MAX after cleaning
+    name: Optional[str] = Field(default=None, max_length=400)
+    phone: Optional[str] = Field(default=None, max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = clean_name(v)
+        if not v:
+            raise ValueError("name is blank")
+        if len(v) > NAME_MAX:
+            raise ValueError(f"name longer than {NAME_MAX} characters")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def _phone(cls, v: Optional[str]) -> Optional[str]:
+        return None if v is None else clean_phone(v)
+
+    @model_validator(mode="after")
+    def _name_required(self):
+        if self.name is None and SELFCHECK_NAME_REQUIRED:
+            raise ValueError("name is required")
+        return self
 
     @field_validator("picks")
     @classmethod
@@ -194,6 +277,7 @@ def result_mail(row: aiosqlite.Row) -> tuple[str, str]:
     url = _site_url(lang, site)
     head = (m["intro"] if prog["complete"] else m["partial"])[lang].format(
         answered=prog["answered"], total=prog["total"], url=url)
+    head = greet(head, row["name"], lang)
     body = "\n\n".join([head, engine.result_text(RULES, answers, lang, stay), m["outro"][lang].format(url=url)])
     return m["subject"][lang], brand.replace_signature(body, site, lang, SIGNATURE[lang])
 
@@ -209,6 +293,10 @@ def _summary(row, radar_result: str, mail_sent: Optional[bool]) -> tuple[str, li
         f"Selbst-Check #{row['id']} bestätigt am {row['confirmed_at'] or _iso(_now())} (Sprache {row['lang']}).",
         f"E-Mail: {row['email']}",
     ]
+    if row["name"]:
+        lines.append(f"Name: {row['name']}")
+    if row["phone"]:
+        lines.append(f"Telefon: {row['phone']}")
     if row["company"]:
         lines.append(f"Firma: {row['company']}")
     lines += [
@@ -250,7 +338,7 @@ def lead_for(row, ref: str) -> Optional[dict]:
     answers = json.loads(row["answers"])
     labels = {o["id"]: o["label"]["de"] for q in RULES["questions"] if q["id"] == "system" for o in q["options"]}
     systems = " + ".join(labels[x] for x in (answers.get("system") or []) if x in labels)
-    who = row["company"] or row["email"]
+    who = row["company"] or row["name"] or row["email"]
     title = f"Website: Selbst-Check {systems} – {who}" if systems else f"Website: Selbst-Check – {who}"
     _, lines = _summary(row, "gewählt" if "radar" in picks else "nicht gewählt", None)
     wanted = [t for p, t in zip(("mail", "call"), ("Ergebnis und Richtangebot per Mail", "30 Minuten Kennenlernen (Meetly)")) if p in picks]
@@ -258,7 +346,7 @@ def lead_for(row, ref: str) -> Optional[dict]:
     label = brand.label(_row_site(row), SELFCHECK_WEBSITE_URL)
     desc = _body(row, lines) + f"\n\nQuelle: {label} / Website / Kampagne selfcheck\nReferenz: {ref}"
     return {"ref": ref, "kind": "selfcheck", "campaign": "selfcheck", "title": title, "email": row["email"],
-            "contact_name": None, "partner_name": row["company"], "phone": None, "lang": row["lang"], "description": desc}
+            "contact_name": row["name"], "partner_name": row["company"], "phone": row["phone"], "lang": row["lang"], "description": desc}
 
 
 async def finish(db: aiosqlite.Connection, sync: dict, outcome: str) -> None:
@@ -349,11 +437,12 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     # cap + insert in ONE statement (atomic, no COUNT-then-INSERT race; security review 2026-11-09)
     cur = await db.execute(
         "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete, company, "
-        "site) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        "site, name, phone) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
         "WHERE (SELECT COUNT(*) FROM selfcheck_submission WHERE email = ? AND created_at >= ?) < ?",
         (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
          json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"]),
-         " ".join(payload.company.split()) if payload.company else None, site, email, since, MAX_PENDING_PER_EMAIL),
+         " ".join(payload.company.split()) if payload.company else None, site, payload.name, payload.phone,
+         email, since, MAX_PENDING_PER_EMAIL),
     )
     if cur.rowcount != 1:
         await db.commit()  # end the (empty) implicit transaction
@@ -470,11 +559,12 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         ref = lead_sync.new_ref()
         page_url = _site_url(row["lang"], site)
         subscribe = {"email": row["email"], "lang": row["lang"], "source": "selfcheck", "page_url": page_url,
-                     "company": row["company"], "lists": ["radar"] if "radar" in picks else []}
+                     "name": row["name"], "company": row["company"], "lists": ["radar"] if "radar" in picks else []}
         await leads_api.route_confirmed(
             db, origin="selfcheck", origin_id=sid, site=site, action="selfcheck", lead=lead_for(row, ref),
             subscribe=subscribe, data={"ref": ref, "email": row["email"], "lang": row["lang"], "picks": picks,
-                                       "company": row["company"], "source": "selfcheck", "page_url": page_url})
+                                       "name": row["name"], "phone": row["phone"], "company": row["company"],
+                                       "source": "selfcheck", "page_url": page_url})
         logger.info("SELFCHECK_CONFIRMED id=%s mail=%s site=%s", sid, mail_sent, site)
         return _redirect(row["lang"], True, status=303, site=site)
 
@@ -501,7 +591,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
     ):
         if not admin_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        sql = ("SELECT s.id, s.created_at, s.confirmed_at, s.email, s.company, s.lang, s.picks, s.answers, s.stay, "
+        sql = ("SELECT s.id, s.created_at, s.confirmed_at, s.email, s.name, s.phone, s.company, s.lang, s.picks, s.answers, s.stay, "
                "s.rules_version, s.complete, s.mail_sent, s.notify_sent, s.radar_result, "
                "l.odoo_lead_id, l.state AS crm_state FROM selfcheck_submission s "
                "LEFT JOIN lead_sync l ON l.origin = 'selfcheck' AND l.origin_id = s.id WHERE s.status = ?")
