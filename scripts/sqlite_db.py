@@ -2,7 +2,8 @@
 """
 SQLite maintenance for mauxy -- the SQLite analogue of the conventional pg_db.py.
 
-The runtime DB (`ACTION_LOG_DB`, default `/data/actions.db`) holds the `action_log` plus
+The runtime DB (`ACTION_LOG_DB`, default `/data/actions.db`) holds the `action_log`, the website
+consent tables (DOI pending, self-check, leads, outbox, login; patch 0003) plus
 the config tables `sites` / `quiz_questions` / `mautic_instance`. In production it lives on
 the k8s PVC inside the pod; locally we keep a copy under `<app>/data/actions.db`.
 

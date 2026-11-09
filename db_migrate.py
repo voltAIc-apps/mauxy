@@ -45,13 +45,7 @@ def latest_version() -> int:
 
 
 def ensure_migrations_table(conn: sqlite3.Connection):
-    conn.execute(
-        f"""CREATE TABLE IF NOT EXISTS {_META_TABLE} (
-                version    INTEGER PRIMARY KEY,
-                name       TEXT,
-                applied_at TEXT
-            )"""
-    )
+    conn.execute(migrations_table_sql())
 
 
 def applied_versions(conn: sqlite3.Connection) -> set:
@@ -82,6 +76,18 @@ def check(db_path) -> dict:
     current = max(done) if done else 0
     pending = [(v, n) for v, n, _ in patches if v not in done]
     return {"current": current, "latest": latest, "pending": pending}
+
+
+def migrations_table_sql() -> str:
+    """DDL of the meta table (shared with the in-memory path in main.py)."""
+    return (f"CREATE TABLE IF NOT EXISTS {_META_TABLE} ("
+            "version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT)")
+
+
+def patch_scripts() -> list:
+    """(version, name, sql) of every committed patch, in order. Used where no deployer step can
+    run before the app: an in-process DB (ACTION_LOG_DB=':memory:', tests / local runs)."""
+    return [(v, n, path.read_text()) for v, n, path in list_patches()]
 
 
 def apply_pending(db_path) -> list:

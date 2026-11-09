@@ -1,0 +1,31 @@
+{
+  "suite": "POST /api/selfcheck validation (flywheel SPEC-020)",
+  "description": "Each case patches the valid base payload (set / delete keys) and sends it with the given Origin. expect_status is the HTTP status; expect_mail whether a DOI mail goes out; expect_row whether a submission is stored.",
+  "base": {
+    "email": "bob@example.com",
+    "lang": "de",
+    "picks": ["mail", "call", "radar"],
+    "answers": { "system": ["ecc"], "why": ["eol"], "s4": "no", "when": "12" },
+    "rules_version": "2026-11-08.1",
+    "consent": true
+  },
+  "cases": [
+    { "id": "T-SC-101", "name": "valid partial submission, all three picks", "set": {}, "expect_status": 200, "expect_mail": true, "expect_row": true },
+    { "id": "T-SC-102", "name": "consent false", "set": { "consent": false }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-103", "name": "unknown question id", "set": { "answers": { "foo": "x" } }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-104", "name": "unknown pick", "set": { "picks": ["mail", "offer"] }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-105", "name": "no pick", "set": { "picks": [] }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-106", "name": "duplicate pick", "set": { "picks": ["mail", "mail"] }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-107", "name": "exclusive option combined", "set": { "answers": { "why": ["none", "eol"] } }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-108", "name": "unexpected extra field", "set": { "price": 1000 }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-109", "name": "negative stay figure", "set": { "stay": { "licence": -1 } }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-110", "name": "invalid e-mail", "set": { "email": "bob@" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-111", "name": "foreign origin", "origin": "https://evil.test", "set": {}, "expect_status": 403, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-112", "name": "no origin header", "origin": null, "set": {}, "expect_status": 403, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-113", "name": "honeypot filled: looks like success", "set": { "company_website": "http://spam" }, "expect_status": 200, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-114", "name": "unsupported language", "set": { "lang": "fr" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-115", "name": "oversized answer value", "set": { "answers": { "when": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" } }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-116", "name": "valid with stage 2 figures", "set": { "stay": { "licence": 120000, "support": 30000, "users": 60 } }, "expect_status": 200, "expect_mail": true, "expect_row": true },
+    { "id": "T-SC-117", "name": "consent missing", "delete": ["consent"], "expect_status": 422, "expect_mail": false, "expect_row": false }
+  ]
+}

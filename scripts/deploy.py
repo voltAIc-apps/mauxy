@@ -46,18 +46,45 @@ KNOWN_VARS = [
     "MAUTIC_BASE_URL", "MAUTIC_USERNAME", "MAUTIC_PASSWORD", "MAUTIC_VERSION",
     "ALLOWED_ORIGINS", "MAUXY_SITES", "CHALLENGE_SECRET", "CHALLENGE_TTL", "RATE_LIMIT",
     "ACTION_LOG_DB", "ADMIN_API_KEY",
+] + [  # website consent service (DOI, sinks, self-check, leads, login; flywheel SPEC-020/021)
+    *(k for k in (
+        "MIGRATE_STRICT", "SUBSCRIBE_RATE_LIMIT", "CHALLENGE_RATE_LIMIT", "CONFIRM_RATE_LIMIT",
+        "CONFIRM_TOKEN_SECRET", "CONFIRM_TOKEN_MAX_AGE", "PUBLIC_BASE_URL", "PUBLIC_WEBSITE_BASE_URL",
+        "NEWSLETTER_PENDING_DAYS", "MAX_PENDING_PER_EMAIL",
+        "MAIL_MODE", "SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM",
+        "SMTP_REPLY_TO", "SMTP_TIMEOUT", "MAIL_MAX_BYTES", "MAIL_ATTACHMENT_TYPES", "MAIL_RECIPIENT_HOURLY_LIMIT",
+        "MAIL_INTERNAL_RECIPIENTS", "MAIL_MAX_ATTEMPTS", "MAIL_BACKOFF_SECONDS", "MAIL_RETENTION_DAYS",
+        "LEAD_SINK", "SUBSCRIBER_SINK",
+        "ODOO_URL", "ODOO_DB", "ODOO_USER", "ODOO_API_KEY", "ODOO_TIMEOUT",
+        "ODOO_LEAD_USER_ID", "ODOO_LEAD_TEAM_ID", "ODOO_LEAD_TAG_IDS", "ODOO_UTM_SOURCE", "ODOO_UTM_MEDIUM",
+        "ODOO_LIST_NEWSLETTER_ID", "ODOO_LIST_RADAR_ID",
+        "LEAD_ALLOWED_ORIGINS", "LEAD_WEBSITE_URL", "LEAD_RATE_LIMIT", "LEAD_NOTIFY_TO",
+        "LEAD_PENDING_DAYS", "LEAD_RETENTION_DAYS", "LEAD_SYNC_MAX_ATTEMPTS", "LEAD_SYNC_BACKOFF_SECONDS",
+        "SHUTDOWN_DRAIN_SECONDS",
+        "SELFCHECK_ALLOWED_ORIGINS", "SELFCHECK_WEBSITE_URL", "SELFCHECK_NOTIFY_TO",
+        "SELFCHECK_RATE_LIMIT", "SELFCHECK_EVENT_RATE_LIMIT", "SELFCHECK_PENDING_DAYS", "SELFCHECK_RETENTION_DAYS",
+        "MAUTIC_RADAR_TAG", "MAUTIC_RADAR_SEGMENT_ID",
+        "LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET", "LINKEDIN_REDIRECT_URI",
+        "AUTH_ALLOWED_ORIGINS", "AUTH_TOKEN_SECRET", "AUTH_SESSION_TTL", "AUTH_RATE_LIMIT",
+        "AUTH_SESSION_RATE_LIMIT",
+        # per-site brand + routing (db-patches/0006); webhook secrets: WEBHOOK_SECRET_<REF> (pattern below)
+        "DEFAULT_SITE", "BRAND_LOGO_MAX_BYTES", "MAIL_SENDER_DOMAINS", "WEBHOOK_ALLOWED_HOSTS", "WEBHOOK_TIMEOUT",
+        "OPTOUT_RESIGNUP_DAYS",
+    )),
 ]
+# One secret per webhook target (routing.py secret_ref -> WEBHOOK_SECRET_<REF>): any number, synced too.
+WEBHOOK_SECRET_RE = re.compile(r"^WEBHOOK_SECRET_[A-Z0-9_]{1,40}$")
 
 RENDER_REQUIRED = ["DEPLOY_NAMESPACE", "DEPLOY_IMAGE", "DEPLOY_DOMAIN", "DEPLOY_IMAGE_PULL_SECRET"]
 
 # Keys written into the mauxy-credentials Secret (the deployment is envFrom this
 # Secret, so all runtime config lives here). Listed keys are set when present.
-SECRET_KEYS = [
-    "MAUTIC_BASE_URL", "MAUTIC_USERNAME", "MAUTIC_PASSWORD", "MAUTIC_VERSION",
-    "ALLOWED_ORIGINS", "MAUXY_SITES", "CHALLENGE_SECRET", "CHALLENGE_TTL", "RATE_LIMIT",
-    "ACTION_LOG_DB", "ADMIN_API_KEY",
-]
-SECRET_REQUIRED = ["MAUTIC_USERNAME", "MAUTIC_PASSWORD", "MAUXY_SITES", "CHALLENGE_SECRET"]
+# Every runtime var (deploy-only vars excluded) -- the app reads them all from this Secret.
+SECRET_KEYS = [k for k in KNOWN_VARS if not k.startswith(("DEPLOY_", "REGISTRY_"))]
+# Always needed: site keys + quiz (newsletter gate) and the DOI signing key. Mautic creds only
+# when the deprecated Mautic subscriber sink is selected (SUBSCRIBER_SINK=mautic).
+SECRET_REQUIRED = ["MAUXY_SITES", "CHALLENGE_SECRET", "CONFIRM_TOKEN_SECRET"]
+SECRET_REQUIRED_MAUTIC = ["MAUTIC_USERNAME", "MAUTIC_PASSWORD"]
 
 PLACEHOLDER_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
@@ -99,11 +126,14 @@ def do_build(variables: dict):
 
 def do_secret(variables: dict):
     """Sync the mauxy-credentials Secret from .env (apply via kubectl)."""
-    _require(variables, ["DEPLOY_NAMESPACE"] + SECRET_REQUIRED, "secret")
+    required = ["DEPLOY_NAMESPACE"] + SECRET_REQUIRED
+    if variables.get("SUBSCRIBER_SINK", "odoo").strip().lower() == "mautic":
+        required += SECRET_REQUIRED_MAUTIC
+    _require(variables, required, "secret")
     ns = variables["DEPLOY_NAMESPACE"]
     args = ["kubectl", "create", "secret", "generic", "mauxy-credentials", "-n", ns,
             "--dry-run=client", "-o", "yaml"]
-    for key in SECRET_KEYS:
+    for key in SECRET_KEYS + sorted(k for k in variables if WEBHOOK_SECRET_RE.match(k)):
         if variables.get(key):
             args += [f"--from-literal={key}={variables[key]}"]
     print(f"==> sync Secret mauxy-credentials (ns {ns})")
@@ -155,7 +185,7 @@ def main():
 
     env_path = Path(args.env_file) if os.path.isabs(args.env_file) else PROJECT_ROOT / args.env_file
     variables = load_dotenv(env_path)
-    for key in KNOWN_VARS:                       # real env vars win over .env
+    for key in KNOWN_VARS + [k for k in os.environ if WEBHOOK_SECRET_RE.match(k)]:  # real env vars win over .env
         if os.environ.get(key):
             variables[key] = os.environ[key]
 

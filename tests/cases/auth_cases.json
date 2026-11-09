@@ -1,0 +1,62 @@
+{
+ "_comment": "LinkedIn login (auth_api.py). T-AUTH-0xx. return = ?return= of /api/auth/linkedin/start (lang de unless given); expected = the stored return path, or null = refused (400). referer = Referer of the start request; origin = the site the callback goes back to (allowlist https://site.test, https://www.site.test; first = default). problems = names of config problems (prefix match), [] = login enabled.",
+ "return": [
+  {"id": "T-AUTH-001", "return": null, "expected": "/de/"},
+  {"id": "T-AUTH-002", "return": "/de/kontakt", "expected": "/de/kontakt"},
+  {"id": "T-AUTH-003", "return": "/en/apps/odoo-crm?tab=price&x=1", "lang": "en", "expected": "/en/apps/odoo-crm?tab=price&x=1"},
+  {"id": "T-AUTH-004", "return": "/de/wissen/erp-einf%C3%BChrung", "expected": "/de/wissen/erp-einf%C3%BChrung"},
+  {"id": "T-AUTH-005", "return": "https://evil.example/de/", "expected": null},
+  {"id": "T-AUTH-006", "return": "//evil.example/de/", "expected": null},
+  {"id": "T-AUTH-007", "return": "/\\evil.example/de/", "expected": null},
+  {"id": "T-AUTH-008", "return": "https://site.test.evil.example/de/", "expected": null},
+  {"id": "T-AUTH-009", "return": "https://site.test@evil.example/de/", "expected": null},
+  {"id": "T-AUTH-010", "return": "javascript:alert(1)", "expected": null},
+  {"id": "T-AUTH-011", "return": "data:text/html,<script>alert(1)</script>", "expected": null},
+  {"id": "T-AUTH-012", "return": "/de/%2F%2Fevil.example", "expected": null},
+  {"id": "T-AUTH-013", "return": "/de/%5Cevil.example", "expected": null},
+  {"id": "T-AUTH-014", "return": "/de/../../evil", "expected": null},
+  {"id": "T-AUTH-015", "return": "/de/%2e%2e/evil", "expected": null},
+  {"id": "T-AUTH-016", "return": "/de/kontakt#frag", "expected": null},
+  {"id": "T-AUTH-017", "return": "/fr/kontakt", "expected": null},
+  {"id": "T-AUTH-018", "return": "/dex/kontakt", "expected": null},
+  {"id": "T-AUTH-019", "return": "de/kontakt", "expected": null},
+  {"id": "T-AUTH-020", "return": "/de/auth/callback?code=x", "expected": null},
+  {"id": "T-AUTH-021", "return": "/de/kontakt\r\nSet-Cookie: x=1", "expected": null},
+  {"id": "T-AUTH-022", "return": "/de/ kontakt", "expected": null},
+  {"id": "T-AUTH-023", "return": "/de@evil.example", "expected": null},
+  {"id": "T-AUTH-024", "return": "/de/x?next=https://evil.example", "expected": null},
+  {"id": "T-AUTH-025", "return": "/de/x?next=%2F%2Fevil.example", "expected": null},
+  {"id": "T-AUTH-026", "return": "/en", "lang": "en", "expected": "/en"},
+  {"id": "T-AUTH-027", "return": "/de/%00", "expected": null}
+ ],
+ "referer": [
+  {"id": "T-AUTH-030", "referer": null, "origin": "https://site.test"},
+  {"id": "T-AUTH-031", "referer": "https://www.site.test/de/kontakt", "origin": "https://www.site.test"},
+  {"id": "T-AUTH-032", "referer": "https://site.test.evil.example/de/", "origin": "https://site.test"},
+  {"id": "T-AUTH-033", "referer": "https://www.site.test@evil.example/de/", "origin": "https://site.test"},
+  {"id": "T-AUTH-034", "referer": "https://user@www.site.test/de/", "origin": "https://site.test"},
+  {"id": "T-AUTH-035", "referer": "http://www.site.test/de/", "origin": "https://site.test"},
+  {"id": "T-AUTH-036", "referer": "https://WWW.SITE.TEST/de/", "origin": "https://www.site.test"},
+  {"id": "T-AUTH-037", "referer": "https://evil.example/", "origin": "https://site.test"},
+  {"id": "T-AUTH-038", "referer": "https://www.site.test:8443/de/", "origin": "https://site.test"}
+ ],
+ "problems": [
+  {"id": "T-AUTH-040", "env": {}, "problems": []},
+  {"id": "T-AUTH-041", "env": {"LINKEDIN_CLIENT_SECRET": ""}, "problems": ["LINKEDIN_CLIENT_ID/LINKEDIN_CLIENT_SECRET"]},
+  {"id": "T-AUTH-042", "env": {"AUTH_TOKEN_SECRET": "short"}, "problems": ["AUTH_TOKEN_SECRET"]},
+  {"id": "T-AUTH-043", "env": {"LINKEDIN_REDIRECT_URI": "http://mauxy.test/api/auth/linkedin/callback"}, "problems": ["LINKEDIN_REDIRECT_URI"]},
+  {"id": "T-AUTH-044", "env": {"LINKEDIN_REDIRECT_URI": "https://mauxy.test/auth/linkedin/callback"}, "problems": ["LINKEDIN_REDIRECT_URI"]},
+  {"id": "T-AUTH-045", "env": {"LINKEDIN_REDIRECT_URI": "http://10.0.99.1:8021/api/auth/linkedin/callback", "LINKEDIN_AUTH_URL": "http://10.0.99.1:8022/oauth/v2/authorization", "LINKEDIN_TOKEN_URL": "http://10.0.99.1:8022/oauth/v2/accessToken", "LINKEDIN_USERINFO_URL": "http://10.0.99.1:8022/v2/userinfo", "AUTH_ALLOWED_ORIGINS": ["http://10.0.99.1:5182"]}, "problems": []},
+  {"id": "T-AUTH-046", "env": {"LINKEDIN_TOKEN_URL": "http://linkedin.evil.example/token"}, "problems": ["LINKEDIN_TOKEN_URL"]},
+  {"id": "T-AUTH-047", "env": {"AUTH_ALLOWED_ORIGINS": ["*"]}, "problems": ["AUTH_ALLOWED_ORIGINS"]},
+  {"id": "T-AUTH-048", "env": {"AUTH_ALLOWED_ORIGINS": ["http://site.test"]}, "problems": ["AUTH_ALLOWED_ORIGINS"]},
+  {"id": "T-AUTH-049", "env": {"AUTH_ALLOWED_ORIGINS": []}, "problems": ["AUTH_ALLOWED_ORIGINS"]}
+ ],
+ "linkedin_errors": [
+  {"id": "T-AUTH-060", "error": "user_cancelled_login", "expected": "user_cancelled_login"},
+  {"id": "T-AUTH-061", "error": "user_cancelled_authorize", "expected": "user_cancelled_authorize"},
+  {"id": "T-AUTH-062", "error": "access_denied", "expected": "access_denied"},
+  {"id": "T-AUTH-063", "error": "<script>alert(1)</script>", "expected": "login_failed"},
+  {"id": "T-AUTH-064", "error": "Invalid Scope", "expected": "login_failed"}
+ ]
+}
