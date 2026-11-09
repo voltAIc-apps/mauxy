@@ -12,8 +12,14 @@ Branded HTML part of the Selbst-Check mails (mail_html.py, owner request 2026-11
   T-HTML-013       colour helpers keep text readable for light brand colours
   T-HTML-014..015  db-patches/0011 (simplify accent = website CTA red, owner value kept); Dockerfile ships mail_html.py
   T-HTML-020..024  XSS in the name (cases "xss"): escaped in HTML, literal in the text part
+  T-HTML-050..057  dark mode (owner request 2026-11-09): color-scheme metas + :root, prefers-color-scheme
+                   block, Outlook [data-ogsc] / [data-ogsb] duplicates, every coloured element carries its
+                   dark class, dark contrast pairs (4.5:1 text + links, 3:1 button / bars) for several
+                   brands, light pairs survive Gmail's forced inversion, traffic lights distinguishable,
+                   logo on a white badge in every mode
 """
 import base64
+import colorsys
 import copy
 import email
 import email.policy
@@ -338,3 +344,203 @@ def test_t_html_015_doi_mail_refuses_any_other_attachment():
     for atts in bad:
         with pytest.raises(mailer.MailRejected):
             mailer.build("x@example.com", "s", "b", html="<p>x</p>", attachments=atts, audience="doi")
+
+
+# ------------------------------------------------------------------ T-HTML-050..057 dark mode
+
+BRANDS = {  # simplify (seed + 0011), very dark, very light, no colours (frame default)
+    "simplify": ("#0074b2", "#ea5562"), "dark": ("#112233", "#445566"), "light": ("#80d2ff", "#ffe066"),
+    "none": (None, None),
+}
+LEVELS = ("#1E7B4F", "#A35F00", "#C0392B")  # gut / prüfen / handeln (vendor/selfcheck/selfcheck.json)
+
+
+def palette(key):
+    primary, accent = BRANDS[key]
+    pal = mail_html.Palette(brand.Brand(site=key, display_name=key, color_primary=primary, color_accent=accent))
+    for c in LEVELS:
+        pal.level(c)
+    return pal
+
+
+def mails(client, outbox, monkeypatch, *, logo: bool):
+    """(doi, result) for the seeded simplify-erp (wordmark header) or re-cloud (PNG logo)."""
+    if not logo:
+        return submit_and_confirm(client, outbox, stay={"licence": 1000, "support": 10})
+    assert client.request("PUT", "/api/admin/brands/re-cloud", headers=ADMIN, json=RECLOUD).status_code == 201
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_ALLOWED_ORIGINS", ["https://site.test", "https://re-cloud.test"])
+    return submit_and_confirm(client, outbox, origin={"Origin": "https://re-cloud.test"}, email="dm@example.com",
+                              stay={"licence": 1000, "support": 10})
+
+
+def style_of(doc):
+    return re.search(r"<style[^>]*>(.*?)</style>", doc, re.S).group(1)
+
+
+def media_dark(css):
+    """Rules inside @media (prefers-color-scheme:dark){...} as {class: {prop: value}}, + the css after it."""
+    head = "@media (prefers-color-scheme:dark){"
+    start = css.index(head) + len(head)
+    depth, i = 1, start
+    while depth:
+        depth += {"{": 1, "}": -1}.get(css[i], 0)
+        i += 1
+    return rules_of(css[start:i - 1], ""), css[i:]
+
+
+def rules_of(css, prefix):
+    out: dict[str, dict[str, str]] = {}
+    for sel, body in re.findall(re.escape(prefix) + r"\.(mx-[\w-]+)\{([^}]*)\}", css):
+        for decl in body.split(";"):
+            prop, value = decl.split(":", 1)
+            assert value.endswith(" !important"), decl
+            out.setdefault(sel, {})[prop] = value[: -len(" !important")]
+    return out
+
+
+@pytest.mark.parametrize("logo", [False, True], ids=["T-HTML-050-wordmark", "T-HTML-050-logo"])
+def test_t_html_050_scheme_metas_media_query_outlook_blocks(logo, client, outbox, monkeypatch):
+    for m in mails(client, outbox, monkeypatch, logo=logo):
+        doc = m["html"]
+        metas = {a.get("name"): a.get("content") for t, a in tags(doc) if t == "meta"}
+        assert metas["color-scheme"] == "light dark" and metas["supported-color-schemes"] == "light dark"
+        css = style_of(doc)
+        assert css.startswith(":root{color-scheme:light dark;")
+        dark, rest = media_dark(css)
+        ogsc, ogsb = rules_of(rest, "[data-ogsc] "), rules_of(rest, "[data-ogsb] ")
+        assert ogsc and ogsb
+        # Outlook duplicates: every media rule once more, text / border -> ogsc, backgrounds -> ogsb
+        for cls, props in dark.items():
+            for prop, value in props.items():
+                target = ogsb if prop.startswith("background") else ogsc
+                assert target[cls][prop] == value, (cls, prop)
+        assert sum(map(len, dark.values())) == sum(map(len, ogsc.values())) + sum(map(len, ogsb.values()))
+        for must in ("mx-bg", "mx-card", "mx-head", "mx-soft", "mx-stripe", "mx-text", "mx-muted", "mx-faint",
+                     "mx-line", "mx-link", "mx-btn", "mx-btn-text", "mx-pre"):
+            assert must in dark, must
+
+
+TEXT_COLOR = re.compile(r"(?:^|;)\s*color\s*:")
+
+
+@pytest.mark.parametrize("logo", [False, True], ids=["T-HTML-051-wordmark", "T-HTML-051-logo"])
+def test_t_html_051_every_coloured_element_has_its_dark_class(logo, client, outbox, monkeypatch):
+    for m in mails(client, outbox, monkeypatch, logo=logo):
+        doc = m["html"]
+        dark, _ = media_dark(style_of(doc))
+        found = tags(doc)
+        ids = [a.get("id") for _, a in found]
+        assert all(ids) and len(ids) == len(set(ids))  # ids stay unique
+        checked = 0
+        for t, a in found:
+            style = a.get("style") or ""
+            props = set()
+            for cls in (a.get("class") or "").split():
+                props |= set(dark.get(cls, {}))
+            if TEXT_COLOR.search(style):
+                assert "color" in props, (t, a.get("id"), a.get("class"))
+                checked += 1
+            if a.get("bgcolor") or re.search(r"background(-color)?\s*:", style):
+                assert "background-color" in props, (t, a.get("id"), a.get("class"))
+                checked += 1
+            if re.search(r"border(-\w+)?\s*:[^;]*#", style):
+                assert "border-color" in props, (t, a.get("id"), a.get("class"))
+                checked += 1
+        assert checked >= 15
+
+
+def test_t_html_051_result_mail_dark_classes_in_place(client, outbox):
+    _doi, result = submit_and_confirm(client, outbox)
+    found = {a["id"]: a.get("class", "") for _t, a in tags(result["html"])}
+    ev = selfcheck_api.engine.evaluate(selfcheck_api.RULES, COMPLETE, "de")
+    for d in ev["dims"]:  # dot + label: the level's own dark colour
+        lvl = "mx-lvl-" + d["color"].lower()[1:]
+        assert lvl in found[f"mx-dim-{d['id']}-dot"].split() and lvl in found[f"mx-dim-{d['id']}-level"].split()
+    assert found[f"mx-risk-{ev['risks'][0]['id']}-n"] == "mx-num"
+    assert found[f"mx-wave-{ev['waves'][0]['id']}-n"] == "mx-num-solid"
+    assert found["mx-quote"] == "mx-quote" and found["mx-bar-fill"] == "mx-bar-fill"
+    assert found["mx-button-cell"] == "mx-btn" and found["mx-button-link"] == "mx-btn-text"
+    assert "mx-chip" in found["mx-chip0"] and found["mx-headline"] == "mx-text mx-h1"
+
+
+@pytest.mark.parametrize("key", list(BRANDS), ids=[f"T-HTML-052-{k}" for k in BRANDS])
+def test_t_html_052_dark_contrast_pairs(key):
+    pal = palette(key)
+    C = mail_html.contrast
+    card, soft = mail_html.DARK_CARD_BG, mail_html.DARK_SOFT_BG
+    # body text, muted text, footer, chips, links: 4.5:1 on every surface they sit on
+    for fg, bg in [(mail_html.DARK_TEXT, card), (mail_html.DARK_TEXT, soft), (mail_html.DARK_MUTED, card),
+                   (mail_html.DARK_FAINT, soft), (mail_html.DARK_FAINT, card), (mail_html.DARK_TEXT, mail_html.DARK_CHIP_BG),
+                   (mail_html.DARK_TEXT, pal.dark_tint), (mail_html.DARK_MUTED, pal.dark_tint),
+                   (pal.dark_link, card), (pal.dark_tint_link, pal.dark_tint)]:
+        assert C(fg, bg) >= 4.5, (key, fg, bg)
+    for c, d in pal.levels.items():  # traffic-light labels (small bold text)
+        assert C(d, card) >= 4.5, (c, d)
+    # large bold button text 3:1, the button 3:1 against the dark card, quote bar 3:1 on its box
+    assert C(pal.dark_on_button, pal.dark_button) >= 3.0
+    assert C(pal.dark_button, card) >= 3.0
+    assert C(pal.dark_bar, pal.dark_tint) >= 3.0
+    assert C(pal.on_primary, pal.primary) >= 3.0  # wave number box keeps the brand colour in dark mode
+
+
+def test_t_html_053_simplify_cta_stays_brand_red_with_white_text():
+    pal = palette("simplify")
+    assert (pal.button, pal.on_button) == ("#ea5562", "#ffffff")
+    assert (pal.dark_button, pal.dark_on_button) == ("#ea5562", "#ffffff")
+
+
+def test_t_html_054_traffic_lights_distinguishable_in_dark():
+    pal = palette("simplify")
+    hues = []
+    for c in (x.lower() for x in LEVELS):
+        h0 = colorsys.rgb_to_hsv(*(v / 255 for v in mail_html._rgb(c)))[0]
+        h1, s1, _v = colorsys.rgb_to_hsv(*(v / 255 for v in mail_html._rgb(pal.levels[c])))
+        assert abs(h0 - h1) < 0.02 and s1 > 0.25  # same hue as the light colour, still saturated
+        hues.append(h1 * 360)
+    for i in range(3):
+        for j in range(i + 1, 3):
+            d = abs(hues[i] - hues[j])
+            assert min(d, 360 - d) >= 25, hues  # green / amber / red stay apart
+
+
+@pytest.mark.parametrize("key", list(BRANDS), ids=[f"T-HTML-055-{k}" for k in BRANDS])
+def test_t_html_055_light_pairs_survive_forced_inversion(key):
+    """Gmail apps ignore the media query and invert the light design themselves: every light pair is
+    readable to begin with (no light grey on white), so the inverted pairs stay readable too."""
+    pal = palette(key)
+    C = mail_html.contrast
+    for fg, bg in [(mail_html.TEXT, mail_html.CARD_BG), (mail_html.MUTED, mail_html.CARD_BG),
+                   (mail_html.FAINT, mail_html.SOFT_BG), (mail_html.TEXT, mail_html.CHIP_BG),
+                   (mail_html.MUTED, pal.tint), (pal.link, mail_html.CARD_BG), (pal.tint_link, pal.tint)]:
+        assert C(fg, bg) >= 4.5, (key, fg, bg)
+    for c in LEVELS:
+        assert C(c, mail_html.CARD_BG) >= 4.5
+    assert C(pal.on_button, pal.button) >= 3.0
+
+
+def test_t_html_056_logo_on_white_badge_in_every_mode(client, outbox, monkeypatch):
+    doi, result = mails(client, outbox, monkeypatch, logo=True)
+    for m in (doi, result):
+        doc = m["html"]
+        found = tags(doc)
+        cell = [a for t, a in found if a.get("id") == "mx-badge-cell"][0]
+        assert cell["class"] == "mx-badge" and cell["bgcolor"] == "#ffffff"
+        assert "background-image:linear-gradient(#ffffff,#ffffff)" in cell["style"]  # Gmail does not invert it
+        assert doc.index('id="mx-header"') < doc.index('id="mx-badge-cell"') < doc.index('id="mx-logo"')
+        dark, rest = media_dark(style_of(doc))
+        assert dark["mx-badge"] == {"background-color": "#ffffff"}
+        assert rules_of(rest, "[data-ogsb] ")["mx-badge"] == {"background-color": "#ffffff"}
+        assert dark["mx-head"]["background-color"] == mail_html.DARK_CARD_BG  # header goes dark, badge stays
+        assert m["attachments"] == [("logo.png", "image/png", "brand-logo")]  # still exactly one inline image
+        assert [a["src"] for t, a in found if t == "img"] == ["cid:brand-logo"]
+
+
+def test_t_html_057_dark_classes_are_fixed_tokens(client, outbox):
+    """Dark classes are fixed tokens or a validated #RRGGBB: a rules colour that is not #RRGGBB gets no
+    class of its own (falls back to mx-text); the name stays escaped (cases T-HTML-020..024)."""
+    pal = mail_html.Palette(None)
+    assert pal.level("red;}</style><script>") == "mx-text" and pal.levels == {}
+    assert pal.level("#1E7B4F") == "mx-lvl-1e7b4f"
+    _doi, result = submit_and_confirm(client, outbox, name="<b>Eve</b>")
+    assert "&lt;b&gt;Eve&lt;/b&gt;" in result["html"] and "<b>Eve" not in result["html"]
+    assert re.fullmatch(r"[\w\s:;{}()#.,!@\-\[\]%]*", style_of(result["html"]))

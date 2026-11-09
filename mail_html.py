@@ -19,9 +19,28 @@ E-mail client rules (Outlook / Gmail / Apple Mail / mobile):
     without a PNG logo the header is the styled wordmark text.
   - colours: the brand's primary / accent; text colour on a coloured surface is picked by WCAG contrast,
     link colour darkened until it reaches 4.5:1 on white, so a light brand colour stays readable.
-  - dark mode: explicit light colours inline (clients that invert get a predictable start), a
-    prefers-color-scheme block for clients that honour it; a logo always sits on its own white header
-    panel (no dark-on-transparent logo on a dark background).
+  - dark mode (owner request 2026-11-09 "support dark mode on emails"): light-first, every colour inline,
+    and every coloured element carries an mx-* class. ONE rule table (Palette.dark_rules) generates
+      * @media (prefers-color-scheme: dark) { .mx-x { prop: dark !important } }  Apple Mail, iOS Mail,
+        Outlook macOS / iOS / Android (new), Thunderbird, Samsung, Gmail web is NOT among them
+      * [data-ogsc] .mx-x { color / border-color }  and  [data-ogsb] .mx-x { background-color }  Outlook.com
+        and the Outlook apps that rewrite colours themselves and mark the touched elements with these attrs
+    plus <meta name="color-scheme" / "supported-color-schemes" content="light dark"> and
+    :root{color-scheme:light dark} (tells Apple Mail the mail has its own dark design: no auto-invert).
+    Dark palette: neutral greys, brand link / badge / bar colours lightened until they reach WCAG 4.5:1 (text)
+    or 3:1 (button, bars) on the dark card, traffic-light colours lightened per level (still green / amber /
+    red, distinguishable), the CTA keeps the brand colour with its text colour picked by contrast.
+    Logo: dark ink on transparency would vanish on a dark header, so the logo sits on its own light rounded
+    BADGE panel (white, 8px radius) that stays white in every mode: pinned in the media query, pinned for
+    [data-ogsb], and painted a second time as background-image:linear-gradient(white,white), which Gmail's
+    forced inversion does not touch. Chosen over a second "logo_dark" asset: works in clients that ignore
+    media queries (Gmail apps), no second upload / DOI attachment / db-patch. In light mode the badge is
+    white on the white header, i.e. invisible.
+    Known limits: Gmail (Android / iOS) ignores media queries and force-inverts colours by its own algorithm
+    (backgrounds darkened, dark text lightened, brand colours shifted); the light design is built to survive
+    that (no light-grey text, no text on images, the logo badge stays white). Gmail web shows the light
+    design. Outlook Windows (Word engine) has a dark mode that partially inverts and ignores CSS; the
+    bgcolor attributes keep the frame coherent there. Yahoo / AOL show the light design.
   - lang attribute, preheader text, alt text, role="presentation" on layout tables, every element with
     a unique id (owner rule).
 
@@ -32,6 +51,7 @@ caller passes explicitly (no free-text linkification).
 from __future__ import annotations
 
 import html
+import re
 import struct
 from typing import Iterable, Optional
 
@@ -50,6 +70,17 @@ MUTED = "#495057"
 FAINT = "#5c636a"
 LINE = "#dee2e6"
 CHIP_BG = "#e9ecef"
+BADGE_BG = "#ffffff"  # logo badge: stays white in every mode (dark ink on transparent logos)
+
+# the same frame in dark mode (prefers-color-scheme / Outlook data-ogsc+ogsb); text pairs >= 4.5:1 (tests)
+DARK_PAGE_BG = "#0f1215"
+DARK_CARD_BG = "#1a1f24"
+DARK_SOFT_BG = "#15191d"
+DARK_TEXT = "#e8eaed"
+DARK_MUTED = "#b1b8c0"
+DARK_FAINT = "#9ba4ad"
+DARK_LINE = "#343b43"
+DARK_CHIP_BG = "#2a3138"
 FALLBACK_PRIMARY = "#1d4ed8"   # same default as confirm_page.py for a profile without colours
 
 SANS = "'Source Sans Pro','Segoe UI',-apple-system,BlinkMacSystemFont,Roboto,Helvetica,Arial,sans-serif"
@@ -100,18 +131,30 @@ def on_color(bg: str, min_ratio: float = 4.5) -> str:
     return "#ffffff" if contrast(bg, "#ffffff") >= min_ratio else "#111111"
 
 
-def ink(hex_: str, bg: str = CARD_BG, min_ratio: float = 4.5) -> str:
-    """`hex_` darkened (towards black) until it reads as text on `bg`."""
+def ink(hex_: str, bg: str = CARD_BG, min_ratio: float = 4.5, towards: str = "#000000") -> str:
+    """`hex_` mixed towards `towards` (black: darken for light surfaces, white: lighten for dark ones)
+    in 10 % steps until it reaches `min_ratio` on `bg`."""
     out = hex_
     for step in range(1, 11):
         if contrast(out, bg) >= min_ratio:
             return out
-        out = mix(hex_, "#000000", step / 10)
+        out = mix(hex_, towards, step / 10)
     return out
 
 
+def ink_dark(hex_: str, bg: str = DARK_CARD_BG, min_ratio: float = 4.5) -> str:
+    """`hex_` lightened until it reads on the dark-mode surface `bg`."""
+    return ink(hex_, bg, min_ratio, towards="#ffffff")
+
+
+HEX6 = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
 class Palette:
-    """Colours of one brand (validated #RRGGBB from the profile, else the frame default)."""
+    """Colours of one brand (validated #RRGGBB from the profile, else the frame default), light and dark.
+
+    Dark mode: dark_rules() is the ONE table (class, css property, dark value) from which _style_block
+    renders the prefers-color-scheme block and the Outlook [data-ogsc] / [data-ogsb] blocks."""
 
     def __init__(self, brand):
         self.primary = (brand.color_primary if brand and brand.color_primary else FALLBACK_PRIMARY).lower()
@@ -119,9 +162,53 @@ class Palette:
         self.link = ink(self.primary)                      # links, eyebrow, wordmark on white
         self.on_primary = on_color(self.primary)           # number boxes on primary
         self.tint = mix(self.primary, "#ffffff", 0.88)     # risk number circle, quote box
+        self.tint_link = ink(self.primary, self.tint)      # number in the risk circle, 4.5:1 on the tint
         self.button = self.accent
         self.on_button = on_color(self.button, 3.0)        # large bold text: WCAG 3:1
-        self.dark_link = mix(self.primary, "#ffffff", 0.45)  # links on the dark-mode card
+        # dark mode
+        self.dark_link = ink_dark(self.primary, min_ratio=6.0)          # links / eyebrow / wordmark (>= 4.5:1, aim 6)
+        self.dark_tint = mix(self.primary, DARK_CARD_BG, 0.82)          # quote box, risk number circle
+        self.dark_tint_link = ink_dark(self.primary, self.dark_tint)    # number in the circle, 4.5:1
+        self.dark_bar = ink_dark(self.primary, self.dark_tint, 3.0)     # quote bar + quote border, 3:1
+        self.dark_button = ink_dark(self.button, DARK_CARD_BG, 3.0)     # brand CTA stays, unless too dark
+        self.dark_on_button = on_color(self.dark_button, 3.0)
+        self.levels: dict[str, str] = {}                                # traffic light colour -> dark colour
+
+    def level(self, color: str) -> str:
+        """Class of a traffic-light colour (gut / prüfen / handeln from the rules); its dark twin is
+        lightened to 5.5:1 (>= 4.5) on the dark card, hue kept (green / amber / red stay distinguishable)."""
+        if not HEX6.match(color or ""):
+            return "mx-text"
+        c = color.lower()
+        self.levels[c] = ink_dark(c, min_ratio=5.5)
+        return f"mx-lvl-{c[1:]}"
+
+    def dark_rules(self) -> list[tuple[str, str, str]]:
+        rules = [
+            ("mx-bg", "background-color", DARK_PAGE_BG),
+            ("mx-pre", "color", DARK_PAGE_BG),
+            ("mx-card", "background-color", DARK_CARD_BG), ("mx-card", "border-color", DARK_LINE),
+            ("mx-head", "background-color", DARK_CARD_BG),
+            ("mx-badge", "background-color", BADGE_BG),
+            ("mx-stripe", "background-color", self.primary),
+            ("mx-soft", "background-color", DARK_SOFT_BG),
+            ("mx-text", "color", DARK_TEXT),
+            ("mx-muted", "color", DARK_MUTED),
+            ("mx-faint", "color", DARK_FAINT),
+            ("mx-line", "border-color", DARK_LINE),
+            ("mx-chip", "background-color", DARK_CHIP_BG), ("mx-chip", "color", DARK_TEXT),
+            ("mx-link", "color", self.dark_link),
+            ("mx-wordmark", "color", self.dark_link),
+            ("mx-num", "background-color", self.dark_tint), ("mx-num", "color", self.dark_tint_link),
+            ("mx-num-solid", "background-color", self.primary), ("mx-num-solid", "color", self.on_primary),
+            ("mx-quote", "background-color", self.dark_tint), ("mx-quote", "border-color", self.dark_bar),
+            ("mx-bar-fill", "background-color", self.dark_bar),
+            ("mx-bar-rest", "background-color", DARK_LINE),
+            ("mx-btn", "background-color", self.dark_button),
+            ("mx-btn-text", "color", self.dark_on_button),
+        ]
+        rules += [(f"mx-lvl-{c[1:]}", "color", d) for c, d in sorted(self.levels.items())]
+        return rules
 
 
 # ------------------------------------------------------------------------------- html helpers
@@ -161,9 +248,11 @@ def logo_attachment(brand) -> Optional[mailer.Attachment]:
                              inline_cid=LOGO_CID)
 
 
-def text_html(ids: Ids, name: str, text: str, links: dict[str, str], pal: Palette, *, style: str = "") -> str:
+def text_html(ids: Ids, name: str, text: str, links: dict[str, str], pal: Palette, *, style: str = "",
+              cls: str = "mx-text") -> str:
     """One paragraph of plain text: escaped, line breaks -> <br>, and exactly the URLs in `links`
-    (url -> id suffix) become anchors. No other text is ever turned into a link."""
+    (url -> id suffix) become anchors. No other text is ever turned into a link. `cls` = the dark-mode
+    class matching the colour in `style` (mx-text default, mx-muted / mx-faint for TEXT / FAINT overrides)."""
     parts = []
     for i, line in enumerate(text.split("\n")):
         if i:
@@ -175,7 +264,7 @@ def text_html(ids: Ids, name: str, text: str, links: dict[str, str], pal: Palett
                 out = out.replace(e, f'<a id="{ids(f"{name}-{key}")}" class="mx-link" href="{e}" '
                                      f'style="color:{pal.link};text-decoration:underline;word-break:normal;overflow-wrap:break-word">{e}</a>', 1)
         parts.append(out)
-    return (f'<p id="{ids(name)}" class="mx-text" style="margin:0 0 16px;font-family:{SANS};font-size:16px;'
+    return (f'<p id="{ids(name)}" class="{cls}" style="margin:0 0 16px;font-family:{SANS};font-size:16px;'
             f'line-height:1.55;color:{TEXT};{style}">{"".join(parts)}</p>')
 
 
@@ -184,9 +273,9 @@ def button(ids: Ids, name: str, label: str, url: str, pal: Palette) -> str:
     return (
         f'<table id="{ids(name)}" role="presentation" cellpadding="0" cellspacing="0" border="0" '
         f'style="margin:8px 0 24px;border-collapse:separate">'
-        f'<tr id="{ids(name + "-row")}"><td id="{ids(name + "-cell")}" bgcolor="{pal.button}" '
+        f'<tr id="{ids(name + "-row")}"><td id="{ids(name + "-cell")}" class="mx-btn" bgcolor="{pal.button}" '
         f'style="background:{pal.button};border-radius:8px;mso-padding-alt:14px 26px">'
-        f'<a id="{ids(name + "-link")}" href="{esc(url)}" '
+        f'<a id="{ids(name + "-link")}" class="mx-btn-text" href="{esc(url)}" '
         f'style="display:inline-block;padding:14px 26px;font-family:{SANS};font-size:19px;font-weight:700;'
         f'line-height:1.2;color:{pal.on_button};text-decoration:none;border-radius:8px">{esc(label)}</a>'
         f'</td></tr></table>')
@@ -197,51 +286,74 @@ def h2(ids: Ids, name: str, text: str) -> str:
             f'line-height:1.3;font-weight:700;color:{TEXT}">{esc(text)}</h2>')
 
 
-def _style_block(pal: Palette, *, logo: bool) -> str:
-    """Media queries only (mobile + dark). Everything else is inline."""
-    head_dark = "" if logo else ".mx-head{background:#1a1f24 !important}.mx-wordmark{color:%s !important}" % pal.dark_link
+def _style_block(pal: Palette) -> str:
+    """The only <style>: color-scheme, mobile media query and the dark mode, all generated from
+    pal.dark_rules() (one table, three renderings):
+      @media (prefers-color-scheme:dark)  every rule, !important beats the inline light colour
+      [data-ogsc] .cls                     Outlook.com / Outlook apps: text + border colours
+      [data-ogsb] .cls                     Outlook.com / Outlook apps: backgrounds
+    Everything else is inline (clients without <style> support get the light design)."""
+    rules = pal.dark_rules()
+    by_cls: dict[str, list[str]] = {}
+    ogsc: dict[str, list[str]] = {}
+    ogsb: dict[str, list[str]] = {}
+    for cls, prop, value in rules:
+        decl = f"{prop}:{value} !important"
+        by_cls.setdefault(cls, []).append(decl)
+        (ogsb if prop.startswith("background") else ogsc).setdefault(cls, []).append(decl)
+    media = "".join(f".{c}{{{';'.join(d)}}}" for c, d in by_cls.items())
+    outlook = ("".join(f"[data-ogsc] .{c}{{{';'.join(d)}}}" for c, d in ogsc.items())
+               + "".join(f"[data-ogsb] .{c}{{{';'.join(d)}}}" for c, d in ogsb.items()))
     return (
+        ":root{color-scheme:light dark;supported-color-schemes:light dark}"
         "@media only screen and (max-width:620px){"
         ".mx-outer{padding:12px 0 !important}.mx-pad{padding-left:20px !important;padding-right:20px !important}"
+        ".mx-pad-logo{padding-left:10px !important;padding-right:10px !important}"
         ".mx-h1{font-size:23px !important}}"
-        "@media (prefers-color-scheme:dark){"
-        ".mx-bg{background:#0f1215 !important}.mx-card{background:#1a1f24 !important;border-color:#2e353c !important}"
-        ".mx-soft{background:#151a1e !important}.mx-text{color:#e8eaed !important}.mx-muted{color:#aab2bb !important}"
-        ".mx-line{border-color:#2e353c !important}.mx-chip{background:#2a3036 !important;color:#e8eaed !important}"
-        f".mx-link{{color:{pal.dark_link} !important}}.mx-quote{{background:#16232d !important}}"
-        f"{head_dark}}}"
+        f"@media (prefers-color-scheme:dark){{{media}}}"
+        f"{outlook}"
     )
 
 
 def frame(*, brand, lang: str, title: str, preheader: str, inner: str, ids: Ids, pal: Palette,
           footer_lines: list[str], logo: Optional[mailer.Attachment], legal_links: list[tuple[str, str]]) -> str:
-    """The branded document around `inner`: header (logo or wordmark), content, signature, legal footer."""
+    """The branded document around `inner`: header (logo badge or wordmark), content, signature, legal
+    footer. Called after `inner` is rendered, so pal.levels already holds the traffic-light colours."""
+    head_pad = "20px 32px"
+    head_cls = "mx-head mx-pad mx-line"
     if logo is not None:
         w, h = png_size(logo.content)
         height = LOGO_HEIGHT
         width = max(1, round(w * height / h))
         if width > LOGO_MAX_WIDTH:
             width, height = LOGO_MAX_WIDTH, max(1, round(h * LOGO_MAX_WIDTH / w))
-        mark = (f'<img id="{ids("logo")}" src="cid:{LOGO_CID}" width="{width}" height="{height}" '
+        # light rounded badge: white in every mode (media query + ogsb pin it, the gradient survives
+        # Gmail's forced inversion); header padding minus badge padding keeps the logo aligned with the text
+        mark = (f'<table id="{ids("badge")}" role="presentation" cellpadding="0" cellspacing="0" border="0" '
+                f'style="border-collapse:separate"><tr id="{ids("badge-row")}">'
+                f'<td id="{ids("badge-cell")}" class="mx-badge" bgcolor="{BADGE_BG}" style="padding:8px 10px;'
+                f'background:{BADGE_BG};background-image:linear-gradient({BADGE_BG},{BADGE_BG});border-radius:8px">'
+                f'<img id="{ids("logo")}" src="cid:{LOGO_CID}" width="{width}" height="{height}" '
                 f'alt="{esc(brand.display_name)}" style="display:block;border:0;outline:none;height:{height}px;'
-                f'width:{width}px;max-width:100%">')
+                f'width:{width}px;max-width:100%"></td></tr></table>')
+        head_pad = "12px 22px"
+        head_cls = "mx-head mx-pad-logo mx-line"
     else:
         mark = (f'<span id="{ids("wordmark")}" class="mx-wordmark" style="font-family:{SANS};font-size:24px;'
                 f'font-weight:700;letter-spacing:-0.01em;color:{pal.link}">{esc(brand.wordmark or brand.display_name)}</span>')
 
     sig = ""
     if footer_lines:
-        sig = text_html(ids, "signature", "\n".join(footer_lines), {}, pal,
+        sig = text_html(ids, "signature", "\n".join(footer_lines), {}, pal, cls="mx-muted mx-line",
                         style=f"margin:28px 0 0;padding-top:16px;border-top:1px solid {LINE};color:{MUTED};font-size:15px")
-        sig = sig.replace('class="mx-text"', 'class="mx-muted mx-line"', 1)
 
     legal = [f'<span id="{ids("legal-name")}">{esc(brand.display_name)}</span>']
     if brand.legal_entity and brand.legal_entity != brand.display_name:
         legal.append(f'<span id="{ids("legal-entity")}">{esc(brand.legal_entity)}</span>')
     for key, url, label in legal_links:
-        legal.append(f'<a id="{ids("legal-" + key)}" class="mx-muted" href="{esc(url)}" '
+        legal.append(f'<a id="{ids("legal-" + key)}" class="mx-faint" href="{esc(url)}" '
                      f'style="color:{FAINT};text-decoration:underline">{esc(label)}</a>')
-    sep = f'<span id="{{}}" style="color:{FAINT}"> · </span>'
+    sep = f'<span id="{{}}" class="mx-faint" style="color:{FAINT}"> · </span>'
     legal_html = ""
     for i, part in enumerate(legal):
         legal_html += (sep.format(ids(f"legal-sep{i}")) if i else "") + part
@@ -255,27 +367,27 @@ def frame(*, brand, lang: str, title: str, preheader: str, inner: str, ids: Ids,
         f'<meta id="{ids("scheme")}" name="color-scheme" content="light dark">'
         f'<meta id="{ids("schemes")}" name="supported-color-schemes" content="light dark">'
         f'<title id="{ids("title")}">{esc(title)}</title>'
-        f'<style id="{ids("style")}">{_style_block(pal, logo=logo is not None)}</style></head>'
+        f'<style id="{ids("style")}">{_style_block(pal)}</style></head>'
         f'<body id="{ids("body")}" class="mx-bg" style="margin:0;padding:0;background:{PAGE_BG};'
         f'-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">'
-        f'<div id="{ids("preheader")}" style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;'
-        f'opacity:0;overflow:hidden;mso-hide:all;color:{PAGE_BG}">{esc(preheader)}{pad}</div>'
+        f'<div id="{ids("preheader")}" class="mx-pre" style="display:none;font-size:1px;line-height:1px;max-height:0;'
+        f'max-width:0;opacity:0;overflow:hidden;mso-hide:all;color:{PAGE_BG}">{esc(preheader)}{pad}</div>'
         f'<table id="{ids("wrap")}" class="mx-bg" role="presentation" width="100%" cellpadding="0" cellspacing="0" '
         f'border="0" bgcolor="{PAGE_BG}" style="background:{PAGE_BG};width:100%">'
         f'<tr id="{ids("wrap-row")}"><td id="{ids("outer")}" class="mx-outer" align="center" style="padding:24px 12px">'
         f'<table id="{ids("card")}" class="mx-card" role="presentation" width="600" cellpadding="0" cellspacing="0" '
         f'border="0" bgcolor="{CARD_BG}" style="width:100%;max-width:600px;background:{CARD_BG};'
         f'border:1px solid {LINE};border-radius:12px;border-collapse:separate;overflow:hidden">'
-        f'<tr id="{ids("stripe-row")}"><td id="{ids("stripe")}" height="5" bgcolor="{pal.primary}" '
+        f'<tr id="{ids("stripe-row")}"><td id="{ids("stripe")}" class="mx-stripe" height="5" bgcolor="{pal.primary}" '
         f'style="height:5px;line-height:5px;font-size:0;background:{pal.primary};border-radius:12px 12px 0 0">&nbsp;</td></tr>'
-        f'<tr id="{ids("head-row")}"><td id="{ids("header")}" class="mx-head mx-pad mx-line" bgcolor="#ffffff" '
-        f'style="padding:20px 32px;background:#ffffff;border-bottom:1px solid {LINE}">{mark}</td></tr>'
-        f'<tr id="{ids("content-row")}"><td id="{ids("content")}" class="mx-pad" '
+        f'<tr id="{ids("head-row")}"><td id="{ids("header")}" class="{head_cls}" bgcolor="{CARD_BG}" '
+        f'style="padding:{head_pad};background:{CARD_BG};border-bottom:1px solid {LINE}">{mark}</td></tr>'
+        f'<tr id="{ids("content-row")}"><td id="{ids("content")}" class="mx-pad mx-text" '
         f'style="padding:28px 32px 32px;font-family:{SANS};color:{TEXT}">{inner}{sig}</td></tr>'
-        f'<tr id="{ids("foot-row")}"><td id="{ids("footer")}" class="mx-soft mx-pad mx-line" bgcolor="{SOFT_BG}" '
+        f'<tr id="{ids("foot-row")}"><td id="{ids("footer")}" class="mx-soft mx-pad mx-line mx-faint" bgcolor="{SOFT_BG}" '
         f'style="padding:18px 32px;background:{SOFT_BG};border-top:1px solid {LINE};border-radius:0 0 12px 12px;'
         f'font-family:{SANS};font-size:13px;line-height:1.6;color:{FAINT}">'
-        f'<p id="{ids("legal")}" class="mx-muted" style="margin:0;color:{FAINT}">{legal_html}</p></td></tr>'
+        f'<p id="{ids("legal")}" class="mx-faint" style="margin:0;color:{FAINT}">{legal_html}</p></td></tr>'
         f'</table></td></tr></table></body></html>'
     )
 
@@ -335,16 +447,17 @@ def selfcheck_result(brand, lang: str, p: dict) -> tuple[Optional[str], list[mai
             k = f"dim-{d['id']}"
             last = d is ev["dims"][-1]
             border = "" if last else f"border-bottom:1px solid {LINE};"
+            lvl = pal.level(d["color"])  # dark twin of gut / prüfen / handeln
             rows.append(
                 f'<tr id="{ids(k)}">'
-                f'<td id="{ids(k + "-dot")}" class="mx-line" width="22" valign="top" aria-hidden="true" '
+                f'<td id="{ids(k + "-dot")}" class="mx-line {lvl}" width="22" valign="top" aria-hidden="true" '
                 f'style="{border}padding:12px 0;width:22px;font-size:18px;line-height:22px;color:{esc(d["color"])}">&#9679;</td>'
                 f'<td id="{ids(k + "-body")}" class="mx-line" valign="top" style="{border}padding:12px 8px 12px 4px">'
                 f'<span id="{ids(k + "-name")}" class="mx-text" style="display:block;font-weight:700;font-size:16px;'
                 f'line-height:22px;color:{TEXT}">{esc(d["name"])}</span>'
                 f'<span id="{ids(k + "-note")}" class="mx-muted" style="display:block;font-size:15px;line-height:1.45;'
                 f'color:{MUTED}">{esc(d["note"])}</span></td>'
-                f'<td id="{ids(k + "-level")}" class="mx-line" valign="top" align="right" style="{border}padding:12px 0;'
+                f'<td id="{ids(k + "-level")}" class="mx-line {lvl}" valign="top" align="right" style="{border}padding:12px 0;'
                 f'white-space:nowrap;font-size:13px;line-height:22px;font-weight:700;letter-spacing:0.05em;'
                 f'text-transform:uppercase;color:{esc(d["color"])}">{esc(d["label"])}</td></tr>')
         out.append(f'<table id="{ids("lights")}" role="presentation" width="100%" cellpadding="0" cellspacing="0" '
@@ -362,8 +475,8 @@ def selfcheck_result(brand, lang: str, p: dict) -> tuple[Optional[str], list[mai
                         f'{esc(lab["read"])} &rarr;</a>')
             rows.append(
                 f'<tr id="{ids(k)}"><td id="{ids(k + "-n-cell")}" width="40" valign="top" style="width:40px;padding:0 0 18px">'
-                f'<div id="{ids(k + "-n")}" aria-hidden="true" style="width:28px;height:28px;border-radius:14px;'
-                f'background:{pal.tint};color:{pal.link};font-weight:700;font-size:15px;line-height:28px;'
+                f'<div id="{ids(k + "-n")}" class="mx-num" aria-hidden="true" style="width:28px;height:28px;border-radius:14px;'
+                f'background:{pal.tint};color:{pal.tint_link};font-weight:700;font-size:15px;line-height:28px;'
                 f'text-align:center">{r["n"]}</div></td>'
                 f'<td id="{ids(k + "-body")}" valign="top" style="padding:2px 0 18px">'
                 f'<span id="{ids(k + "-title")}" class="mx-text" style="display:block;font-weight:700;font-size:16px;'
@@ -379,7 +492,7 @@ def selfcheck_result(brand, lang: str, p: dict) -> tuple[Optional[str], list[mai
             k = f"wave-{w['id']}"
             rows.append(
                 f'<tr id="{ids(k)}"><td id="{ids(k + "-n-cell")}" width="40" valign="top" style="width:40px;padding:0 0 14px">'
-                f'<div id="{ids(k + "-n")}" aria-hidden="true" style="width:28px;height:28px;border-radius:6px;'
+                f'<div id="{ids(k + "-n")}" class="mx-num-solid" aria-hidden="true" style="width:28px;height:28px;border-radius:6px;'
                 f'background:{pal.primary};color:{pal.on_primary};font-weight:700;font-size:15px;line-height:28px;'
                 f'text-align:center">{w["n"]}</div></td>'
                 f'<td id="{ids(k + "-body")}" valign="top" style="padding:2px 0 14px">'
@@ -392,9 +505,9 @@ def selfcheck_result(brand, lang: str, p: dict) -> tuple[Optional[str], list[mai
 
     # Richtangebot: how it follows (intro text above) + precision of the answers (bar = answered share)
     share = max(0, min(100, round(100 * p["answered"] / p["total"]))) if p["total"] else 0
-    bar_rest = (f'<td id="{ids("bar-rest")}" width="{100 - share}%" bgcolor="{LINE}" style="background:{LINE};'
+    bar_rest = (f'<td id="{ids("bar-rest")}" class="mx-bar-rest" width="{100 - share}%" bgcolor="{LINE}" style="background:{LINE};'
                 f'height:6px;line-height:6px;font-size:0">&nbsp;</td>') if share < 100 else ""
-    bar_fill = (f'<td id="{ids("bar-fill")}" width="{share}%" bgcolor="{pal.primary}" style="background:{pal.primary};'
+    bar_fill = (f'<td id="{ids("bar-fill")}" class="mx-bar-fill" width="{share}%" bgcolor="{pal.primary}" style="background:{pal.primary};'
                 f'height:6px;line-height:6px;font-size:0">&nbsp;</td>') if share > 0 else ""
     out.append(
         f'<table id="{ids("quote")}" class="mx-quote" role="presentation" width="100%" cellpadding="0" cellspacing="0" '
@@ -451,7 +564,7 @@ def letter(brand, lang: str, *, subject: str, paragraphs: list[str], footer_line
                 out.append(text_html(ids, f"p{i}", before, {}, pal))
             out.append(button(ids, "button", link_label or link, link, pal))
             out.append(text_html(ids, f"p{i}-url", link, {link: "url"}, pal,
-                                 style=f"font-size:13px;color:{FAINT}"))
+                                 style=f"font-size:13px;color:{FAINT}", cls="mx-faint"))
             rest = "\n".join(lines[lines.index(link) + 1:])
             if rest:
                 out.append(text_html(ids, f"p{i}-rest", rest, {}, pal))
