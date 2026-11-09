@@ -327,7 +327,7 @@ the per-site key / quiz.
 (result step and the premature-exit Richtangebot, both picks `mail` / `call` / `radar` of the same kind):
 
 ```json
-{"email": "...", "name": "Max Mustermann", "phone": "+49 30 123456", "lang": "de",
+{"email": "...", "salutation": "mr", "name": "Max Mustermann", "phone": "+49 30 123456", "lang": "de",
  "picks": ["mail"], "answers": {...}, "stay": null, "rules_version": "...", "consent": true,
  "company": "Muster GmbH", "company_website": ""}
 ```
@@ -335,6 +335,11 @@ the per-site key / quiz.
 - `name` required: string, <= 100 chars after cleaning (whitespace collapsed, control / direction
   characters removed), not blank -> else 422.
 - `phone` optional: `^[0-9+()/ -]+$`, at least one digit, <= 40 chars; blank or omitted = none -> else 422.
+- `salutation` required (db-patches/0012): `"ms"` | `"mr"` | `"none"` as chosen by the person ("Anrede":
+  Frau / Herr / Keine Angabe), else 422. Transition `SELFCHECK_SALUTATION_REQUIRED=false`: missing = `"none"`.
+  Effect: result mail greeting ("Sehr geehrte Frau Dr. Muster," / "Dear Mr Muster,"; none = full name as
+  before), `crm.lead.title`, "Salutation:" in operator mail + lead. Optional on `/api/lead` contact /
+  inquiry / webinar / checkout (same enum).
 - Response unchanged and uniform (`200 pending_confirmation`, 403, 422, 429, 503).
 - Transition: while `SELFCHECK_NAME_REQUIRED=false` a request WITHOUT `name` is accepted (old website);
   `true` (default) after the website ships the field. Order: mauxy (false) -> website -> flip to true.

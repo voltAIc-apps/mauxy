@@ -241,7 +241,7 @@ outbox, login state/code), 0004 per-site policy, 0005 mail outbox, 0006 per-site
 (mauxy's per-site do-not-contact record, hashed), 0008 re-signup (`source` self / admin, `resignup_at`,
 `newsletter_pending.resignup`, audit `site_optout_lift`), 0009 `odoo_optout_mark` (provenance of mauxy's Odoo
 opt-outs), 0010 Selbst-Check name / phone, 0011 simplify-erp accent = website CTA red `#ea5562` (only
-replaces the 0006 seed value). Tests with `ACTION_LOG_DB=:memory:` apply the patches
+replaces the 0006 seed value), 0012 Selbst-Check salutation (ms / mr / none). Tests with `ACTION_LOG_DB=:memory:` apply the patches
 in-process. Never edit a deployed patch; add the next one.
 
 Dev loop: change your local DB schema, run `--generate <name>`, review the emitted patch
@@ -387,7 +387,8 @@ The site entry `simplify-erp` exists in `sites` (patch 0004: `subscribe_quiz=0`,
 - CORS: the site origin in `ALLOWED_ORIGINS` (GET + POST, headers `Content-Type`, `Authorization`).
 - Lead CTAs, Selbst-Check and LinkedIn login are unchanged (Origin allowlists, no site key).
 - Selbst-Check body since 2026-11-09: + `name` (required) and `phone` (optional), API.md "Website contract:
-  Selbst-Check body"; rollout switch `SELFCHECK_NAME_REQUIRED`.
+  Selbst-Check body"; rollout switch `SELFCHECK_NAME_REQUIRED`. + `salutation` (ms / mr / none, required),
+  rollout switch `SELFCHECK_SALUTATION_REQUIRED` (README "Selbst-Check", Salutation).
 
 ### One-time Mautic setup (DEPRECATED, only for sites on the Mautic sink)
 
@@ -463,7 +464,7 @@ the report PDF / rendered images), operator notifications. No second SMTP code a
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/selfcheck` | `{email, name, phone?, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company?, company_website}`. `name` / `phone`: see below. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
+| `POST /api/selfcheck` | `{email, salutation, name, phone?, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company?, company_website}`. `name` / `phone`: see below. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
 | `GET /api/selfcheck/confirm?token=` | DOI mail link, read-only: confirmation page with a "Bestätigen" button (API.md "DOI mail links"). |
 | `POST /api/selfcheck/confirm` | The click (form field `token`), single-use. Result mail (pick `mail`), then the outbox: Migration Radar via the subscriber sink (pick `radar`, not blacklisted), `crm.lead` (picks `mail` / `call`; Radar alone = no lead), notification to `SELFCHECK_NOTIFY_TO` (always: quote request, call yes/no, answers, CRM lead id). 303 to `/{lang}/selbst-check?bestaetigt=1` (misconfigured: `=fehler`). Optional field `company` names the lead. |
 | `POST /api/selfcheck/event` | `{event: started|completed|exited_early|submitted, lang}` -> 204. Stores day + event + lang only; global rate-limit key (IP never read), access-log lines dropped. |
@@ -485,6 +486,26 @@ Name + phone (owner request 2026-11-09, db-patches/0010, tests T-SC-160..199):
   website does not send `name` yet; a missing name is accepted, a blank / invalid one never), 2) deploy
   the website, 3) set `true` (`.env`, `scripts/deploy.py --secret`, restart). Same for the `/api/lead`
   alias `kind: selfcheck`; other kinds and LUDO unchanged.
+
+Salutation (owner request 2026-11-09, db-patches/0012, tests T-SC-200..229 + T-SAL cases):
+
+- `salutation`: `ms` | `mr` | `none`, as STATED by the person (website "Anrede": Frau / Herr / Keine Angabe,
+  required choice, no preselection). Never inferred from the name. Unknown value -> 422.
+- Stored in `selfcheck_submission.salutation` (same retention). Missing while
+  `SELFCHECK_SALUTATION_REQUIRED=false` -> stored `none`; rows of before 0012: NULL (= none).
+- Result mail greeting (contact's language, plain text literal, HTML part escaped; DOI mail unchanged, no name):
+  de `ms` "Sehr geehrte Frau {Nachname}," / `mr` "Sehr geehrter Herr {Nachname}," / `none` "Guten Tag {Name},";
+  en `ms` "Dear Ms {Last name}," / `mr` "Dear Mr {Last name}," / `none` "Hello {Name}," (as before).
+  Surname (`selfcheck_api.surname`) = last whitespace token, lower-case particles before it kept (von, van,
+  de, zu, ...), leading academic titles kept (Prof. / Dr. / Dr.-Ing. / h.c.): "Prof. Dr. Max Mustermann" ->
+  "Sehr geehrter Herr Prof. Dr. Mustermann". Single token = as is.
+- `crm.lead.title`: `ms` -> `base.res_partner_title_madam`, `mr` -> `base.res_partner_title_mister`
+  (ids via read-only `ir.model.data` search, cached; never created; missing -> no title + warning).
+  Operator mail + lead description: "Salutation: Ms / Mr / not given" (English).
+- `/api/lead` kinds with a name (contact, inquiry, webinar, checkout): `salutation` optional, same enum ->
+  title + "Salutation:" line when sent.
+- Rollout switch `SELFCHECK_SALUTATION_REQUIRED` (default `true`): same order as the name: mauxy with
+  `false`, then the website, then `true`.
 
 Result mail (owner request 2026-11-09, "brand beautified"): `multipart/alternative`, the plain text unchanged
 as the fallback, plus a branded HTML part from the same engine values (`mail_html.selfcheck_result`): greeting
@@ -550,7 +571,8 @@ results); submissions are deleted after `LEAD_RETENTION_DAYS` (30), unconfirmed 
   HTML-escaped: submitted content, Selbst-Check answers + result text from the shared rules engine,
   what was requested, UTM line, marker), `source_id` / `medium_id` / `campaign_id` (existing UTM records
   by name: `ODOO_UTM_SOURCE`, `ODOO_UTM_MEDIUM`, campaign = kind; missing -> left empty, warning),
-  optional `team_id`, `tag_ids`. Exactly one active `res.partner` with that e-mail -> `partner_id`
+  optional `team_id`, `tag_ids`, `title` (stated salutation ms / mr -> standard res.partner.title by
+  xml id; lead field only, also with a linked partner). Exactly one active `res.partner` with that e-mail -> `partner_id`
   (+ `contact_name`); then NO `email_from` / `phone` (crm.lead's inverse would write them onto the
   partner). Otherwise `contact_name`, `partner_name`, `email_from`, `phone`.
 - `crm.lead.message_subscribe` (Ashant's partner) only if Odoo did not already auto-follow him.
@@ -565,7 +587,8 @@ results); submissions are deleted after `LEAD_RETENTION_DAYS` (30), unconfirmed 
 
 1. Group `Website Bot (mauxy)` (Settings > Technical > Groups), no implied groups. Access rights:
    `res.partner` read; `res.users` read (default); `crm.lead` read + create + write; `utm.source`,
-   `utm.medium`, `utm.campaign` read; `mail.blacklist` read; `mailing.list` read;
+   `utm.medium`, `utm.campaign` read; `ir.model.data` + `res.partner.title` read (Odoo default for
+   internal users; salutation -> title); `mail.blacklist` read; `mailing.list` read;
    `mailing.contact` read + create; `mailing.subscription` read + create + write. No unlink anywhere.
 2. Record rules for the group: `crm.lead` read + write `[('create_uid', '=', user.id)]` (only its own
    leads; write is needed by Odoo's message_subscribe, mauxy never calls write on leads);

@@ -161,7 +161,7 @@ COMPLETE = {"system": ["ecc"], "why": ["eol"], "s4": "no", "when": "12"}
 def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo):
     payload = {"kind": "selfcheck", "email": "bob@example.com", "lang": "de", "picks": ["mail", "call", "radar"],
                "answers": COMPLETE, "rules_version": "x", "consent": True, "company": "Muster GmbH",
-               "name": "Bob Beispiel", "phone": "+49 (0)30 / 123-45"}
+               "salutation": "none", "name": "Bob Beispiel", "phone": "+49 (0)30 / 123-45"}
     assert client.post("/api/lead", headers=ORIGIN, json=payload).json() == {"status": "pending_confirmation"}
     assert odoo.calls == []
     r = click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
@@ -184,7 +184,7 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
 def test_t_lead_035_radar_only_is_no_lead(client, outbox, odoo):
     client.post("/api/selfcheck", headers=ORIGIN, json={"email": "bob@example.com", "lang": "de", "picks": ["radar"],
                                                         "answers": {}, "rules_version": "x", "consent": True,
-                                                        "name": "Bob Beispiel"})
+                                                        "salutation": "none", "name": "Bob Beispiel"})
     click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
     drain(client)
     assert odoo.leads() == [] and len(odoo.db["mailing.subscription"]) == 1
@@ -377,7 +377,7 @@ def test_t_lead_035_selfcheck_lead_title_short_with_several_systems(client, outb
     """Title shows the first system + count of the others; the description keeps the full list."""
     payload = {"kind": "selfcheck", "email": "eve@example.com", "lang": "de", "picks": ["mail"],
                "answers": {**COMPLETE, "system": ["ecc", "other", "excel"]}, "rules_version": "x", "consent": True,
-               "name": "Eve Beispiel"}
+               "salutation": "none", "name": "Eve Beispiel"}
     assert client.post("/api/lead", headers=ORIGIN, json=payload).json() == {"status": "pending_confirmation"}
     click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
     drain(client)

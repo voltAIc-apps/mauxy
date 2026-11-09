@@ -1,8 +1,9 @@
 {
   "suite": "POST /api/selfcheck validation (flywheel SPEC-020)",
-  "description": "Each case patches the valid base payload (set / delete keys) and sends it with the given Origin. expect_status is the HTTP status; expect_mail whether a DOI mail goes out; expect_row whether a submission is stored. Optional: flag (SELFCHECK_NAME_REQUIRED for this case, default true) and expect_stored (columns of the stored row, after cleaning). String values {xN} are expanded to N times x. T-SC-160..183: name / phone (owner request 2026-11-09, db-patches/0010).",
+  "description": "Each case patches the valid base payload (set / delete keys) and sends it with the given Origin. expect_status is the HTTP status; expect_mail whether a DOI mail goes out; expect_row whether a submission is stored. Optional: flag (SELFCHECK_NAME_REQUIRED for this case, default true) and expect_stored (columns of the stored row, after cleaning). String values {xN} are expanded to N times x. T-SC-160..183: name / phone (owner request 2026-11-09, db-patches/0010). T-SC-200..213: salutation (db-patches/0012); salutation_flag = SELFCHECK_SALUTATION_REQUIRED for this case (default true).",
   "base": {
     "email": "bob@example.com",
+    "salutation": "none",
     "name": "Bob Beispiel",
     "lang": "de",
     "picks": ["mail", "call", "radar"],
@@ -51,6 +52,20 @@
     { "id": "T-SC-180", "name": "phone without any digit", "set": { "phone": "+()/-" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
     { "id": "T-SC-181", "name": "phone with an inner line break", "set": { "phone": "030\n123" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
     { "id": "T-SC-182", "name": "phone trimmed", "set": { "phone": " 030 123 " }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "phone": "030 123" } },
-    { "id": "T-SC-183", "name": "invalid phone refused even with SELFCHECK_NAME_REQUIRED off and no name", "set": { "phone": "x" }, "delete": ["name"], "flag": false, "expect_status": 422, "expect_mail": false, "expect_row": false }
+    { "id": "T-SC-183", "name": "invalid phone refused even with SELFCHECK_NAME_REQUIRED off and no name", "set": { "phone": "x" }, "delete": ["name"], "flag": false, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-200", "name": "salutation ms", "set": { "salutation": "ms" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "salutation": "ms" } },
+    { "id": "T-SC-201", "name": "salutation mr", "set": { "salutation": "mr" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "salutation": "mr" } },
+    { "id": "T-SC-202", "name": "salutation none (Keine Angabe)", "set": { "salutation": "none" }, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "salutation": "none" } },
+    { "id": "T-SC-203", "name": "salutation missing, flag on", "set": {}, "delete": ["salutation"], "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-204", "name": "salutation missing, flag off: stored as none", "set": {}, "delete": ["salutation"], "salutation_flag": false, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "salutation": "none" } },
+    { "id": "T-SC-205", "name": "salutation null, flag on", "set": { "salutation": null }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-206", "name": "salutation null, flag off: stored as none", "set": { "salutation": null }, "salutation_flag": false, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "salutation": "none" } },
+    { "id": "T-SC-207", "name": "salutation unknown value", "set": { "salutation": "mrs" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-208", "name": "salutation upper case (enum is exact)", "set": { "salutation": "MS" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-209", "name": "salutation empty string", "set": { "salutation": "" }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-210", "name": "salutation unknown value refused even with the flag off", "set": { "salutation": "divers" }, "salutation_flag": false, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-211", "name": "salutation as a number", "set": { "salutation": 1 }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-212", "name": "salutation as a list", "set": { "salutation": ["ms"] }, "expect_status": 422, "expect_mail": false, "expect_row": false },
+    { "id": "T-SC-213", "name": "old website: no salutation, no name, both flags off", "set": {}, "delete": ["salutation", "name"], "flag": false, "salutation_flag": false, "expect_status": 200, "expect_mail": true, "expect_row": true, "expect_stored": { "name": null, "salutation": "none" } }
   ]
 }

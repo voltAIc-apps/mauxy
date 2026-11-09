@@ -1,0 +1,53 @@
+{
+  "suite": "Salutation (owner request 2026-11-09, db-patches/0012): greeting of the result mail and crm.lead.title",
+  "description": "greet: selfcheck_api.greet(text, person, lang, salutation). Unless 'text' is given, text = the vendored neutral opening of lang + '\\n\\nREST' and the expected result = expect + '\\n\\nREST' (plain text part: literal). person null = no name. title: sinks.OdooLeadSink.build_vals with the fake Odoo seed (res.partner.title 3 = base.res_partner_title_madam, 4 = base.res_partner_title_mister); expect_title null = no 'title' key in the vals.",
+  "greet": [
+    {"id": "T-SAL-001", "name": "de ms", "lang": "de", "salutation": "ms", "person": "Anna Muster", "expect": "Sehr geehrte Frau Muster,"},
+    {"id": "T-SAL-002", "name": "de mr", "lang": "de", "salutation": "mr", "person": "Max Mustermann", "expect": "Sehr geehrter Herr Mustermann,"},
+    {"id": "T-SAL-003", "name": "de none = full name (as before)", "lang": "de", "salutation": "none", "person": "Anna Muster", "expect": "Guten Tag Anna Muster,"},
+    {"id": "T-SAL-004", "name": "de null (row of before 0012) = none", "lang": "de", "salutation": null, "person": "Anna Muster", "expect": "Guten Tag Anna Muster,"},
+    {"id": "T-SAL-005", "name": "de unknown value = none", "lang": "de", "salutation": "x", "person": "Anna Muster", "expect": "Guten Tag Anna Muster,"},
+    {"id": "T-SAL-006", "name": "de ms with Dr.", "lang": "de", "salutation": "ms", "person": "Dr. Anna Muster", "expect": "Sehr geehrte Frau Dr. Muster,"},
+    {"id": "T-SAL-007", "name": "de mr with Prof. Dr.", "lang": "de", "salutation": "mr", "person": "Prof. Dr. Max Mustermann", "expect": "Sehr geehrter Herr Prof. Dr. Mustermann,"},
+    {"id": "T-SAL-008", "name": "de mr with Dr.-Ing.", "lang": "de", "salutation": "mr", "person": "Dr.-Ing. Max Mustermann", "expect": "Sehr geehrter Herr Dr.-Ing. Mustermann,"},
+    {"id": "T-SAL-009", "name": "de mr with Prof. Dr. h.c.", "lang": "de", "salutation": "mr", "person": "Prof. Dr. h.c. Max Mustermann", "expect": "Sehr geehrter Herr Prof. Dr. h.c. Mustermann,"},
+    {"id": "T-SAL-010", "name": "de title without dot", "lang": "de", "salutation": "ms", "person": "Dr Anna Muster", "expect": "Sehr geehrte Frau Dr Muster,"},
+    {"id": "T-SAL-011", "name": "de title lower case", "lang": "de", "salutation": "ms", "person": "dr. anna muster", "expect": "Sehr geehrte Frau dr. muster,"},
+    {"id": "T-SAL-012", "name": "de title + surname only", "lang": "de", "salutation": "mr", "person": "Dr. Muster", "expect": "Sehr geehrter Herr Dr. Muster,"},
+    {"id": "T-SAL-013", "name": "de first name starting with Dr is no title", "lang": "de", "salutation": "ms", "person": "Drea Muster", "expect": "Sehr geehrte Frau Muster,"},
+    {"id": "T-SAL-014", "name": "de several first names", "lang": "de", "salutation": "ms", "person": "Anna Maria Muster", "expect": "Sehr geehrte Frau Muster,"},
+    {"id": "T-SAL-015", "name": "de double surname with hyphen", "lang": "de", "salutation": "ms", "person": "Anna Muster-Schmidt", "expect": "Sehr geehrte Frau Muster-Schmidt,"},
+    {"id": "T-SAL-016", "name": "de particle von kept", "lang": "de", "salutation": "ms", "person": "Anna von Muster", "expect": "Sehr geehrte Frau von Muster,"},
+    {"id": "T-SAL-017", "name": "de particles van der kept", "lang": "de", "salutation": "mr", "person": "Ludwig van der Berg", "expect": "Sehr geehrter Herr van der Berg,"},
+    {"id": "T-SAL-018", "name": "de title + particle", "lang": "de", "salutation": "mr", "person": "Dr. Hans von Muster", "expect": "Sehr geehrter Herr Dr. von Muster,"},
+    {"id": "T-SAL-019", "name": "de capitalised particle = part of the first names (last token only)", "lang": "de", "salutation": "mr", "person": "Hans Von Muster", "expect": "Sehr geehrter Herr Muster,"},
+    {"id": "T-SAL-020", "name": "de single token used as is", "lang": "de", "salutation": "ms", "person": "Muster", "expect": "Sehr geehrte Frau Muster,"},
+    {"id": "T-SAL-021", "name": "de single title token used as is", "lang": "de", "salutation": "mr", "person": "Dr.", "expect": "Sehr geehrter Herr Dr.,"},
+    {"id": "T-SAL-022", "name": "de umlaut + apostrophe", "lang": "de", "salutation": "mr", "person": "Jörg O'Brien-Müller", "expect": "Sehr geehrter Herr O'Brien-Müller,"},
+    {"id": "T-SAL-023", "name": "de none keeps the title in the full name", "lang": "de", "salutation": "none", "person": "Dr. Anna Muster", "expect": "Guten Tag Dr. Anna Muster,"},
+    {"id": "T-SAL-024", "name": "de plain text literal: markup not escaped", "lang": "de", "salutation": "mr", "person": "Max <b>Muster</b>", "expect": "Sehr geehrter Herr <b>Muster</b>,"},
+    {"id": "T-SAL-025", "name": "de plain text literal: ampersand + quotes", "lang": "de", "salutation": "ms", "person": "Anna \"O'Muster&Co\"", "expect": "Sehr geehrte Frau \"O'Muster&Co\","},
+    {"id": "T-SAL-026", "name": "en ms", "lang": "en", "salutation": "ms", "person": "Anna Muster", "expect": "Dear Ms Muster,"},
+    {"id": "T-SAL-027", "name": "en mr", "lang": "en", "salutation": "mr", "person": "Max Mustermann", "expect": "Dear Mr Mustermann,"},
+    {"id": "T-SAL-028", "name": "en none = full name (as before)", "lang": "en", "salutation": "none", "person": "Anna Muster", "expect": "Hello Anna Muster,"},
+    {"id": "T-SAL-029", "name": "en null = none", "lang": "en", "salutation": null, "person": "Anna Muster", "expect": "Hello Anna Muster,"},
+    {"id": "T-SAL-030", "name": "en ms with Dr.", "lang": "en", "salutation": "ms", "person": "Dr. Anna Muster", "expect": "Dear Ms Dr. Muster,"},
+    {"id": "T-SAL-031", "name": "en mr with Prof. Dr.", "lang": "en", "salutation": "mr", "person": "Prof. Dr. Max Mustermann", "expect": "Dear Mr Prof. Dr. Mustermann,"},
+    {"id": "T-SAL-032", "name": "en single token", "lang": "en", "salutation": "mr", "person": "Muster", "expect": "Dear Mr Muster,"},
+    {"id": "T-SAL-033", "name": "en particle", "lang": "en", "salutation": "ms", "person": "Anna van Dijk", "expect": "Dear Ms van Dijk,"},
+    {"id": "T-SAL-034", "name": "en plain text literal", "lang": "en", "salutation": "ms", "person": "Ann <i>Smith</i>", "expect": "Dear Ms <i>Smith</i>,"}
+  ],
+  "greet_unchanged": [
+    {"id": "T-SAL-040", "name": "no name: neutral opening kept (de, ms)", "lang": "de", "salutation": "ms", "person": null, "text": "Guten Tag,\n\ndanke", "expect_text": "Guten Tag,\n\ndanke"},
+    {"id": "T-SAL-041", "name": "empty name: neutral opening kept (en, mr)", "lang": "en", "salutation": "mr", "person": "", "text": "Hello,\n\nthank you", "expect_text": "Hello,\n\nthank you"},
+    {"id": "T-SAL-042", "name": "foreign opening: unchanged", "lang": "en", "salutation": "ms", "person": "Anna Muster", "text": "Hi there", "expect_text": "Hi there"},
+    {"id": "T-SAL-043", "name": "only the opening is replaced, rest kept", "lang": "de", "salutation": "mr", "person": "Max Muster", "text": "Guten Tag,\n\nGuten Tag, danke", "expect_text": "Sehr geehrter Herr Muster,\n\nGuten Tag, danke"}
+  ],
+  "title": [
+    {"id": "T-SAL-050", "name": "ms -> Madam", "salutation": "ms", "expect_title": 3},
+    {"id": "T-SAL-051", "name": "mr -> Mister", "salutation": "mr", "expect_title": 4},
+    {"id": "T-SAL-052", "name": "none -> no title", "salutation": "none", "expect_title": null},
+    {"id": "T-SAL-053", "name": "missing (row of before 0012) -> no title", "salutation": null, "expect_title": null},
+    {"id": "T-SAL-054", "name": "unknown value -> no title", "salutation": "x", "expect_title": null}
+  ]
+}

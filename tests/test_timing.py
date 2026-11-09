@@ -69,7 +69,7 @@ def test_t_sec_017a_subscribe_identical_and_not_waiting(respx_mock, client, outb
 @respx.mock(assert_all_called=False)
 def test_t_sec_017b_selfcheck_identical_and_not_waiting(respx_mock, client, outbox, slow_mailer):
     body = {"lang": "de", "picks": ["mail"], "answers": {"system": ["ecc"]}, "rules_version": "x", "consent": True,
-            "name": "Dora Beispiel"}
+            "salutation": "none", "name": "Dora Beispiel"}
     first, t1 = _timed(client, "/api/selfcheck", {**body, "email": "dora@example.com"}, ORIGIN)
     client.portal.call(jobs.drain)
     # throttled address (3 earlier requests) must look exactly like a fresh one
