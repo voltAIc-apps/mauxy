@@ -335,7 +335,7 @@ def test_t_br_055_lead_and_selfcheck_per_brand(client, outbox, odoo, monkeypatch
     assert r.headers["location"] == "https://re-cloud.test/de/anfrage/bestaetigt?art=contact"
     drain(client)
     (lead,) = odoo.leads()
-    assert "Quelle: re-cloud.test / Website / Kampagne contact" in lead["description"]
+    assert "Source: re-cloud.test / Website / campaign contact" in lead["description"]
     assert q(client, "SELECT site FROM lead_submission")[0]["site"] == "re-cloud"
 
     assert client.post("/api/selfcheck", headers=origin, json={**copy.deepcopy(SC_BASE), "email": "sam@example.com"}).status_code == 200

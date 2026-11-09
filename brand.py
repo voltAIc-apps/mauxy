@@ -158,6 +158,15 @@ def lead_site(row_site: Optional[str]) -> str:
     return row_site or DEFAULT_SITE
 
 
+def locale_for(site: Optional[str], lang: Optional[str] = None) -> str:
+    """Language of a text TO A CONTACT (owner decision 2026-11-09): the submission's own locale,
+    else the site's default_locale, else 'de' (sites without a profile, as before 0006)."""
+    if lang in LOCALES:
+        return lang
+    b = get(site)
+    return b.default_locale if b and b.default_locale in LOCALES else "de"
+
+
 # ------------------------------------------------------------------------------- render helpers
 
 

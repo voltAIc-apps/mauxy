@@ -339,4 +339,4 @@ the per-site key / quiz.
 - Transition: while `SELFCHECK_NAME_REQUIRED=false` a request WITHOUT `name` is accepted (old website);
   `true` (default) after the website ships the field. Order: mauxy (false) -> website -> flip to true.
 - Effect after the DOI click: `crm.lead.contact_name` / `phone`, result mail greeting by name (Sie-form),
-  operator mail shows Name + Telefon. README "Selbst-Check".
+  operator mail shows Name + Phone (operator texts English). README "Selbst-Check".

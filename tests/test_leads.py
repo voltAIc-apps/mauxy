@@ -111,13 +111,13 @@ def test_t_lead_031_contact_creates_one_lead(client, outbox, odoo):
     r = submit_and_confirm(client, outbox, base("contact", newsletter=True, page_url="https://site.test/de/contact"))
     assert r.status_code == 303 and r.headers["location"] == "https://site.test/de/anfrage/bestaetigt?art=contact"
     (lead,) = odoo.leads()
-    assert lead["name"] == "Website: Kontaktanfrage – Muster GmbH"
+    assert lead["name"] == "Website: Contact request – Muster GmbH"
     assert lead["type"] == "lead" and lead["user_id"] == 7 and lead["message_partner_ids"] == [70]
     assert (lead["source_id"], lead["medium_id"], lead["campaign_id"]) == (11, 12, 21)
     assert (lead["email_from"], lead["contact_name"], lead["partner_name"], lead["phone"]) == (
         "bob@example.com", "Bob Muster", "Muster GmbH", "+49 30 1234567")
     assert "Wir planen den Wechsel von SAP ECC.<br>Bitte um Rückruf." in lead["description"]
-    assert "Newsletter: ja (bestätigt)" in lead["description"]
+    assert "Newsletter: yes (confirmed)" in lead["description"]
     (contact,) = odoo.db["mailing.contact"].values()
     assert contact["email"] == "bob@example.com" and contact["name"] == "Bob Muster"
     sync = rows(client, "SELECT * FROM lead_sync")[0]
@@ -137,11 +137,11 @@ def test_t_lead_032_single_use(client, outbox, odoo):
 
 
 @pytest.mark.parametrize("kind,title,campaign,snippets", [
-    ("inquiry", "Website: Anfrage Odoo Datalake – Muster GmbH", 22, ["Anfrage zu app „Odoo Datalake“ (odoo-datalake)"]),
-    ("webinar", "Website: Webinar KI in Odoo {d} – Muster GmbH", 23, ["Webinar-Anmeldung: „KI in Odoo“ (odoo-ki), Termin {d}"]),
-    ("checkout", "Website: Bestellung Invoice OCR – Muster GmbH", 24,
-     ["Bestellreferenz ORD-ABC123", "Summe netto laut Website: 1.490,00 €", "Rechnungsadresse: Hauptstr. 1, 10115 Berlin, DE",
-      "USt-IdNr.: DE123456789", "Zusatzleistungen: Installation", "Paket: Starter"]),
+    ("inquiry", "Website: Inquiry Odoo Datalake – Muster GmbH", 22, ["Inquiry about app “Odoo Datalake” (odoo-datalake)"]),
+    ("webinar", "Website: Webinar KI in Odoo {d} – Muster GmbH", 23, ["Webinar registration: “KI in Odoo” (odoo-ki), date {d}"]),
+    ("checkout", "Website: Order Invoice OCR – Muster GmbH", 24,
+     ["order reference ORD-ABC123", "Net total per website: EUR 1,490.00", "Billing address: Hauptstr. 1, 10115 Berlin, DE",
+      "VAT ID: DE123456789", "Additional services: Installation", "Bundle: Starter"]),
 ])
 def test_t_lead_033_every_kind(kind, title, campaign, snippets, client, outbox, odoo):
     payload = base(kind, company="Muster GmbH") if kind == "inquiry" else base(kind)
@@ -171,12 +171,12 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
     assert lead["name"] == "Self-Check: SAP ECC / R/3 – Muster GmbH"
     assert lead["campaign_id"] == 20 and lead["partner_name"] == "Muster GmbH"
     assert lead["contact_name"] == "Bob Beispiel" and lead["phone"] == "+49 (0)30 / 123-45"
-    assert "Angefragt: Ergebnis und Richtangebot per Mail; 30 Minuten Kennenlernen (Meetly)" in lead["description"]
-    assert "Ihre Antworten" in lead["description"]  # answers summary from the shared rules engine
+    assert "Requested: result and indicative quote by mail; 30-minute introduction (Meetly)" in lead["description"]
+    assert "Your answers" in lead["description"] and "Ihre Antworten" not in lead["description"]  # answers summary from the shared rules engine
     (sub,) = odoo.db["mailing.subscription"].values()
     assert sub["list_id"] == 2
     note = next(m for m in outbox if m["to"] == "owner@site.test")
-    assert f"CRM-Lead (erp.wapsol): #{lead['id']}" in note["body"] and "Migration Radar: ok" in note["body"]
+    assert f"CRM lead (erp.wapsol): #{lead['id']}" in note["body"] and "Migration Radar: ok" in note["body"]
     row = rows(client, "SELECT radar_result, notify_sent, company FROM selfcheck_submission")[0]
     assert row == {"radar_result": "ok", "notify_sent": 1, "company": "Muster GmbH"}
 
@@ -188,7 +188,7 @@ def test_t_lead_035_radar_only_is_no_lead(client, outbox, odoo):
     click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
     drain(client)
     assert odoo.leads() == [] and len(odoo.db["mailing.subscription"]) == 1
-    assert "CRM-Lead: keiner (nur Radar)" in outbox[-1]["body"]
+    assert "CRM lead: none (Radar only)" in outbox[-1]["body"]
 
 
 def test_t_lead_036_transient_failures_are_retried(client, outbox, odoo):
@@ -214,8 +214,9 @@ def test_t_lead_038_permanent_failure_mails_ashant_and_can_be_requeued(client, o
     sync = rows(client, "SELECT * FROM lead_sync")[0]
     assert sync["state"] == "failed" and sync["failure_mailed"] == 1 and sync["attempts"] == 1
     mail = outbox[-1]
-    assert mail["to"] == "owner@site.test" and "NICHT im CRM" in mail["subject"] and mail["reply_to"] == "bob@example.com"
-    assert "Website: Kontaktanfrage – Muster GmbH" in mail["body"] and "Bitte um Rückruf" in mail["body"]
+    assert mail["to"] == "owner@site.test" and "NOT in CRM" in mail["subject"] and mail["reply_to"] == "bob@example.com"
+    assert "Website: Contact request – Muster GmbH" in mail["body"] and "Bitte um Rückruf" in mail["body"]
+    assert "could not be delivered to erp.wapsol" in mail["body"] and "Company: Muster GmbH" in mail["body"]
     assert "AccessError" in mail["body"]
     assert client.post(f"/api/lead/sync/{sync['id']}/retry").status_code == 401
     assert client.post(f"/api/lead/sync/{sync['id']}/retry", headers=ADMIN).json() == {"requeued": True}
@@ -230,7 +231,7 @@ def test_t_lead_039_retries_exhausted(client, outbox, odoo):
     submit_and_confirm(client, outbox, base("inquiry"))
     sync = rows(client, "SELECT state, attempts, last_error FROM lead_sync")[0]
     assert sync["state"] == "failed" and sync["attempts"] == lead_sync.MAX_ATTEMPTS and "retries exhausted" in sync["last_error"]
-    assert "NICHT im CRM" in outbox[-1]["subject"]
+    assert "NOT in CRM" in outbox[-1]["subject"]
 
 
 def test_t_lead_040_resume_after_restart(client, outbox, odoo):
@@ -288,7 +289,7 @@ def test_t_lead_043_no_crm_sink_mails_the_lead(client, outbox, odoo, monkeypatch
     submit_and_confirm(client, outbox, base("webinar"))
     assert odoo.leads() == [] and not [c for c in odoo.calls if c[0] == "crm.lead"]
     note = outbox[-1]
-    assert note["to"] == "owner@site.test" and note["subject"].startswith("Website-Lead (nicht im CRM): Website: Webinar KI in Odoo")
+    assert note["to"] == "owner@site.test" and note["subject"].startswith("Website lead (not in CRM): Website: Webinar KI in Odoo")
 
 
 def test_t_lead_044_newsletter_with_odoo_sink(client, outbox, odoo):
@@ -382,4 +383,4 @@ def test_t_lead_035_selfcheck_lead_title_short_with_several_systems(client, outb
     drain(client)
     (lead,) = odoo.leads()
     assert lead["name"] == "Self-Check: SAP ECC / R/3 +2 – Eve Beispiel"
-    assert "Systeme: SAP ECC / R/3 + " in lead["description"]
+    assert "Systems: SAP ECC / R/3 + " in lead["description"]

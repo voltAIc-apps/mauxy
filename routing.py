@@ -92,6 +92,7 @@ import aiosqlite
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
+import brand
 import jobs
 import lead_sync
 import mailer
@@ -513,7 +514,8 @@ async def _execute(db: aiosqlite.Connection, row: dict) -> str:
         status = await webhooks.deliver(params, idem_key=row["idem_key"], action=action, site=site,
                                         data=data, occurred_at=row["created_at"])
         return f"delivered ({status})"
-    common = dict(lang=data.get("locale") or data.get("lang") or "de", source=data.get("source") or action,
+    common = dict(lang=brand.locale_for(site, data.get("locale") or data.get("lang")),  # unknown -> site default
+                  source=data.get("source") or action,
                   page_url=data.get("page_url") or "", name=data.get("name"), company=data.get("company"))
     if sink == "odoo":
         s = sinks.subscriber_sink("odoo")
@@ -606,15 +608,16 @@ async def mail_failure(row: dict) -> bool:
         logger.error("LEAD_NOTIFY_TO not set -- failed delivery %s reaches nobody", row["id"])
         return False
     data = json.loads(row["payload"] or "{}")
-    subject = f"mauxy: Weiterleitung FEHLGESCHLAGEN ({row['site']} / {row['action']} -> {row['sink']})"
+    # operator mail: English (owner decision 2026-11-09, texts for the owner are English)
+    subject = f"mauxy: delivery FAILED ({row['site']} / {row['action']} -> {row['sink']})"
     lines = [
-        "Eine Weiterleitung an ein Zielsystem ist endgültig fehlgeschlagen.",
-        f"Site: {row['site']}", f"Aktion: {row['action']}", f"Ziel: {_target_label(row)}",
-        f"Fehler: {row['last_error']}", f"Versuche: {row['attempts']}",
-        f"E-Mail: {data.get('email', '-')}",
+        "A delivery to a target system failed permanently.",
+        f"Site: {row['site']}", f"Action: {row['action']}", f"Target: {_target_label(row)}",
+        f"Error: {row['last_error']}", f"Attempts: {row['attempts']}",
+        f"E-mail: {data.get('email', '-')}",
         "",
-        "Bitte manuell nachtragen" + (" (Abmeldung: rechtlich nötig)" if row["action"] == "unsubscribe" else "")
-        + f" oder nach Behebung erneut anstoßen: POST /api/admin/deliveries/{row['id']}/retry (Admin-Key).",
+        "Please apply it by hand" + (" (unsubscribe: legally required)" if row["action"] == "unsubscribe" else "")
+        + f" or re-queue it after fixing the cause: POST /api/admin/deliveries/{row['id']}/retry (admin key).",
     ]
     return await mailer.send(lead_sync.NOTIFY_TO, subject, "\n".join(lines), audience="internal",
                              key=f"route-failed-{row['id']}-{row['attempts']}")

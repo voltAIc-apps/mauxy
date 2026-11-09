@@ -226,58 +226,60 @@ NL_NOTE = {"de": " und den Newsletter bestellt", "en": " and subscribed to the n
 
 
 def _fmt_date(iso: str) -> str:
-    """'2026-12-03T09:00:00Z' -> '03.12.2026 10:00 Uhr' (German time: audience and CRM users)."""
+    """'2026-12-03T09:00:00Z' -> '2026-12-03 10:00 CET' (Berlin time, where the webinars run;
+    ISO order: unambiguous for the owner, who reads the CRM in English)."""
     dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/Berlin"))
-    return dt.strftime("%d.%m.%Y %H:%M Uhr")
+    return dt.strftime("%Y-%m-%d %H:%M %Z")
 
 
 def _eur(x: float) -> str:
-    return f"{x:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"EUR {x:,.2f}"
 
 
 def lead_for(row, ref: str) -> dict:
-    """crm.lead content (sink-agnostic) from a confirmed submission. German (internal)."""
+    """crm.lead content (sink-agnostic) from a confirmed submission. English: internal text for the
+    owner (decision 2026-11-09); the contact's own language is the `lang` field / line."""
     kind, d = row["kind"], json.loads(row["data"])
     who = d.get("company") or d.get("name") or row["email"]
     lines: list[str]
     if kind == "contact":
-        title = f"Website: Kontaktanfrage – {who}"
-        head = "Kontaktanfrage über das Kontaktformular"
-        body = ["Nachricht:", d["message"]]
+        title = f"Website: Contact request – {who}"
+        head = "Contact request via the contact form"
+        body = ["Message:", d["message"]]
     elif kind == "inquiry":
-        title = f"Website: Anfrage {d['subject_title']} – {who}"
-        head = f"Anfrage zu {d['subject_type']} „{d['subject_title']}“ ({d['subject_id']})"
-        body = ["Nachricht:", d["message"]] if d.get("message") else []
+        title = f"Website: Inquiry {d['subject_title']} – {who}"
+        head = f"Inquiry about {d['subject_type']} “{d['subject_title']}” ({d['subject_id']})"
+        body = ["Message:", d["message"]] if d.get("message") else []
     elif kind == "webinar":
         date = _fmt_date(d["date"])
         title = f"Website: Webinar {d['webinar_title']} {date[:10]} – {who}"
-        head = f"Webinar-Anmeldung: „{d['webinar_title']}“ ({d['webinar_id']}), Termin {date}"
+        head = f"Webinar registration: “{d['webinar_title']}” ({d['webinar_id']}), date {date}"
         body = []
     else:  # checkout
-        title = f"Website: Bestellung {d['product_title']} – {who}"
-        head = f"Bestellung im Website-Shop, Bestellreferenz {d['order_ref']} (Angaben laut Website, Preise ungeprüft)"
+        title = f"Website: Order {d['product_title']} – {who}"
+        head = f"Order in the website shop, order reference {d['order_ref']} (as submitted on the website, prices unchecked)"
         b = d["billing"]
-        body = [f"Produkt: {d['product_title']} ({d['product_id']})"]
+        body = [f"Product: {d['product_title']} ({d['product_id']})"]
         if d.get("bundle"):
-            body.append(f"Paket: {d['bundle']}")
+            body.append(f"Bundle: {d['bundle']}")
         if d.get("technology"):
-            body.append(f"Technologie: {d['technology']}")
+            body.append(f"Technology: {d['technology']}")
         if d.get("services"):
-            body.append("Zusatzleistungen: " + "; ".join(d["services"]))
-        body += [f"Summe netto laut Website: {_eur(d['price_net'])}",
-                 f"Rechnungsadresse: {b['street']}, {b['postal_code']} {b['city']}, {b['country']}",
-                 f"USt-IdNr.: {d.get('vat_id') or '-'}", "AGB akzeptiert: ja"]
-    lines = [f"{head}. Bestätigt per Double-Opt-in am {_fmt_date(row['confirmed_at'])} (Sprache {row['lang']}).", ""]
-    for label, key in (("Name", "name"), ("Firma", "company"), ("Telefon", "phone")):
+            body.append("Additional services: " + "; ".join(d["services"]))
+        body += [f"Net total per website: {_eur(d['price_net'])}",
+                 f"Billing address: {b['street']}, {b['postal_code']} {b['city']}, {b['country']}",
+                 f"VAT ID: {d.get('vat_id') or '-'}", "Terms accepted: yes"]
+    lines = [f"{head}. Confirmed by double opt-in on {_fmt_date(row['confirmed_at'])} (language {row['lang']}).", ""]
+    for label, key in (("Name", "name"), ("Company", "company"), ("Phone", "phone")):
         if d.get(key):
             lines.append(f"{label}: {d[key]}")
-    lines += [f"E-Mail: {row['email']}", f"Newsletter: {'ja (bestätigt)' if row['newsletter'] else 'nein'}"]
+    lines += [f"E-mail: {row['email']}", f"Newsletter: {'yes (confirmed)' if row['newsletter'] else 'no'}"]
     if row["page_url"]:
-        lines.append(f"Seite: {row['page_url']}")
+        lines.append(f"Page: {row['page_url']}")
     if body:
         lines += [""] + body
     site = brand.lead_site(row["site"])
-    lines += ["", f"Quelle: {brand.label(site, LEAD_WEBSITE_URL)} / Website / Kampagne {kind}", f"Referenz: {ref}"]
+    lines += ["", f"Source: {brand.label(site, LEAD_WEBSITE_URL)} / Website / campaign {kind}", f"Reference: {ref}"]
     return {"ref": ref, "kind": kind, "campaign": kind, "title": title[:200], "email": row["email"],
             "contact_name": d.get("name"), "partner_name": d.get("company"), "phone": d.get("phone"),
             "lang": row["lang"], "description": "\n".join(lines)}
@@ -288,7 +290,7 @@ async def finish(db: aiosqlite.Connection, sync: dict, outcome: str) -> None:
     the lead is mailed to LEAD_NOTIFY_TO instead of being created (nothing gets lost)."""
     if outcome == "done" and sync["lead_sink"] == "none" and sync["lead"] and lead_sync.NOTIFY_TO:
         lead = json.loads(sync["lead"])
-        await mailer.send(lead_sync.NOTIFY_TO, f"Website-Lead (nicht im CRM): {lead['title']}",
+        await mailer.send(lead_sync.NOTIFY_TO, f"Website lead (not in CRM): {lead['title']}",
                           lead_sync.lead_text(sync), reply_to=lead["email"], audience="internal",
                           key=f"lead-none-{sync['id']}")
 
@@ -305,8 +307,7 @@ def _origin_ok(request: Request) -> bool:
 
 def _target(site: Optional[str], lang: str, ok: bool, kind: str = "") -> str:
     """After the click: the site's explicit target > its website_url > LEAD_WEBSITE_URL (brand.py)."""
-    b = brand.get(site)
-    lang = lang if lang in ("de", "en") else (b.default_locale if b else "de")
+    lang = brand.locale_for(site, lang)  # unknown locale -> the site's default_locale
     if ok:
         return brand.redirect_url(site, "lead", lang, "confirmed", env_base=LEAD_WEBSITE_URL,
                                   path=f"/{lang}/anfrage/bestaetigt", params={"art": kind})
@@ -426,7 +427,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         """DOI link, step 1 READ-ONLY (mail scanners prefetch links): confirmation page with a
         "Bestätigen" button (POST). Invalid / expired / used: uniform neutral page."""
         if not _signer:
-            return _redirect("de", False)
+            return _redirect("", False, site=brand.DEFAULT_SITE)
         row = await _pending(request.app.state.db, token)
         if row is None:
             return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_signer, token)))
@@ -441,7 +442,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         """DOI step 2, the human click: claims the token atomically (single use), queues the
         delivery (crm.lead + newsletter if ticked), 303 to the website's confirmed page."""
         if not _signer:
-            return _redirect("de", False, status=303)
+            return _redirect("", False, status=303, site=brand.DEFAULT_SITE)
         if not confirm_page.same_origin(request):
             logger.warning("LEAD_CONFIRM_FOREIGN_ORIGIN")
             return confirm_page.neutral(403)

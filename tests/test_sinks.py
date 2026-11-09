@@ -18,7 +18,7 @@ import pytest
 import sinks
 from sinks import OdooLeadSink, OdooSubscriberSink, SinkPermanent
 
-LEAD = {"ref": "mauxy-abc123", "kind": "contact", "campaign": "contact", "title": "Website: Kontaktanfrage – Muster GmbH",
+LEAD = {"ref": "mauxy-abc123", "kind": "contact", "campaign": "contact", "title": "Website: Contact request – Muster GmbH",
         "email": "Bob@Example.com", "contact_name": "Bob Muster", "partner_name": "Muster GmbH", "phone": "+49 30 1234",
         "lang": "de", "description": "Zeile 1 <b>fett</b>\nZeile 2 & mehr"}
 
@@ -70,8 +70,8 @@ def test_t_sink_004_lead_vals(odoo, monkeypatch):
     assert lead["id"] == lead_id
     assert lead["type"] == "lead" and lead["user_id"] == 7 and lead["team_id"] == 5 and lead["tag_ids"] == [[6, 0, [3, 4]]]
     assert (lead["source_id"], lead["medium_id"], lead["campaign_id"]) == (11, 12, 21)
-    assert lead["name"] == "Website: Kontaktanfrage – Muster GmbH"
-    assert lead["description"] == "<p>Zeile 1 &lt;b&gt;fett&lt;/b&gt;<br>Zeile 2 &amp; mehr</p><p>Referenz: mauxy-abc123</p>"
+    assert lead["name"] == "Website: Contact request – Muster GmbH"
+    assert lead["description"] == "<p>Zeile 1 &lt;b&gt;fett&lt;/b&gt;<br>Zeile 2 &amp; mehr</p><p>Reference: mauxy-abc123</p>"
 
 
 def test_t_sink_005_missing_utm_is_omitted_never_created(odoo):

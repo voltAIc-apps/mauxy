@@ -224,16 +224,16 @@ async def _finish(db: aiosqlite.Connection, sync_id: int, outcome: str, *, attem
 
 
 def lead_text(row: dict) -> str:
-    """Everything needed to enter the lead by hand (failure mail, LEAD_SINK=none)."""
+    """Everything needed to enter the lead by hand (failure mail, LEAD_SINK=none). English (operator)."""
     lead = json.loads(row["lead"]) if row["lead"] else {}
     sub = json.loads(row["subscribe"]) if row["subscribe"] else {}
-    lines = [lead.get("title", "(kein Lead)"), ""]
-    for label, key in (("E-Mail", "email"), ("Name", "contact_name"), ("Firma", "partner_name"), ("Telefon", "phone"),
-                       ("Kampagne", "campaign")):
+    lines = [lead.get("title", "(no lead)"), ""]
+    for label, key in (("E-mail", "email"), ("Name", "contact_name"), ("Company", "partner_name"), ("Phone", "phone"),
+                       ("Campaign", "campaign")):
         if lead.get(key):
             lines.append(f"{label}: {lead[key]}")
     if sub.get("lists"):
-        lines.append(f"Listen (bestätigt): {', '.join(sub['lists'])} -> {row.get('sub_results') or '{}'}")
+        lines.append(f"Lists (confirmed): {', '.join(sub['lists'])} -> {row.get('sub_results') or '{}'}")
     lines += ["", lead.get("description", "")]
     return "\n".join(lines).strip()
 
@@ -242,12 +242,13 @@ async def mail_failure(row: dict) -> bool:
     if not NOTIFY_TO:
         logger.error("LEAD_NOTIFY_TO not set -- failed lead %s reaches nobody", row["id"])
         return False
-    subject = f"mauxy: Website-Lead NICHT im CRM ({row['origin']} #{row['origin_id']})"
+    # operator mail: English (owner decision 2026-11-09, texts for the owner are English)
+    subject = f"mauxy: website lead NOT in CRM ({row['origin']} #{row['origin_id']})"
     body = "\n".join([
-        "Die bestätigte Website-Anfrage konnte nicht nach erp.wapsol übertragen werden.",
-        f"Fehler: {row['last_error']}",
-        f"Versuche: {row['attempts']}. Bitte manuell anlegen oder nach Behebung erneut anstoßen:",
-        f"POST /api/lead/sync/{row['id']}/retry (Admin-Key).",
+        "The confirmed website request could not be delivered to erp.wapsol.",
+        f"Error: {row['last_error']}",
+        f"Attempts: {row['attempts']}. Please create it by hand, or re-queue it after fixing the cause:",
+        f"POST /api/lead/sync/{row['id']}/retry (admin key).",
         "",
         lead_text(row),
     ])

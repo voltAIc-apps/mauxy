@@ -188,7 +188,7 @@ class OdooLeadSink:
         team_id, tag_ids = o.get("team_id") or self.team_id, o.get("tag_ids") or self.tag_ids
         desc = lead["description"]
         if lead["ref"] not in desc:  # the retry search needs the marker in the description
-            desc += f"\n\nReferenz: {lead['ref']}"
+            desc += f"\n\nReference: {lead['ref']}"
         vals: dict = {
             "name": lead["title"][:200],
             "type": "lead",
