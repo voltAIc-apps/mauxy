@@ -340,7 +340,7 @@ def lead_for(row, ref: str) -> Optional[dict]:
     # short title: first system + count of the others (the full list is in the description)
     systems = picked[0] + (f" +{len(picked) - 1}" if len(picked) > 1 else "") if picked else ""
     who = row["company"] or row["name"] or row["email"]
-    title = f"Selbst-Check: {systems} – {who}" if systems else f"Selbst-Check – {who}"
+    title = f"Self-Check: {systems} – {who}" if systems else f"Self-Check – {who}"
     _, lines = _summary(row, "gewählt" if "radar" in picks else "nicht gewählt", None)
     wanted = [t for p, t in zip(("mail", "call"), ("Ergebnis und Richtangebot per Mail", "30 Minuten Kennenlernen (Meetly)")) if p in picks]
     lines.insert(2, "Angefragt: " + "; ".join(wanted))
