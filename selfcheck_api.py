@@ -56,6 +56,7 @@ import brand
 import confirm_page
 import jobs
 import lead_sync
+import mail_html
 import mailer
 from vendor.selfcheck import selfcheck as engine
 
@@ -266,7 +267,37 @@ def _row_site(row) -> str:
     return brand.lead_site(row["site"] if "site" in row.keys() else "")
 
 
-def result_mail(row: aiosqlite.Row) -> tuple[str, str]:
+def doi_mail(site: Optional[str], lang: str, picks: list[str], link: str) -> tuple[str, str, Optional[str]]:
+    """(subject, plain text, branded HTML or None) of the DOI mail. Server text only (no name, no free
+    text). HTML = the same paragraphs in the brand frame, the link as a "Bestätigen" button (no logo:
+    attachments are refused for an unconfirmed address). No brand profile -> plain text only."""
+    doi = RULES["mail"]["doi"]
+    text = doi["body"][lang].format(picks=_picks_block(picks, lang), link=link, hours=CONFIRM_TOKEN_MAX_AGE // 3600,
+                                    retention_pending_days=SELFCHECK_PENDING_DAYS)
+    subject = doi["subject"][lang]
+    plain = brand.replace_signature(text, site, lang, SIGNATURE[lang])
+    b = brand.get(site)
+    if b is None:
+        return subject, plain, None
+    core, footer_lines = _split_signature(text, site, lang)
+    html_part = mail_html.letter(b, lang, subject=subject, paragraphs=[x for x in core.split("\n\n") if x],
+                                 footer_lines=footer_lines, link=link, link_label=confirm_page.BUTTON[lang])
+    return subject, plain, html_part
+
+
+def _split_signature(text: str, site: Optional[str], lang: str) -> tuple[str, list[str]]:
+    """(text without the vendored signature, signature lines = the site's footer or that signature):
+    the HTML part shows the signature as its own block (mail_html.frame)."""
+    sig = SIGNATURE[lang]
+    core = text.rstrip()[: -len(sig)].rstrip() if text.rstrip().endswith(sig) else text.rstrip()
+    footer = brand.footer(site, lang) or sig
+    return core, footer.split("\n")
+
+
+def result_mail(row: aiosqlite.Row) -> tuple[str, str, Optional[str], list]:
+    """(subject, plain text, branded HTML or None, inline images). Plain text = the mail of before the
+    HTML part, unchanged; the HTML twin renders the same engine values (mail_html.selfcheck_result).
+    No brand profile -> no HTML part (plain text only, as before 0006)."""
     lang = row["lang"]
     site = _row_site(row)
     answers = json.loads(row["answers"])
@@ -277,8 +308,38 @@ def result_mail(row: aiosqlite.Row) -> tuple[str, str]:
     head = (m["intro"] if prog["complete"] else m["partial"])[lang].format(
         answered=prog["answered"], total=prog["total"], url=url)
     head = greet(head, row["name"], lang)
-    body = "\n\n".join([head, engine.result_text(RULES, answers, lang, stay), m["outro"][lang].format(url=url)])
-    return m["subject"][lang], brand.replace_signature(body, site, lang, SIGNATURE[lang])
+    result = engine.result_text(RULES, answers, lang, stay)
+    outro = m["outro"][lang].format(url=url)
+    body = "\n\n".join([head, result, outro])
+    subject = m["subject"][lang]
+    plain = brand.replace_signature(body, site, lang, SIGNATURE[lang])
+
+    b = brand.get(site)
+    if b is None:
+        return subject, plain, None, []
+    labels = {k: v[lang] for k, v in m["labels"].items()}
+    # stage-2 sentence(s) exactly as the plain text has them (built inside the engine's result_text)
+    stay_lines: list[str] = []
+    if engine.stay_cost(RULES, stay):
+        lines = result.split("\n")
+        if labels["stay"] in lines:
+            for line in lines[lines.index(labels["stay"]) + 1:]:
+                if not line:
+                    break
+                stay_lines.append(line)
+    greeting, _, intro = head.partition("\n\n")
+    outro_core, footer_lines = _split_signature(outro, site, lang)
+    parts = {
+        "subject": subject, "greeting": greeting, "intro": [x for x in intro.split("\n\n") if x], "url": url,
+        "base": brand.base_url(site, SELFCHECK_WEBSITE_URL), "complete": prog["complete"],
+        "answered": prog["answered"], "total": prog["total"],
+        "precision_word": RULES["precision"]["words"][prog["precision"]["level"]][lang],
+        "ev": engine.evaluate(RULES, answers, lang) if prog["complete"] else None, "labels": labels,
+        "stay_lines": stay_lines, "answers": engine.answer_lines(RULES, answers, lang),
+        "outro": [x for x in outro_core.split("\n\n") if x], "footer_lines": footer_lines,
+    }
+    html_part, images = mail_html.selfcheck_result(b, lang, parts)
+    return subject, plain, html_part, images
 
 
 # Texts FOR THE OWNER (operator mail, crm.lead) are English (owner decision 2026-11-09): the engine
@@ -463,14 +524,9 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     await db.execute("UPDATE selfcheck_submission SET token_hash = ? WHERE id = ?", (_hash(token), sid))
     await db.commit()
 
-    doi = RULES["mail"]["doi"]
-    body = brand.replace_signature(doi["body"][payload.lang].format(
-        picks=_picks_block(payload.picks, payload.lang),
-        link=f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}",
-        hours=CONFIRM_TOKEN_MAX_AGE // 3600,
-        retention_pending_days=SELFCHECK_PENDING_DAYS,
-    ), site, payload.lang, SIGNATURE[payload.lang])
-    ok = await mailer.send(email, doi["subject"][payload.lang], body, audience="doi", key=f"sc-doi-{sid}",
+    subject, body, html_part = doi_mail(site, payload.lang, payload.picks,
+                                        f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}")
+    ok = await mailer.send(email, subject, body, html=html_part, audience="doi", key=f"sc-doi-{sid}",
                            sender=brand.sender(site))
     if not ok:
         await db.execute("DELETE FROM selfcheck_submission WHERE id = ?", (sid,))
@@ -557,10 +613,10 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         picks = json.loads(row["picks"])
         mail_sent = False
         if "mail" in picks:
-            subject, body = result_mail(row)
-            # address confirmed by the DOI click; the report PDF / images go here as mailer.Attachment
-            mail_sent = await mailer.send(row["email"], subject, body, audience="confirmed", key=f"sc-result-{sid}",
-                                          sender=brand.sender(site))
+            subject, body, html_part, images = result_mail(row)
+            # address confirmed by the DOI click: branded HTML + inline logo (later the report PDF) allowed
+            mail_sent = await mailer.send(row["email"], subject, body, html=html_part, attachments=images,
+                                          audience="confirmed", key=f"sc-result-{sid}", sender=brand.sender(site))
         await db.execute("UPDATE selfcheck_submission SET mail_sent = ? WHERE id = ?", (int(mail_sent), sid))
         await db.commit()
 
