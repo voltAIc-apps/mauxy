@@ -44,6 +44,8 @@ the confirmation page (the mail link itself is read-only: mail scanners prefetch
 | Sinks | Odoo lead + subscriber sink, deprecated Mautic sink, per-site subscriber sink | `sinks.py`, `mautic_sink.py` |
 | Odoo | the one Odoo client (JSON-RPC, allowlist) | `odoo_client.py` |
 | LinkedIn login | `GET /api/auth/linkedin/start`, `GET /api/auth/linkedin/callback`, `POST /api/auth/session` | `auth_api.py` |
+| Per-site brand | admin `/api/admin/brands*` (profile, logo, footers, redirects, origins, preview) | `brand.py`, `confirm_page.py` |
+| Per-site routing | admin `/api/admin/routes*`, `/api/admin/deliveries*`; fan-out outbox | `routing.py`, `webhooks.py` |
 | Schema | `db-patches/`, `db_migrate.py`, `scripts/sqlite_db.py` | |
 
 ---
@@ -178,6 +180,10 @@ that DNS for `DEPLOY_DOMAIN` points at the ingress.
 | `MAIL_*` | mail limits / retries, see "Mail (SMTP)" | see `.env.example` |
 | `SELFCHECK_*`, `MAUTIC_RADAR_*` | Self-check, see `.env.example` | see `.env.example` |
 | `LINKEDIN_*`, `AUTH_*` | LinkedIn login, see "LinkedIn login" | login disabled until set |
+| `DEFAULT_SITE` | site of leads / Selbst-Checks without a mapped origin | `simplify-erp` |
+| `BRAND_LOGO_MAX_BYTES` | logo size cap | `65536` |
+| `MAIL_SENDER_DOMAINS` | sender domains brand profiles may use | domain of `SMTP_FROM` |
+| `WEBHOOK_ALLOWED_HOSTS` / `WEBHOOK_TIMEOUT` / `WEBHOOK_SECRET_<REF>` | webhook host allow-list (empty = none) / timeout / one HMAC secret per target (>= 32) | empty / `10` |
 
 ### Runtime config (SQLite) & onboarding a site
 
@@ -228,7 +234,9 @@ python scripts/sqlite_db.py --pull            # copy the live PVC DB to a local 
 ```
 
 Shipped: 0001 init, 0002 quiz seed, 0003 website consent tables (DOI pending, self-check, leads,
-outbox, login state/code), 0004 per-site policy. Tests with `ACTION_LOG_DB=:memory:` apply the patches
+outbox, login state/code), 0004 per-site policy, 0005 mail outbox, 0006 per-site brand + routing
+(`site_brand`, `site_mail_footer`, `site_redirect`, `site_origin`, `site_route`, `route_delivery`;
+`site` on leads / self-checks, `target` on `lead_sync`; seed: simplify-erp profile). Tests with `ACTION_LOG_DB=:memory:` apply the patches
 in-process. Never edit a deployed patch; add the next one.
 
 Dev loop: change your local DB schema, run `--generate <name>`, review the emitted patch
@@ -314,6 +322,7 @@ Rows carry `action` (`subscribe` / `confirm` / `unsubscribe`) and `site`.
 | `not_found` | unsubscribe: no subscription for that address. Nothing changed. |
 | `subscribe_ok` / `subscribe_already_confirmed` / `subscribe_dnc_skip` / `subscribe_throttled` | DOI mail sent / no mail (already, blocked, > `MAX_PENDING_PER_EMAIL`) |
 | `confirm_ok` / `confirm_invalid` / `confirm_expired` / `confirm_error` | DOI click outcome |
+| `unsubscribe_queued` | routed site: opt-out queued to every target (`error_detail` = `routed:<n>`); per-target outcome in `/api/admin/deliveries` |
 | `quiz_failed` / `honeypot` / `subscribe_honeypot` | gate rejected (no sink touched) |
 | `sink_error` / `sink_unreachable` / `mautic_unreachable` / `error` | sink problem; `error_detail` has more |
 
@@ -595,19 +604,121 @@ separate later step (not in `k8s/`).
 Local: `tests/scripts/run_local.py` mounts a mocked LinkedIn at `/__mock_linkedin` (fake person);
 tests `tests/test_auth.py` (T-AUTH-0xx, respx).
 
+## Per site: brand profile + action routing (owner requirement 2026-11-09)
+
+Every site (= `sites.site`; ludo, simplify-erp, re-cloud, later slyy.ai, re-cloud.io, poweron.software,
+runludo.com) can have its own **brand profile** and its own **routing**. A site without them behaves exactly
+as before (generic "wapsol GmbH" page, `SMTP_FROM`, env redirect URLs, fallback sinks) -- LUDO is such a
+site (regression tests T-BR-060/061, golden pages `tests/cases/brand_golden.json`).
+
+### Brand profile (`brand.py`, admin `PUT /api/admin/brands/{site}`)
+
+| Field | Rule | Used in |
+|---|---|---|
+| `display_name`, `wordmark`, `legal_entity` | one line, no `<>` / controls, escaped on render | confirm + neutral page (brand line, legal line), logo alt |
+| `color_primary`, `color_accent` | exactly `#RRGGBB` (also a DB CHECK) | button / focus colour inside the hashed inline stylesheet (no `unsafe-inline`) |
+| `logo` `{mime, data}` | PNG / WebP only (magic bytes), <= `BRAND_LOGO_MAX_BYTES` (64 KiB), base64; no SVG (script vector), no remote URL | brand line as `data:` URI; CSP `img-src data:` only on pages that carry one |
+| `website_url` | https (http only on `10.0.99.1`), no user info / quotes | default redirect base, website name in mails ("auf re-cloud.io") |
+| `imprint_url`, `privacy_url` | https, `{lang}` placeholder allowed | legal links on the pages |
+| `redirects` `[{flow, locale, outcome, url}]` | flow newsletter / lead / selfcheck, outcome confirmed / error, https | redirect after the click (flow parameter `reason` / `art` / `bestaetigt` appended); also in CSP `form-action` |
+| `default_locale` | de / en | invalid locale fallback |
+| `mail_from_name`, `mail_from_address`, `mail_reply_to` | address domain in `MAIL_SENDER_DOMAINS` (checked on write AND send; else `SMTP_FROM`) | person-facing mails: newsletter / lead / Selbst-Check DOI, Selbst-Check result. Operator mails stay `SMTP_FROM`. |
+| `mail_footer` `{de, en}` | <= 1000 chars, line breaks only | appended to the newsletter DOI; ends the lead DOI; replaces the vendored Selbst-Check signature |
+| `origins` | `scheme://host[:port]`, unique across sites | site of CTA leads / Selbst-Checks (no site key there); unmapped -> `DEFAULT_SITE` |
+
+Redirect order: explicit `redirects` row > `website_url` + standard path > env (`PUBLIC_WEBSITE_BASE_URL`,
+`LEAD_WEBSITE_URL`, `SELFCHECK_WEBSITE_URL`). The neutral page (invalid / used / expired link) is branded by
+the site claim inside the token (unsigned read, known sites only): it depends on the link text, never on its
+validity, so it stays uniform per brand (no oracle). Seed (patch 0006): simplify-erp with the simplify-erp.de
+values (prod website, imprint, colours, the old mail signature as footer; sender = `SMTP_FROM`; privacy URL
+empty). Each environment has its own DB: stag / dev set `website_url` via the admin API.
+
+### Routing ("hooks", `routing.py`, admin `PUT /api/admin/routes/{site}/{action}`)
+
+Per site and action an **ordered** list of targets `{sink, params, enabled}`; routes REPLACE the fallback
+(`sites.subscriber_sink` / `SUBSCRIBER_SINK` / `LEAD_SINK`, `ODOO_LIST_*_ID`) for that action.
+
+| Action | When | Sinks |
+|---|---|---|
+| `subscribe` | newsletter DOI click; ticked newsletter box of a lead | odoo, mautic, webhook |
+| `unsubscribe` | `POST /api/unsubscribe` | odoo, mautic, webhook |
+| `lead` | CTA lead confirmed | odoo (max 1), webhook |
+| `selfcheck` | Selbst-Check confirmed (lead for mail / call, Radar list for radar) | odoo (max 1), mautic (Radar), webhook |
+
+Params: odoo `{"lists": {"newsletter": id, "radar": id}, "team_id", "tag_ids", "utm_source", "utm_medium",
+"utm_campaign"}` (subscribe / unsubscribe: lists only; missing = env); mautic `{"segment": alias}`; webhook
+`{"url": "https://<WEBHOOK_ALLOWED_HOSTS host>/...", "secret_ref": "flywheel"}` (secret in env
+`WEBHOOK_SECRET_FLYWHEEL`, never in SQLite). New action = one line in `routing.ACTIONS` + a `fan_out` call.
+
+Delivery = **fan-out outbox** `route_delivery`: one row per (event, target), own state / attempts / backoff
+(`LEAD_SYNC_*`), resumed after restart; a failing target neither blocks nor repeats the others. Idempotency
+key = sha256(action | event | target identity): a repeated enqueue is a no-op, the webhook receiver gets the
+same `Idempotency-Key` on every retry. The ONE odoo target of `lead` / `selfcheck` rides in `lead_sync`
+(crm.lead duplicate guard, operator mail), its params in `lead_sync.target`. Permanent failure / retries
+exhausted -> mail to `LEAD_NOTIFY_TO`, then `POST /api/admin/deliveries/{id}/retry`. Payload (address)
+cleared once delivered; rows deleted after `LEAD_RETENTION_DAYS`.
+
+**Unsubscribe reaches every target that may hold the address for that site** (compliance): explicit
+unsubscribe targets + all subscribe targets + list-holding odoo / mautic targets of lead / selfcheck + every
+webhook of the site + the site's fallback sink (subscribers from before the routes). Odoo opts out of the
+union of all those list ids. Routed sites answer `200 ok` at once (no 503: the opt-out is durable in the
+outbox); a site without any route keeps the synchronous fallback (503 when the sink is down).
+
+Website contract (simplify-erp.de): unchanged -- same site key, endpoints, bodies, confirm / error pages.
+Optional for new sites: map their origin(s) in the profile so leads / Selbst-Checks get their brand + routes.
+
+### Webhook receivers (what the flywheel -- or any system -- must provide; not implemented here)
+
+1. An HTTPS endpoint with a publicly trusted certificate on a host the owner adds to `WEBHOOK_ALLOWED_HOSTS`
+   (public address; mauxy refuses private / loopback / link-local / metadata / CGNAT addresses and redirects).
+2. A shared secret (>= 32 chars, `openssl rand -hex 32`) in mauxy's env as `WEBHOOK_SECRET_<REF>` and in the
+   receiver's own secret store.
+3. Verify every request: `X-Mauxy-Signature: v1=<hex>` = HMAC-SHA256(secret, `<X-Mauxy-Timestamp>.<raw body>`),
+   constant-time compare; refuse timestamps older than 5 min; de-duplicate by `id` (= `Idempotency-Key`,
+   same on every retry). Reference: `webhooks.verify()`.
+4. Payload `{"id", "event", "site", "occurred_at", "data"}`; `data`: unsubscribe `{email}`; subscribe
+   `{email, locale, source, page_url, segment, lists}`; lead `{ref, kind, email, lang, name, company, phone,
+   newsletter, page_url}`; selfcheck `{ref, email, lang, picks, company, source, page_url}`. The flywheel:
+   `unsubscribe` -> do-not-contact list of that site.
+5. Answer `2xx` fast (body ignored). `408` / `425` / `429` / `5xx` / timeout -> retried with backoff; other
+   `4xx` and `3xx` -> failed (operator mail), never followed.
+
+### MITM / SSRF risk (brand + routing)
+
+| Path | Threat | Control | Residual risk |
+|---|---|---|---|
+| mauxy -> webhook receiver | MITM reads opt-outs / leads, forges answers | https only, certificate + host name verified, TLS failure = permanent (no retry into a downgrade), HMAC over body + timestamp (receiver detects forged / replayed requests) | low; a rogue CA-trusted cert could read the payload -> payloads minimal, rotate `WEBHOOK_SECRET_*` on suspicion |
+| admin config -> webhook URL | SSRF into the cluster / cloud metadata | exact host allow-list (env, not admin-settable), mauxy resolves DNS, EVERY address must be public, connection pinned to the checked address (no DNS rebinding), no redirects, no env proxies, 10 s timeout, response body never read | low; an allow-listed host that is compromised receives the events it is configured for |
+| brand values -> pages / mails | XSS, CSS / header injection, tracking pixels | strict validation (hex colours, https URLs, no `<>`), html-escape on render, hashed stylesheet, raster logo inline only, CR/LF stripped from headers | low |
+| sender per site | spoofing other domains | `MAIL_SENDER_DOMAINS` allow-list on write + send, mailcow sender ACL, SPF / DKIM / DMARC per domain | low |
+
+### Owner checklist per brand
+
+1. `PUT /api/admin/brands/<site>`: display name, legal entity, colours, wordmark, logo (PNG / WebP <= 64 KiB),
+   website, imprint + privacy URL, default locale, `origins` (for leads / Selbst-Check), optional explicit
+   `redirects`; sender name / address / reply-to + footer per locale.
+2. Sender domain: add to `MAIL_SENDER_DOMAINS`; mailcow sender ACL for `SMTP_USER`; SPF / DKIM / DMARC.
+3. erp.wapsol: the site's mailing lists (+ record rule of the bot group for the new list ids), CRM team,
+   tags, UTM source / campaign records (the bot cannot create them).
+4. `PUT /api/admin/routes/<site>/<action>` for subscribe / unsubscribe / lead / selfcheck.
+5. Webhooks: receiver host into `WEBHOOK_ALLOWED_HOSTS`, `WEBHOOK_SECRET_<REF>` into `.env` + secret
+   (`deploy.py --secret` syncs every `WEBHOOK_SECRET_*`), same secret at the receiver.
+6. Check: `GET /api/admin/brands/<site>/preview?flow=newsletter&lang=de`, `/health/detail` (`brands`,
+   `routes`, `webhooks`, `deliveries_failed`), `GET /api/admin/deliveries?state=failed`.
+
 ## Roadmap
 
 Planned features (see [issue #8](https://github.com/voltAIc-apps/mauxy/issues/8)):
 
 - Per-site unsubscribe (segment removal instead of global DNC)
 - Single-use challenge tokens (today: short expiry + rate-limit + honeypot; topic-bound since the merge)
-- Per-site Odoo lists (today: one `ODOO_LIST_NEWSLETTER_ID` for every site on the Odoo sink)
 
 Done: `POST /api/subscribe` (segment add) · per-site key registry · centralized
 bot-defence quiz (`GET /api/challenge`, per-site topics) · SQLite-backed runtime config
 (sites + quiz + Mautic version) with admin CRUD (`/api/admin/*`) — no redeploy to onboard
 a site or edit a quiz · per-site policy (quiz on subscribe, subscriber sink, DOI owner) · mauxy-owned
-double opt-in for `doi_owner=mauxy` sites (Mautic campaign only for `doi_owner=sink`).
+double opt-in for `doi_owner=mauxy` sites (Mautic campaign only for `doi_owner=sink`) · per-site brand
+profile + action routing with per-site Odoo lists, signed webhooks and a fan-out outbox (db-patches/0006).
 
 ---
 

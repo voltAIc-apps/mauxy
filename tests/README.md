@@ -13,6 +13,9 @@ Tests for every endpoint. Mautic is mocked via `respx`; Odoo is ALWAYS the in-me
 | T-SINK-0xx | Odoo sinks: partner match, lead vals, follower, lists, opt-out (test_sinks) |
 | T-AUTH-0xx | LinkedIn login: email only when email_verified is exactly true (058, 089-093), return-path open redirects, Referer origin, config guard, state replay / cookie / expiry, code replay / binding / origin / 60 s, error passthrough, no PII (test_auth, cases/auth_cases.json; LinkedIn mocked with respx) |
 | T-LEAD-0xx | CTA leads + outbox: validation (cases/lead_api_cases.json), DOI, retries, idempotency (test_leads) |
+| T-BR-0xx | per-site brand profile: admin validation matrix (colours, URLs, logo type / size, sender allow-list, origins), XSS escaping, branded confirm / neutral page + CSP, redirect order, mails per brand, LUDO / unbranded byte-identical (cases/brand_golden.json), simplify-erp seed = old texts (test_brand_routing, cases/brand_routing_cases.json) |
+| T-RT-0xx | per-site routing: admin validation matrix, fan-out per target, partial failure + retry, idempotency, permanent failure mail + admin retry, unsubscribe reaches every target, routed leads / Selbst-Check, fallback unchanged (test_brand_routing) |
+| T-WH-0xx | signed webhooks: HMAC + timestamp + idempotency headers, SSRF matrix (private / loopback / metadata / CGNAT / mapped / mixed answers, http, allow-list, user info), redirects never followed, status handling, real TLS on 10.0.99.1 (pinned address, SNI, wrong cert = permanent) (test_brand_routing) |
 
 ## Run
 

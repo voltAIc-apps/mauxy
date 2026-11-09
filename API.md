@@ -110,9 +110,14 @@ JS. So the mail link never confirms by itself (`confirm_page.py`):
 
 | Flow | GET (mail link, read-only) | POST (the click) → 303 |
 |---|---|---|
-| Newsletter | `/api/confirm?token=` | `/api/confirm` → `PUBLIC_WEBSITE_BASE_URL/{lang}/newsletter/confirmed` |
-| CTA lead | `/api/lead/confirm?token=` | `/api/lead/confirm` → `LEAD_WEBSITE_URL/{lang}/anfrage/bestaetigt?art=<kind>` |
-| Selbst-Check | `/api/selfcheck/confirm?token=` | `/api/selfcheck/confirm` → `SELFCHECK_WEBSITE_URL/{lang}/selbst-check?bestaetigt=1` |
+| Newsletter | `/api/confirm?token=` | `/api/confirm` → `<base>/{lang}/newsletter/confirmed` |
+| CTA lead | `/api/lead/confirm?token=` | `/api/lead/confirm` → `<base>/{lang}/anfrage/bestaetigt?art=<kind>` |
+| Selbst-Check | `/api/selfcheck/confirm?token=` | `/api/selfcheck/confirm` → `<base>/{lang}/selbst-check?bestaetigt=1` |
+
+`<base>` per site (db-patches/0006): the brand profile's explicit `redirects` URL (flow parameter appended)
+> its `website_url` > the env URL (`PUBLIC_WEBSITE_BASE_URL`, `LEAD_WEBSITE_URL`, `SELFCHECK_WEBSITE_URL`) =
+the behaviour before 0006 for sites without a profile. Page and neutral page carry the site's brand
+(README "Per site").
 
 - **GET** validates the token only (signature + max age + unused pending row, SHA-256 constant time;
   no burn, no sink / lead write, no action_log line) and renders a minimal page (de/en by the
@@ -159,10 +164,13 @@ lists; deprecated Mautic: DNC list).
 
 | Status | Body | Meaning |
 |--------|------|---------|
-| 200 | `{"status":"ok"}` | Applied — or contact not found. Same body either way (no enumeration leak). |
+| 200 | `{"status":"ok"}` | Applied — or contact not found. Same body either way (no enumeration leak). Routed site: queued to every target (outbox, retries) |
 | 401 | `{"error":"unauthorized"}` | Missing/unknown site key |
 | 409 | `{"status":"quiz_failed"}` | Wrong/expired bot-defence answer (email-independent → still no leak) |
-| 503 | `{"status":"service_unavailable"}` | Subscriber sink unreachable |
+| 503 | `{"status":"service_unavailable"}` | Subscriber sink unreachable (sites WITHOUT routes only) |
+
+A site with routes (`/api/admin/routes`) fans the opt-out out to every receiver that may hold the address
+(README "Per site"); the per-target outcome is in `GET /api/admin/deliveries`.
 
 ---
 
@@ -206,6 +214,48 @@ authoritative after.
 - `GET` — `{base_url, version, source, updated_at}` (source `manual`|`unset`).
 - `PUT` `{version, base_url?}` — set the version manually (`source=manual`); takes effect immediately.
 
+### Brands — `/api/admin/brands` (per-site brand profile, db-patches/0006)
+- `GET` — all profiles (`brands`, `count`, `default_site`); the logo only as `{mime, bytes, sha256}`.
+- `GET /api/admin/brands/{site}` — one profile; `404` if none.
+- `PUT /api/admin/brands/{site}` — create (`201`, `display_name` required) or update (`200`). Only the fields
+  sent change; `null` clears an optional field; `mail_footer`, `redirects`, `origins`, `logo` replace the
+  stored set. `400` (rule violated, message says which), `422` (shape / pattern / unknown field).
+  ```json
+  {"display_name": "re-cloud", "legal_entity": "wapsol GmbH", "color_primary": "#0b5fff", "color_accent": "#9cc3ff",
+   "wordmark": "re-cloud", "website_url": "https://re-cloud.io", "imprint_url": "https://re-cloud.io/{lang}/impressum",
+   "privacy_url": "https://re-cloud.io/{lang}/datenschutz", "default_locale": "de",
+   "mail_from_name": "re-cloud", "mail_from_address": "hello@re-cloud.io", "mail_reply_to": "info@re-cloud.io",
+   "mail_footer": {"de": "re-cloud\nwapsol GmbH", "en": "re-cloud\nwapsol GmbH"},
+   "redirects": [{"flow": "newsletter", "locale": "de", "outcome": "confirmed", "url": "https://re-cloud.io/de/danke"}],
+   "origins": ["https://re-cloud.io", "https://www.re-cloud.io"],
+   "logo": {"mime": "image/png", "data": "<base64, <= 64 KiB>"}}
+  ```
+  Rules: colours `#RRGGBB`; URLs https (http only on `10.0.99.1`), no user info / quotes, `{lang}` only in
+  imprint / privacy / redirects; logo PNG / WebP (magic bytes, size cap; no SVG); `mail_from_address` domain in
+  `MAIL_SENDER_DOMAINS`; one-line texts without `<>` / controls; footer <= 1000 chars; origin unique per site.
+- `DELETE /api/admin/brands/{site}` — profile + footers + redirects + origins; the site falls back to the
+  generic look.
+- `GET /api/admin/brands/{site}/preview?flow=newsletter|lead|selfcheck|neutral&lang=de|en` — the page as the
+  person sees it (dummy token; a click lands on the neutral page).
+
+### Routes — `/api/admin/routes` (per-site action routing)
+- `GET [?site=…]` — `routes` (`{site, action, position, sink, params, enabled}`), `actions` (allowed sinks per
+  action), `webhook_allowed_hosts`.
+- `PUT /api/admin/routes/{site}/{action}` `{"targets": [{sink, params?, enabled?}, …]}` — replaces the ordered
+  list (1..10). Actions `subscribe`, `unsubscribe`, `lead`, `selfcheck`; sinks `odoo` (lead / selfcheck: max
+  one), `mautic`, `webhook` (url host in `WEBHOOK_ALLOWED_HOSTS`, `secret_ref` -> env `WEBHOOK_SECRET_<REF>`
+  must exist, >= 32 chars). `400` with the reason, `422` unknown action / bad site name.
+  ```json
+  {"targets": [{"sink": "odoo", "params": {"lists": {"newsletter": 12}}},
+               {"sink": "webhook", "params": {"url": "https://flywheel.example/hooks/mauxy", "secret_ref": "flywheel"}}]}
+  ```
+- `DELETE /api/admin/routes/{site}/{action}` — back to the fallback sinks; `404` if there were none.
+
+### Deliveries — `/api/admin/deliveries` (fan-out outbox)
+- `GET [?state=queued|done|failed&site=…&action=…&limit=100]` — per-target rows (`sink`, `params`, `state`,
+  `result`, `attempts`, `last_error`, …; never the payload).
+- `POST /api/admin/deliveries/{id}/retry` — failed -> queued (attempts reset); `409` if not failed or purged.
+
 ---
 
 ## GET /health · GET /ready · GET /health/detail
@@ -216,8 +266,9 @@ independent of every downstream (sinks, Mautic, SMTP), so an outage never restar
 answers, else 503. It is deliberately NOT tied to a sink (upstream tied it to Mautic): subscribe,
 confirm, leads and login keep working while erp.wapsol / Mautic is down (pending rows + outbox in
 SQLite, retries). `/health/detail` (operator, always HTTP 200): `status ok|degraded`, `lead_sink`,
-`subscriber_sink` (reachability, cached 30 s), `auth_linkedin`, `sites` (count), `quiz`
-(`configured|disabled`), `mautic_version` (`unknown` if unset), `cache_age_seconds`. Never secrets.
+`subscriber_sink` (reachability, cached 30 s), `brands`, `routes` (counts), `webhooks` (`<n> allowed host(s)` |
+`disabled`), `deliveries_failed`, `auth_linkedin`, `sites` (count), `quiz` (`configured|disabled`),
+`mautic_version` (`unknown` if unset), `cache_age_seconds`. Never secrets.
 
 ---
 
@@ -227,7 +278,7 @@ SQLite, retries). `/health/detail` (operator, always HTTP 200): `status ok|degra
 |--------|-------|
 | 401    | Missing or invalid Bearer token (site key or admin key) |
 | 403    | `ADMIN_API_KEY` not configured (admin endpoint disabled) |
-| 409    | Bot-defence quiz failed |
+| 409    | Bot-defence quiz failed; admin: key / question exists, delivery not retryable |
 | 422    | Invalid request body (e.g. malformed email on `/api/unsubscribe`) |
 | 429    | Rate limit exceeded -- retry after the period resets |
 | 503    | Service not configured, or subscriber sink unreachable on `/api/unsubscribe` |
