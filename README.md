@@ -183,6 +183,7 @@ that DNS for `DEPLOY_DOMAIN` points at the ingress.
 | `DEFAULT_SITE` | site of leads / Selbst-Checks without a mapped origin | `simplify-erp` |
 | `BRAND_LOGO_MAX_BYTES` | logo size cap | `65536` |
 | `MAIL_SENDER_DOMAINS` | sender domains brand profiles may use | domain of `SMTP_FROM` |
+| `OPTOUT_RESIGNUP_DAYS` | at most one re-signup DOI per site + address after an own opt-out in N days | `30` |
 | `WEBHOOK_ALLOWED_HOSTS` / `WEBHOOK_TIMEOUT` / `WEBHOOK_SECRET_<REF>` | webhook host allow-list (empty = none) / timeout / one HMAC secret per target (>= 32) | empty / `10` |
 
 ### Runtime config (SQLite) & onboarding a site
@@ -237,7 +238,8 @@ Shipped: 0001 init, 0002 quiz seed, 0003 website consent tables (DOI pending, se
 outbox, login state/code), 0004 per-site policy, 0005 mail outbox, 0006 per-site brand + routing
 (`site_brand`, `site_mail_footer`, `site_redirect`, `site_origin`, `site_route`, `route_delivery`;
 `site` on leads / self-checks, `target` on `lead_sync`; seed: simplify-erp profile), 0007 `site_optout`
-(mauxy's per-site do-not-contact record, hashed). Tests with `ACTION_LOG_DB=:memory:` apply the patches
+(mauxy's per-site do-not-contact record, hashed), 0008 re-signup (`source` self / admin, `resignup_at`,
+`newsletter_pending.resignup`, audit `site_optout_lift`). Tests with `ACTION_LOG_DB=:memory:` apply the patches
 in-process. Never edit a deployed patch; add the next one.
 
 Dev loop: change your local DB schema, run `--generate <name>`, review the emitted patch
@@ -324,6 +326,7 @@ Rows carry `action` (`subscribe` / `confirm` / `unsubscribe`) and `site`.
 | `subscribe_ok` / `subscribe_already_confirmed` / `subscribe_dnc_skip` / `subscribe_throttled` | DOI mail sent / no mail (already, blocked, > `MAX_PENDING_PER_EMAIL`) |
 | `confirm_ok` / `confirm_invalid` / `confirm_expired` / `confirm_error` | DOI click outcome |
 | `unsubscribe_queued` | routed site: opt-out queued to every target (`error_detail` = `routed:<n>`); per-target outcome in `/api/admin/deliveries` |
+| `subscribe_resignup_throttled` / `confirm_dnc_refused` | re-signup cap hit (no mail) / click on a blocked address (nothing delivered, confirmed page) |
 | `quiz_failed` / `honeypot` / `subscribe_honeypot` | gate rejected (no sink touched) |
 | `sink_error` / `sink_unreachable` / `mautic_unreachable` / `error` | sink problem; `error_detail` has more |
 
@@ -668,8 +671,20 @@ nobody gets it, the same confirmed page as a success; check error: token release
 inside the outbox before every marketing delivery (`subscribe`, `lead`, `selfcheck` -> result `dnc_skip`;
 check error -> retry / failure mail, never delivered unchecked). `unsubscribe` is never gated. Leads /
 Selbst-Check: the crm.lead (a confirmed contact request) and the operator mail still happen; list subscriptions
-and the lead / selfcheck webhooks are skipped. Every response stays uniform. Re-subscription after an opt-out
-only on the person's request: admin `POST /api/admin/optouts/{site}/lift` (+ remove the Odoo opt-out / DNC).
+and the lead / selfcheck webhooks are skipped. Every response stays uniform.
+
+**Re-signup** (owner decision 2026-11-09: "Keep the block. Allow re-signup after a new confirmation click.",
+patch 0008): a **self-service** opt-out (`site_optout` source `self` = the person's own unsubscribe via mauxy,
+plus the Odoo list opt-outs that unsubscribe wrote) does NOT suppress a new DOI mail, but blocks every marketing
+delivery until the person clicks a NEW confirm link issued as re-signup after the opt-out. That click lifts the
+row (audit `site_optout_lift`: reason `doi_reconfirm`, timestamps, hashed address) and re-subscribes via the
+targets (Odoo: `opt_out` back to False with the bot's existing write on `mailing.subscription.opt_out` -- no new
+rights). Links issued before the opt-out never lift it. **Hard blocks** still suppress the DOI mail and need a
+manual lift: admin block (`POST /api/admin/optouts/{site}/block`), Odoo `mail.blacklist`, Mautic DNC (mauxy never
+removes a DNC), and an Odoo list opt-out mauxy did not write (Odoo's own unsubscribe link, opt-outs from before
+0007). Abuse guard: re-signup DOI mails count toward `MAX_PENDING_PER_EMAIL` plus at most 1 per site and address
+per `OPTOUT_RESIGNUP_DAYS` (30), atomic. A lead's ticked newsletter box is not a re-signup (lists stay skipped).
+Manual lift: `POST /api/admin/optouts/{site}/lift` (audited, reason `admin`).
 Sites without routes keep their sink's semantics (Odoo blacklist, Mautic DNC) -- unchanged.
 
 **Unsubscribe reaches every target that may hold the address for that site** (compliance): explicit

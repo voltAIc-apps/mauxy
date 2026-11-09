@@ -69,6 +69,7 @@ KNOWN_VARS = [
         "AUTH_SESSION_RATE_LIMIT",
         # per-site brand + routing (db-patches/0006); webhook secrets: WEBHOOK_SECRET_<REF> (pattern below)
         "DEFAULT_SITE", "BRAND_LOGO_MAX_BYTES", "MAIL_SENDER_DOMAINS", "WEBHOOK_ALLOWED_HOSTS", "WEBHOOK_TIMEOUT",
+        "OPTOUT_RESIGNUP_DAYS",
     )),
 ]
 # One secret per webhook target (routing.py secret_ref -> WEBHOOK_SECRET_<REF>): any number, synced too.

@@ -293,17 +293,18 @@ class OdooSubscriberSink:
         logger.info("ODOO_SUBSCRIBED list=%s source=%s", list_key, source)
         return "ok"
 
-    async def dnc(self, email: str, list_ids: list[int]) -> bool:
-        """Do-not-contact for routed sites: blacklisted, or opted out on any of `list_ids`."""
+    async def dnc(self, email: str, list_ids: list[int]) -> Optional[str]:
+        """Do-not-contact for routed sites: 'blacklist' (hard), 'optout' (opted out on any of
+        `list_ids`; soft only when mauxy's own unsubscribe wrote it, routing.dnc_status) or None."""
         norm = normalize_email(email)
         async with _wrap():
             if await self._blacklisted(norm):
-                return True
-            if list_ids:
-                return bool(await self.odoo.search_read(
+                return "blacklist"
+            if list_ids and await self.odoo.search_read(
                     "mailing.subscription", [["list_id", "in", list_ids], ["contact_id.email_normalized", "=", norm],
-                                             ["opt_out", "=", True]], ["id"], limit=1))
-        return False
+                                             ["opt_out", "=", True]], ["id"], limit=1):
+                return "optout"
+        return None
 
     async def unsubscribe(self, email: str, *, list_ids: Optional[list[int]] = None):
         """Opt-out on every given list (routed: all lists the site's odoo targets hold), else the

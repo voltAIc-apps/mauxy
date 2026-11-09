@@ -9,6 +9,9 @@ routing ("hooks") with fan-out through the route_delivery outbox, signed webhook
   T-RT-001..021  route admin validation matrix ("route_admin")
   T-RT-030..041  fan-out, partial failure + retry, idempotency, permanent failure + mail + admin
                  retry, unsubscribe reaches every target, routed leads / self-check, fallback
+  T-DNC-010..015 re-signup after a self-service opt-out (owner decision): DOI allowed, no fan-out
+                 before the click, the new click lifts (audit) + re-subscribes, hard blocks suppress,
+                 old links never lift, abuse cap 1 / 30 days + per-address cap
   T-DNC-001..009 do-not-contact gate of routed sites (security review): fallback blacklist, one of
                  several targets, webhook-only + mauxy opt-out record, check error -> fail closed,
                  block at the click, outbox gate for lead / selfcheck webhooks + lists, uniform
@@ -900,22 +903,30 @@ def test_t_dnc_003_mautic_dnc_target_blocks(respx_mock, client, outbox, odoo, ho
 
 
 def test_t_dnc_004_webhook_only_site_opt_out_record(client, outbox, odoo, hooks, monkeypatch):
-    """A webhook-only site whose fallback is 'none': mauxy's own opt-out record is the source.
-    Unsubscribe -> record (hash only) -> no DOI mail, no webhook; admin lift on request -> DOI again."""
-    monkeypatch.setitem(mauxy_main._SITES_BY_KEY[WEB_KEY], "sink", "none")
+    """A webhook-only site whose fallback is 'none': mauxy's own opt-out record (hash only) is the
+    source. Self-service opt-out: a new subscribe gets its DOI mail but nothing reaches the webhook
+    before the click; admin check / block (hard) / lift."""
     put_routes(client, "simplify-web", "subscribe", [{"sink": "webhook", "params": FLYWHEEL}])
+    monkeypatch.setitem(mauxy_main._SITES_BY_KEY[WEB_KEY], "sink", "none")  # after the write (it reloads the cache)
     assert unsubscribe(client, "Ov@Example.com").json() == {"status": "ok"}
     (row,) = q(client, "SELECT * FROM site_optout")
-    assert row["site"] == "simplify-web" and row["email_hash"] == hashlib.sha256(b"ov@example.com").hexdigest()
+    assert row["site"] == "simplify-web" and row["source"] == "self"
+    assert row["email_hash"] == hashlib.sha256(b"ov@example.com").hexdigest()
     assert "ov@example.com" not in json.dumps(q(client, "SELECT * FROM site_optout"))
     hooks.requests.clear()
-    assert _subscribe_status(client, outbox, "ov@example.com")[2] == [] and hooks.requests == []
-    check = lambda: client.request("POST", "/api/admin/optouts/simplify-web/check", headers=ADMIN, json={"email": "OV@example.com"})  # noqa: E731
-    assert check().json() == {"opted_out": True}
+    assert _subscribe_status(client, outbox, "ov@example.com")[2] and hooks.requests == []
+    assert [(d["action"], d["sink"]) for d in deliveries(client)] == [("unsubscribe", "webhook")]  # no subscribe row before the click
+    check = lambda e="OV@example.com": client.request("POST", "/api/admin/optouts/simplify-web/check", headers=ADMIN, json={"email": e})  # noqa: E731
+    assert check().json() == {"opted_out": True, "source": "self"}
     assert client.request("POST", "/api/admin/optouts/simplify-web/check", json={"email": "ov@example.com"}).status_code == 401
     assert client.request("POST", "/api/admin/optouts/simplify-web/lift", headers=ADMIN, json={"email": "ov@example.com"}).json() == {"lifted": True}
-    assert check().json() == {"opted_out": False}
-    assert _subscribe_status(client, outbox, "ov@example.com")[2]
+    assert check().json() == {"opted_out": False, "source": None}
+    assert [r["reason"] for r in q(client, "SELECT * FROM site_optout_lift")] == ["admin"]
+    # an admin block is hard: even the DOI mail is suppressed, a later self unsubscribe never downgrades it
+    assert client.request("POST", "/api/admin/optouts/simplify-web/block", headers=ADMIN, json={"email": "hb@example.com"}).json() == {"blocked": True}
+    unsubscribe(client, "hb@example.com")
+    assert check("hb@example.com").json() == {"opted_out": True, "source": "admin"}
+    assert _subscribe_status(client, outbox, "hb@example.com")[2] == []
 
 
 @respx.mock(assert_all_called=False)
@@ -1005,3 +1016,96 @@ def test_t_dnc_009_outbox_gate_error_retries_never_delivers_unchecked(client, ou
     client.request("POST", f"/api/admin/deliveries/{row['id']}/retry", headers=ADMIN)
     drain(client)
     assert deliveries(client)[0]["state"] == "done" and len(hooks.requests) == 1
+
+
+# ------------------------------------------------------------------------------------------ re-signup (owner decision)
+
+
+def _routed_odoo_web(client, odoo):
+    odoo.add("mailing.list", id=5, name="Web Newsletter")
+    put_routes(client, "simplify-web", "subscribe", [{"sink": "odoo", "params": {"lists": {"newsletter": 5}}},
+                                                     {"sink": "webhook", "params": FLYWHEEL}])
+
+
+def test_t_dnc_010_011_resignup_doi_then_click_lifts_and_resubscribes(client, outbox, odoo, hooks):
+    """Subscribed -> own unsubscribe (Odoo opt_out written by mauxy + self row) -> new subscribe:
+    DOI mail, nothing delivered before the click; the click lifts the row (audit doi_reconfirm, hash
+    only), Odoo opt_out back to False (existing write right), the webhook gets the subscribe."""
+    _routed_odoo_web(client, odoo)
+    nl_confirm(client, outbox, "re@example.com")
+    unsubscribe(client, "re@example.com")
+    (sub,) = odoo.db["mailing.subscription"].values()
+    assert sub["opt_out"] and q(client, "SELECT source FROM site_optout") == [{"source": "self"}]
+    before = len(deliveries(client))
+    hooks.requests.clear()
+    token, mail = nl_subscribe(client, outbox, "re@example.com")
+    assert mail and len(deliveries(client)) == before and hooks.requests == []  # DOI only, no fan-out
+    assert q(client, "SELECT resignup FROM newsletter_pending WHERE email = 're@example.com' AND used_at IS NULL") == [{"resignup": 1}]
+    r = click_confirm(client, f"/api/confirm?token={token}")
+    drain(client)
+    assert r.headers["location"] == "https://site.test/de/newsletter/confirmed"
+    assert q(client, "SELECT * FROM site_optout") == []
+    (audit,) = q(client, "SELECT * FROM site_optout_lift")
+    assert audit["reason"] == "doi_reconfirm" and audit["source"] == "self" and audit["site"] == "simplify-web"
+    assert audit["email_hash"] == hashlib.sha256(b"re@example.com").hexdigest() and audit["lifted_at"]
+    assert odoo.db["mailing.subscription"][sub["id"]]["opt_out"] is False
+    (ev,) = hooks.events("flywheel.test")
+    assert ev["event"] == "subscribe" and "_reconfirmed" not in ev["data"]  # internal flag never sent
+    log = client.request("GET", "/api/actions?result=confirm_ok", headers=ADMIN).json()["actions"]
+    assert log[0]["error_detail"] == "routed:2 reconfirmed"
+
+
+def test_t_dnc_012_hard_blocks_still_suppress_doi(client, outbox, odoo, hooks):
+    """Blacklist (even with a self row), an Odoo opt-out mauxy did not write, an admin block: no DOI."""
+    _routed_odoo_web(client, odoo)
+    _blacklist(odoo, "bl3@example.com")
+    unsubscribe(client, "bl3@example.com")  # self row present -- the blacklist still wins
+    cid = odoo.add("mailing.contact", name="x", email="odoolink@example.com")
+    odoo.add("mailing.subscription", contact_id=cid, list_id=5, opt_out=True)  # Odoo's own link, no self row
+    client.request("POST", "/api/admin/optouts/simplify-web/block", headers=ADMIN, json={"email": "adm@example.com"})
+    hooks.requests.clear()  # the unsubscribe above reached the webhook (correct); only subscribes count here
+    for e in ("bl3@example.com", "odoolink@example.com", "adm@example.com"):
+        status, body, mails = _subscribe_status(client, outbox, e)
+        assert (status, body, mails) == (200, {"status": "pending_confirmation"}, []), e
+    assert hooks.requests == [] and "subscribe" not in [d["action"] for d in deliveries(client)]
+
+
+def test_t_dnc_013_old_link_never_lifts(client, outbox, odoo, hooks):
+    """A link issued BEFORE the opt-out (not a re-signup link) is clicked afterwards: token burnt,
+    nothing delivered, the opt-out stays, the same confirmed page."""
+    _routed_odoo_web(client, odoo)
+    token, _ = nl_subscribe(client, outbox, "old@example.com")
+    unsubscribe(client, "old@example.com")
+    hooks.requests.clear()
+    r = click_confirm(client, f"/api/confirm?token={token}")
+    drain(client)
+    assert r.headers["location"] == "https://site.test/de/newsletter/confirmed" and hooks.requests == []
+    assert q(client, "SELECT source FROM site_optout") == [{"source": "self"}] and q(client, "SELECT * FROM site_optout_lift") == []
+
+
+def test_t_dnc_014_resignup_cap_one_per_30_days(client, outbox, odoo, hooks):
+    """Opted-out address: one re-signup DOI per site in 30 days (silent, uniform); after 30 days again."""
+    _routed_odoo_web(client, odoo)
+    unsubscribe(client, "cap@example.com")
+    first, second = (_subscribe_status(client, outbox, "cap@example.com") for _ in range(2))
+    assert first[:2] == second[:2] == (200, {"status": "pending_confirmation"})
+    assert len(second[2]) == 1  # still only the first DOI mail
+    log = [r["result"] for r in client.request("GET", "/api/actions?email=cap@example.com", headers=ADMIN).json()["actions"]]
+    assert "subscribe_resignup_throttled" in log
+    async def age(app):
+        old = routing.iso(routing.now() - routing.timedelta(days=31))
+        await app.state.db.execute("UPDATE site_optout SET resignup_at = ?", (old,))
+        await app.state.db.commit()
+    client.portal.call(age, client.app)
+    assert len(_subscribe_status(client, outbox, "cap@example.com")[2]) == 2
+
+
+def test_t_dnc_015_resignup_counts_toward_per_address_cap(client, outbox, odoo, hooks, monkeypatch):
+    """Per-address cap reached: no DOI, and the 30-day re-signup slot is NOT consumed."""
+    _routed_odoo_web(client, odoo)
+    unsubscribe(client, "pa@example.com")
+    monkeypatch.setattr(mauxy_main, "MAX_PENDING_PER_EMAIL", 0)
+    assert _subscribe_status(client, outbox, "pa@example.com")[2] == []
+    assert q(client, "SELECT resignup_at FROM site_optout") == [{"resignup_at": None}]
+    monkeypatch.setattr(mauxy_main, "MAX_PENDING_PER_EMAIL", 3)
+    assert len(_subscribe_status(client, outbox, "pa@example.com")[2]) == 1

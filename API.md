@@ -252,10 +252,13 @@ authoritative after.
 - `DELETE /api/admin/routes/{site}/{action}` — back to the fallback sinks; `404` if there were none.
 
 ### Opt-outs — `/api/admin/optouts` (mauxy's per-site do-not-contact record, patch 0007)
-- `POST /api/admin/optouts/{site}/check` `{"email"}` → `{"opted_out": bool}` (address in the body, never in a URL).
-- `POST /api/admin/optouts/{site}/lift` `{"email"}` → `{"lifted": true}` / `404`. Only on the person's explicit
-  request (re-subscribe); written automatically on every unsubscribe, read by the do-not-contact gate of routed
-  sites (README "Per site").
+- `POST /api/admin/optouts/{site}/check` `{"email"}` → `{"opted_out": bool, "source": "self"|"admin"|null}`
+  (address in the body, never in a URL).
+- `POST /api/admin/optouts/{site}/block` `{"email"}` → `{"blocked": true}`: manual HARD block (suppresses even the
+  DOI mail; a later self unsubscribe never downgrades it).
+- `POST /api/admin/optouts/{site}/lift` `{"email"}` → `{"lifted": true}` / `404`; audited (`site_optout_lift`,
+  reason `admin`). Self-service opt-outs (`source self`, written on every unsubscribe) are lifted by the person's
+  own new confirmation click (reason `doi_reconfirm`); see README "Per site" (Re-signup).
 
 ### Deliveries — `/api/admin/deliveries` (fan-out outbox)
 - `GET [?state=queued|done|failed&site=…&action=…&limit=100]` — per-target rows (`sink`, `params`, `state`,

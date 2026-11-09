@@ -33,6 +33,18 @@ Permanent failure / retries exhausted -> mail to LEAD_NOTIFY_TO (action, site, t
 POST /api/admin/deliveries/{id}/retry after fixing the cause. payload (contains the address) is
 cleared once delivered; rows deleted LEAD_RETENTION_DAYS after done / failed.
 
+Re-signup (owner decision 2026-11-09, db-patches/0008): self-service opt-outs (site_optout source
+'self' = the person's own unsubscribe via mauxy, plus the Odoo list opt-outs that unsubscribe wrote)
+do NOT suppress a new DOI mail (status 'optout'), but stay a block for every marketing delivery
+until the person clicks a NEW confirm link issued as re-signup (newsletter_pending.resignup, after
+the opt-out). That click lifts the row (audit site_optout_lift, reason doi_reconfirm, hash only) and
+the fan-out re-subscribes (Odoo: opt_out back to False -- the bot's existing write on
+mailing.subscription.opt_out, no new rights). Hard blocks still suppress the DOI mail and need a
+manual lift: source 'admin', Odoo mail.blacklist, Mautic DNC (mauxy never removes a DNC), and an
+Odoo list opt-out WITHOUT a self-service row (Odoo's own unsubscribe link, older opt-outs).
+Abuse guard: one re-signup DOI per site + address per OPTOUT_RESIGNUP_DAYS (30), atomic, on top of
+MAX_PENDING_PER_EMAIL.
+
 Do-not-contact gate (security review 2026-11-09, fail closed): a routed site may have no target
 that can answer "is this address blocked?" (e.g. webhook-only). dnc_status() therefore checks
   1. mauxy's own opt-out record (site_optout, db-patches/0007: written on every unsubscribe,
@@ -61,6 +73,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -87,6 +100,7 @@ ACTIONS: dict[str, frozenset] = {
 }
 SINKS = ("odoo", "mautic", "webhook")
 GATED = ("subscribe", "lead", "selfcheck")  # marketing deliveries: do-not-contact gate in the outbox
+RESIGNUP_DAYS = int(os.environ.get("OPTOUT_RESIGNUP_DAYS", "30"))
 # site name -> its pinned fallback subscriber sink (sites.subscriber_sink) or None; set by main.py
 FALLBACK: Callable[[str], Optional[str]] = lambda site: None
 MAX_TARGETS = 10
@@ -295,31 +309,62 @@ def email_hash(email: str) -> str:
     return hashlib.sha256(email.strip().lower().encode()).hexdigest()
 
 
-async def record_optout(db: aiosqlite.Connection, site: str, email: str) -> None:
-    """mauxy's own do-not-contact record (every unsubscribe that passed the gates)."""
-    await db.execute("INSERT OR IGNORE INTO site_optout (site, email_hash, created_at) VALUES (?, ?, ?)",
-                     (site, email_hash(email), iso(now())))
+async def record_optout(db: aiosqlite.Connection, site: str, email: str, source: str = "self") -> None:
+    """mauxy's own do-not-contact record. 'self' = every unsubscribe that passed the gates (a repeat
+    moves created_at, so older DOI links cannot lift it); 'admin' = manual hard block (never
+    downgraded back to 'self')."""
+    await db.execute(
+        "INSERT INTO site_optout (site, email_hash, created_at, source) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(site, email_hash) DO UPDATE SET created_at = excluded.created_at, "
+        "source = CASE WHEN site_optout.source = 'admin' OR excluded.source = 'admin' THEN 'admin' ELSE 'self' END",
+        (site, email_hash(email), iso(now()), source))
     await db.commit()
 
 
+async def optout_row(db: aiosqlite.Connection, site: str, email: str) -> Optional[dict]:
+    async with db.execute("SELECT * FROM site_optout WHERE site = ? AND email_hash = ?", (site, email_hash(email))) as cur:
+        r = await cur.fetchone()
+    return dict(r) if r else None
+
+
 async def opted_out(db: aiosqlite.Connection, site: str, email: str) -> bool:
-    async with db.execute("SELECT 1 FROM site_optout WHERE site = ? AND email_hash = ?", (site, email_hash(email))) as cur:
-        return await cur.fetchone() is not None
+    return await optout_row(db, site, email) is not None
 
 
-async def lift_optout(db: aiosqlite.Connection, site: str, email: str) -> bool:
-    cur = await db.execute("DELETE FROM site_optout WHERE site = ? AND email_hash = ?", (site, email_hash(email)))
+async def lift_optout(db: aiosqlite.Connection, site: str, email: str, reason: str) -> bool:
+    """Delete the opt-out and audit the lift (reason doi_reconfirm | admin; hash only)."""
+    row = await optout_row(db, site, email)
+    if row is None:
+        return False
+    await db.execute("DELETE FROM site_optout WHERE site = ? AND email_hash = ?", (site, row["email_hash"]))
+    await db.execute("INSERT INTO site_optout_lift (site, email_hash, source, reason, opted_out_at, lifted_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (site, row["email_hash"], row["source"], reason, row["created_at"], iso(now())))
+    await db.commit()
+    logger.info("OPTOUT_LIFTED site=%s reason=%s source=%s", site, reason, row["source"])
+    return True
+
+
+async def claim_resignup(db: aiosqlite.Connection, site: str, email: str) -> bool:
+    """Abuse guard: one re-signup DOI per site + address per RESIGNUP_DAYS, atomic (conditional
+    UPDATE: parallel requests cannot both pass)."""
+    cutoff = iso(now() - timedelta(days=RESIGNUP_DAYS))
+    cur = await db.execute("UPDATE site_optout SET resignup_at = ? WHERE site = ? AND email_hash = ? AND source = 'self' "
+                           "AND (resignup_at IS NULL OR resignup_at < ?)", (iso(now()), site, email_hash(email), cutoff))
     await db.commit()
     return cur.rowcount == 1
 
 
 async def dnc_status(db: aiosqlite.Connection, site: str, email: str, *, fallback_kind: Optional[str] = None,
-                     primary: bool = True) -> str:
-    """'blocked' | 'subscribed' | 'none' for a ROUTED site (module doc "Do-not-contact gate").
-    Raises SinkTransient / SinkPermanent: callers fail closed. primary=True also asks the first
-    list-holding subscribe target whether the address is already subscribed (no second DOI)."""
-    if await opted_out(db, site, email):
+                     primary: bool = True, reconfirmed: bool = False) -> str:
+    """'blocked' (hard) | 'optout' (self-service: DOI allowed, marketing blocked) | 'subscribed' |
+    'none' for a ROUTED site (module doc). Raises SinkTransient / SinkPermanent: callers fail closed.
+    primary=True also asks the first list-holding subscribe target whether the address is already
+    subscribed (no second DOI). reconfirmed = deliveries of the event whose click just lifted a
+    self-service opt-out: Odoo list opt-outs are then re-subscribed, not a block."""
+    row = await optout_row(db, site, email)
+    if row and row["source"] == "admin":
         return "blocked"
+    soft = row is not None
     kind = (fallback_kind or FALLBACK(site) or sinks.default_subscriber_kind()).strip().lower()
     want_odoo, want_mautic, lists = kind == "odoo", kind == "mautic", set()
     if kind == "odoo":
@@ -331,10 +376,14 @@ async def dnc_status(db: aiosqlite.Connection, site: str, email: str, *, fallbac
                 lists.update(t.params.get("lists", {}).values())
             elif t.sink == "mautic":
                 want_mautic = True
-    if want_odoo and await sinks.subscriber_sink("odoo").dnc(email, sorted(lists or set(_env_list_ids()))):
-        return "blocked"
+    if want_odoo:
+        odoo_dnc = await sinks.subscriber_sink("odoo").dnc(email, sorted(lists or set(_env_list_ids())))
+        if odoo_dnc == "blacklist" or (odoo_dnc == "optout" and not (soft or reconfirmed)):
+            return "blocked"  # blacklist; or a list opt-out mauxy did not write -> manual lift
     if want_mautic and await sinks.subscriber_sink("mautic").dnc(email):
         return "blocked"
+    if soft:
+        return "optout"
     return await status(site, email) if primary else "none"
 
 
@@ -413,7 +462,8 @@ async def _execute(db: aiosqlite.Connection, row: dict) -> str:
     action, sink, site = row["action"], row["sink"], row["site"]
     params, data = json.loads(row["params"]), json.loads(row["payload"] or "{}")
     email = data.get("email", "")
-    if action in GATED and await dnc_status(db, site, email, primary=False) == "blocked":
+    reconfirmed = bool(data.pop("_reconfirmed", False))  # internal flag, never sent to a receiver
+    if action in GATED and await dnc_status(db, site, email, primary=False, reconfirmed=reconfirmed) in ("blocked", "optout"):
         return "dnc_skip"  # do-not-contact: this marketing delivery never leaves (errors above -> retry)
     if sink == "webhook":
         status = await webhooks.deliver(params, idem_key=row["idem_key"], action=action, site=site,
@@ -667,7 +717,19 @@ def build_router(*, require_admin: Callable[[Request], Optional[JSONResponse]],
             return err
         if (email := await _optout_email(request)) is None:
             return JSONResponse({"error": "email required"}, status_code=422)
-        return JSONResponse({"opted_out": await opted_out(request.app.state.db, site, email)})
+        row = await optout_row(request.app.state.db, site, email)
+        return JSONResponse({"opted_out": row is not None, "source": row["source"] if row else None})
+
+    @router.post("/api/admin/optouts/{site}/block")
+    async def admin_optout_block(site: str, request: Request):
+        """Manual hard block (source admin): suppresses even the DOI mail; only an admin lifts it."""
+        if (err := require_admin(request) or bad(site)) is not None:
+            return err
+        if (email := await _optout_email(request)) is None:
+            return JSONResponse({"error": "email required"}, status_code=422)
+        await record_optout(request.app.state.db, site, email, source="admin")
+        logger.info("ADMIN_OPTOUT_BLOCKED site=%s", site)
+        return JSONResponse({"blocked": True})
 
     @router.post("/api/admin/optouts/{site}/lift")
     async def admin_optout_lift(site: str, request: Request):
@@ -676,7 +738,7 @@ def build_router(*, require_admin: Callable[[Request], Optional[JSONResponse]],
             return err
         if (email := await _optout_email(request)) is None:
             return JSONResponse({"error": "email required"}, status_code=422)
-        lifted = await lift_optout(request.app.state.db, site, email)
+        lifted = await lift_optout(request.app.state.db, site, email, "admin")
         logger.info("ADMIN_OPTOUT_LIFTED site=%s lifted=%s", site, lifted)
         return JSONResponse({"lifted": lifted}, status_code=200 if lifted else 404)
 

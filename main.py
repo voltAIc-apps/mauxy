@@ -686,6 +686,7 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
     if state == "blocked":
         await log_action(request, email, "subscribe_dnc_skip", **log)
         return
+    resignup = state == "optout"  # self-service opt-out (routed site): DOI allowed, the click re-consents
 
     await purge_newsletter_pending(db)
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
@@ -697,15 +698,22 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
     # atomic (also across connections / processes). rowcount 0 = capped.
     cur = await db.execute(
         "INSERT INTO newsletter_pending (id, token_hash, email, locale, source, page_url, site, segment, sink, "
-        "created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        "created_at, resignup) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
         "WHERE (SELECT COUNT(*) FROM newsletter_pending WHERE email = ? AND created_at >= ?) < ?",
         (pid, token_hash(token), email, payload.locale, payload.source, payload.page_url,
-         site["site"], site["segment"] or "", site["sink"] or "", now_iso(), email, since, MAX_PENDING_PER_EMAIL),
+         site["site"], site["segment"] or "", site["sink"] or "", now_iso(), int(resignup), email, since,
+         MAX_PENDING_PER_EMAIL),
     )
     inserted = cur.rowcount == 1
     await db.commit()  # also ends the (empty) implicit transaction when capped
     if not inserted:
         await log_action(request, email, "subscribe_throttled", **log)
+        return
+    if resignup and not await routing.claim_resignup(db, site["site"], email):
+        # abuse guard: one re-signup DOI per site + address per OPTOUT_RESIGNUP_DAYS (on top of the cap above)
+        await db.execute("DELETE FROM newsletter_pending WHERE id = ?", (pid,))
+        await db.commit()
+        await log_action(request, email, "subscribe_resignup_throttled", **log)
         return
 
     subject, body = NEWSLETTER_DOI[payload.locale]
@@ -826,6 +834,14 @@ async def confirm(request: Request):
             await db.commit()
             await log_action(request, email, "confirm_error", error_detail=f"dnc_check: {str(exc)[:180]}", **log)
             return fail(locale, "service_unavailable", site)
+        reconfirmed = False
+        if dnc == "optout":
+            # self-service opt-out: only a re-signup link issued AFTER it is fresh consent -> lift
+            # (audited, hash only) and re-subscribe; an older link stays blocked
+            orow = await routing.optout_row(db, site, email)
+            if row["resignup"] and orow and row["created_at"] >= orow["created_at"]:
+                reconfirmed = await routing.lift_optout(db, site, email, "doi_reconfirm")
+            dnc = "none" if reconfirmed else "blocked"
         if dnc == "blocked":
             await log_action(request, email, "confirm_dnc_refused", error_detail="routed", **log)
             return RedirectResponse(_nl_redirect(site, locale, "confirmed"), status_code=303)
@@ -833,8 +849,9 @@ async def confirm(request: Request):
         # nor repeats the others; the outbox gate re-checks do-not-contact per delivery)
         await routing.fan_out(db, site=site, action="subscribe", event_ref=f"nl:{pid}", to=to, data={
             "email": email, "locale": locale, "source": row["source"], "page_url": row["page_url"],
-            "segment": row["segment"] or "", "lists": ["newsletter"]})
-        await log_action(request, email, "confirm_ok", error_detail=f"routed:{len(to)}", **log)
+            "segment": row["segment"] or "", "lists": ["newsletter"], **({"_reconfirmed": True} if reconfirmed else {})})
+        await log_action(request, email, "confirm_ok",
+                         error_detail=f"routed:{len(to)}" + (" reconfirmed" if reconfirmed else ""), **log)
         return RedirectResponse(_nl_redirect(site, locale, "confirmed"), status_code=303)
 
     try:
