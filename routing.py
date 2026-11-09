@@ -33,6 +33,22 @@ Permanent failure / retries exhausted -> mail to LEAD_NOTIFY_TO (action, site, t
 POST /api/admin/deliveries/{id}/retry after fixing the cause. payload (contains the address) is
 cleared once delivered; rows deleted LEAD_RETENTION_DAYS after done / failed.
 
+Do-not-contact gate (security review 2026-11-09, fail closed): a routed site may have no target
+that can answer "is this address blocked?" (e.g. webhook-only). dnc_status() therefore checks
+  1. mauxy's own opt-out record (site_optout, db-patches/0007: written on every unsubscribe,
+     SHA-256 of the address, per site; lifted only by an admin on the person's request)
+  2. Odoo: mail.blacklist + an opt-out on ANY list the site's odoo targets / fallback hold
+  3. Mautic: DNC (when a mautic target or the Mautic fallback exists)
+  4. the site's fallback sink ALWAYS (sites.subscriber_sink / SUBSCRIBER_SINK; never "no target ->
+     none")
+Any error -> raises -> the caller sends nothing. Used before the DOI mail (main._subscribe_job),
+at the click (main.confirm: blocked -> token burnt, nobody gets it, the same confirmed page), and
+inside the outbox before EVERY marketing delivery (actions in GATED: subscribe, lead, selfcheck;
+result 'dnc_skip'; check error -> retry, never delivered unchecked). unsubscribe is never gated.
+Choice for leads / Selbst-Check: the crm.lead itself (a contact request the person confirmed) and
+the operator mail are still created; list subscriptions and their webhooks are skipped.
+Sites without routes keep their sink's semantics (Odoo blacklist / Mautic DNC) as before.
+
 Unsubscribe (compliance): reaches EVERY target that may hold the address for that site = explicit
 unsubscribe targets + all subscribe targets + list-holding odoo / mautic targets of lead /
 selfcheck + all webhooks of the site + the site's fallback subscriber sink (subscribers from
@@ -70,6 +86,9 @@ ACTIONS: dict[str, frozenset] = {
     "selfcheck": frozenset({"odoo", "mautic", "webhook"}),
 }
 SINKS = ("odoo", "mautic", "webhook")
+GATED = ("subscribe", "lead", "selfcheck")  # marketing deliveries: do-not-contact gate in the outbox
+# site name -> its pinned fallback subscriber sink (sites.subscriber_sink) or None; set by main.py
+FALLBACK: Callable[[str], Optional[str]] = lambda site: None
 MAX_TARGETS = 10
 SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 UTM_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,80}$")
@@ -272,6 +291,53 @@ def unsubscribe_targets(site: Optional[str], fallback_kind: Optional[str]) -> Op
     return out
 
 
+def email_hash(email: str) -> str:
+    return hashlib.sha256(email.strip().lower().encode()).hexdigest()
+
+
+async def record_optout(db: aiosqlite.Connection, site: str, email: str) -> None:
+    """mauxy's own do-not-contact record (every unsubscribe that passed the gates)."""
+    await db.execute("INSERT OR IGNORE INTO site_optout (site, email_hash, created_at) VALUES (?, ?, ?)",
+                     (site, email_hash(email), iso(now())))
+    await db.commit()
+
+
+async def opted_out(db: aiosqlite.Connection, site: str, email: str) -> bool:
+    async with db.execute("SELECT 1 FROM site_optout WHERE site = ? AND email_hash = ?", (site, email_hash(email))) as cur:
+        return await cur.fetchone() is not None
+
+
+async def lift_optout(db: aiosqlite.Connection, site: str, email: str) -> bool:
+    cur = await db.execute("DELETE FROM site_optout WHERE site = ? AND email_hash = ?", (site, email_hash(email)))
+    await db.commit()
+    return cur.rowcount == 1
+
+
+async def dnc_status(db: aiosqlite.Connection, site: str, email: str, *, fallback_kind: Optional[str] = None,
+                     primary: bool = True) -> str:
+    """'blocked' | 'subscribed' | 'none' for a ROUTED site (module doc "Do-not-contact gate").
+    Raises SinkTransient / SinkPermanent: callers fail closed. primary=True also asks the first
+    list-holding subscribe target whether the address is already subscribed (no second DOI)."""
+    if await opted_out(db, site, email):
+        return "blocked"
+    kind = (fallback_kind or FALLBACK(site) or sinks.default_subscriber_kind()).strip().lower()
+    want_odoo, want_mautic, lists = kind == "odoo", kind == "mautic", set()
+    if kind == "odoo":
+        lists.update(_env_list_ids())
+    for action in ACTIONS:
+        for t in targets(site, action):
+            if t.sink == "odoo":
+                want_odoo = True
+                lists.update(t.params.get("lists", {}).values())
+            elif t.sink == "mautic":
+                want_mautic = True
+    if want_odoo and await sinks.subscriber_sink("odoo").dnc(email, sorted(lists or set(_env_list_ids()))):
+        return "blocked"
+    if want_mautic and await sinks.subscriber_sink("mautic").dnc(email):
+        return "blocked"
+    return await status(site, email) if primary else "none"
+
+
 async def status(site: Optional[str], email: str) -> str:
     """Read-only pre-check before a newsletter DOI mail on a routed site: the first list-holding
     target ('subscribed' | 'blocked' | 'none'); webhooks cannot answer -> 'none'."""
@@ -342,11 +408,13 @@ async def _row(db: aiosqlite.Connection, did: int) -> Optional[dict]:
     return dict(r) if r else None
 
 
-async def _execute(row: dict) -> str:
+async def _execute(db: aiosqlite.Connection, row: dict) -> str:
     """One attempt at one target. Returns the result word. Raises SinkTransient / SinkPermanent."""
     action, sink, site = row["action"], row["sink"], row["site"]
     params, data = json.loads(row["params"]), json.loads(row["payload"] or "{}")
     email = data.get("email", "")
+    if action in GATED and await dnc_status(db, site, email, primary=False) == "blocked":
+        return "dnc_skip"  # do-not-contact: this marketing delivery never leaves (errors above -> retry)
     if sink == "webhook":
         status = await webhooks.deliver(params, idem_key=row["idem_key"], action=action, site=site,
                                         data=data, occurred_at=row["created_at"])
@@ -387,7 +455,7 @@ async def run(db: aiosqlite.Connection, did: int) -> None:
             if wait > 0:
                 await asyncio.sleep(wait)
         try:
-            result = await _execute(row)
+            result = await _execute(db, row)
         except sinks.SinkTransient as exc:
             attempts = row["attempts"] + 1
             if attempts < lead_sync.MAX_ATTEMPTS:
@@ -578,6 +646,39 @@ def build_router(*, require_admin: Callable[[Request], Optional[JSONResponse]],
         for r in rows:
             r["params"] = json.loads(r["params"])
         return JSONResponse({"deliveries": rows, "count": len(rows)})
+
+    async def _optout_email(request: Request) -> Optional[str]:
+        try:
+            body = await request.json()
+        except ValueError:
+            return None
+        email = body.get("email") if isinstance(body, dict) else None
+        if not isinstance(email, str):
+            return None
+        try:
+            return mailer.normalize_address(email)
+        except mailer.MailRejected:
+            return None
+
+    @router.post("/api/admin/optouts/{site}/check")
+    async def admin_optout_check(site: str, request: Request):
+        """{"email"} -> {"opted_out": bool} (address in the body, never in a URL / log)."""
+        if (err := require_admin(request) or bad(site)) is not None:
+            return err
+        if (email := await _optout_email(request)) is None:
+            return JSONResponse({"error": "email required"}, status_code=422)
+        return JSONResponse({"opted_out": await opted_out(request.app.state.db, site, email)})
+
+    @router.post("/api/admin/optouts/{site}/lift")
+    async def admin_optout_lift(site: str, request: Request):
+        """Remove mauxy's opt-out record -- ONLY on the person's explicit request (re-subscribe)."""
+        if (err := require_admin(request) or bad(site)) is not None:
+            return err
+        if (email := await _optout_email(request)) is None:
+            return JSONResponse({"error": "email required"}, status_code=422)
+        lifted = await lift_optout(request.app.state.db, site, email)
+        logger.info("ADMIN_OPTOUT_LIFTED site=%s lifted=%s", site, lifted)
+        return JSONResponse({"lifted": lifted}, status_code=200 if lifted else 404)
 
     @router.post("/api/admin/deliveries/{did}/retry")
     async def admin_retry_delivery(did: int, request: Request):

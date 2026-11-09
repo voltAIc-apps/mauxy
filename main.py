@@ -280,6 +280,14 @@ async def _init_mautic_instance(db: aiosqlite.Connection) -> None:
     await _refresh_mautic_instance(db)
 
 
+def _site_fallback(site_name: str) -> Optional[str]:
+    """Pinned subscriber sink of a site name (sites.subscriber_sink), None = global SUBSCRIBER_SINK."""
+    return next((s["sink"] for s in _SITES_BY_KEY.values() if s["site"] == site_name and s.get("sink")), None)
+
+
+routing.FALLBACK = _site_fallback  # the do-not-contact gate always checks the site's fallback sink
+
+
 def _site_for_request(request: Request) -> Optional[dict]:
     """Calling site from its Bearer key (constant-time compare against every key), or None."""
     header = request.headers.get("authorization", "")
@@ -661,8 +669,10 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
     db: aiosqlite.Connection = request.app.state.db
     log = dict(action="subscribe", site=site["site"])
     try:
-        if routing.targets(site["site"], "subscribe"):  # routed site: its first list-holding target
-            state = await routing.status(site["site"], email)
+        if routing.targets(site["site"], "subscribe"):
+            # routed site: do-not-contact across mauxy's opt-out record, every list-holding target and
+            # the fallback sink (fail closed: an error -> no DOI mail), then 'subscribed' from the first one
+            state = await routing.dnc_status(db, site["site"], email, fallback_kind=site["sink"])
         else:
             state = await sinks.subscriber_sink(site["sink"]).status(email, "newsletter")
     except (sinks.SinkTransient, sinks.SinkPermanent) as exc:
@@ -805,9 +815,22 @@ async def confirm(request: Request):
 
     site = row["site"]
     if to := routing.targets(site, "subscribe"):
-        # Routed site: the click is final; every target gets its own outbox row (retries per target,
-        # a down target neither blocks nor repeats the others). Blocked addresses are refused by
-        # the list-holding target itself (result 'blocked').
+        # Routed site: re-check do-not-contact at the click (an opt-out may have happened after the
+        # DOI mail). Error -> claim released, nothing sent (fail closed, retry later). Blocked ->
+        # token stays burnt, NOBODY gets it, the same confirmed page as a success (uniform).
+        try:
+            dnc = await routing.dnc_status(db, site, email, fallback_kind=row["sink"] or None, primary=False)
+        except (sinks.SinkTransient, sinks.SinkPermanent) as exc:
+            await db.execute("UPDATE newsletter_pending SET used_at = NULL, token_hash = ? WHERE id = ?",
+                             (token_hash(token), pid))
+            await db.commit()
+            await log_action(request, email, "confirm_error", error_detail=f"dnc_check: {str(exc)[:180]}", **log)
+            return fail(locale, "service_unavailable", site)
+        if dnc == "blocked":
+            await log_action(request, email, "confirm_dnc_refused", error_detail="routed", **log)
+            return RedirectResponse(_nl_redirect(site, locale, "confirmed"), status_code=303)
+        # every target gets its own outbox row (retries per target, a down target neither blocks
+        # nor repeats the others; the outbox gate re-checks do-not-contact per delivery)
         await routing.fan_out(db, site=site, action="subscribe", event_ref=f"nl:{pid}", to=to, data={
             "email": email, "locale": locale, "source": row["source"], "page_url": row["page_url"],
             "segment": row["segment"] or "", "lists": ["newsletter"]})
@@ -897,6 +920,9 @@ async def unsubscribe(payload: UnsubscribeRequest, request: Request):
     if not _verify_challenge(payload.challenge, payload.answer, site["topic"]):
         await log_action(request, email, "quiz_failed", **log)
         return JSONResponse({"status": "quiz_failed"}, status_code=409)
+    # mauxy's own do-not-contact record (db-patches/0007), whatever the path: webhook-only sites
+    # have no other source, and a later routing change must still know this opt-out
+    await routing.record_optout(request.app.state.db, site["site"], email)
     to = routing.unsubscribe_targets(site["site"], site["sink"])
     if to is not None:
         # Routed site: the opt-out goes to EVERY receiver that may hold the address (routing.py),

@@ -236,7 +236,8 @@ python scripts/sqlite_db.py --pull            # copy the live PVC DB to a local 
 Shipped: 0001 init, 0002 quiz seed, 0003 website consent tables (DOI pending, self-check, leads,
 outbox, login state/code), 0004 per-site policy, 0005 mail outbox, 0006 per-site brand + routing
 (`site_brand`, `site_mail_footer`, `site_redirect`, `site_origin`, `site_route`, `route_delivery`;
-`site` on leads / self-checks, `target` on `lead_sync`; seed: simplify-erp profile). Tests with `ACTION_LOG_DB=:memory:` apply the patches
+`site` on leads / self-checks, `target` on `lead_sync`; seed: simplify-erp profile), 0007 `site_optout`
+(mauxy's per-site do-not-contact record, hashed). Tests with `ACTION_LOG_DB=:memory:` apply the patches
 in-process. Never edit a deployed patch; add the next one.
 
 Dev loop: change your local DB schema, run `--generate <name>`, review the emitted patch
@@ -657,6 +658,19 @@ same `Idempotency-Key` on every retry. The ONE odoo target of `lead` / `selfchec
 (crm.lead duplicate guard, operator mail), its params in `lead_sync.target`. Permanent failure / retries
 exhausted -> mail to `LEAD_NOTIFY_TO`, then `POST /api/admin/deliveries/{id}/retry`. Payload (address)
 cleared once delivered; rows deleted after `LEAD_RETENTION_DAYS`.
+
+**Do-not-contact gate** (security review 2026-11-09, fail closed; routed sites): a site may have no target
+that can say "blocked" (e.g. webhook-only), so `routing.dnc_status()` checks (1) mauxy's own opt-out record
+`site_optout` (patch 0007: written on EVERY unsubscribe, per site, SHA-256 of the address only, never purged),
+(2) Odoo `mail.blacklist` + an opt-out on any list of the site's odoo targets / fallback lists, (3) Mautic DNC,
+(4) always the site's fallback sink. Checked before the DOI mail, again at the click (blocked: token burnt,
+nobody gets it, the same confirmed page as a success; check error: token released, `service_unavailable`) and
+inside the outbox before every marketing delivery (`subscribe`, `lead`, `selfcheck` -> result `dnc_skip`;
+check error -> retry / failure mail, never delivered unchecked). `unsubscribe` is never gated. Leads /
+Selbst-Check: the crm.lead (a confirmed contact request) and the operator mail still happen; list subscriptions
+and the lead / selfcheck webhooks are skipped. Every response stays uniform. Re-subscription after an opt-out
+only on the person's request: admin `POST /api/admin/optouts/{site}/lift` (+ remove the Odoo opt-out / DNC).
+Sites without routes keep their sink's semantics (Odoo blacklist, Mautic DNC) -- unchanged.
 
 **Unsubscribe reaches every target that may hold the address for that site** (compliance): explicit
 unsubscribe targets + all subscribe targets + list-holding odoo / mautic targets of lead / selfcheck + every

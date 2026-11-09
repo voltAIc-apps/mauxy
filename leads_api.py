@@ -383,6 +383,12 @@ async def route_confirmed(db: aiosqlite.Connection, *, origin: str, origin_id: i
     + one outbox row per other routed target; a ticked newsletter box follows the site's
     subscribe routing when it has one (shared by leads_api and selfcheck_api)."""
     lists = list(subscribe.get("lists") or [])
+    if lists and await routing.opted_out(db, site, subscribe["email"]):
+        # do-not-contact (mauxy's opt-out record): no list subscription at all. The crm.lead (a contact
+        # request the person confirmed) and the operator mail still happen; routed marketing webhooks
+        # are skipped by the outbox gate (routing.GATED).
+        logger.info("LEAD_LISTS_DNC_SKIP origin=%s id=%s", origin, origin_id)
+        lists = []
     if "newsletter" in lists and (nl_to := routing.targets(site, "subscribe")):
         lists.remove("newsletter")
         await routing.fan_out(db, site=site, action="subscribe", event_ref=f"{origin}-nl:{origin_id}", to=nl_to, data={

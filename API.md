@@ -251,9 +251,15 @@ authoritative after.
   ```
 - `DELETE /api/admin/routes/{site}/{action}` — back to the fallback sinks; `404` if there were none.
 
+### Opt-outs — `/api/admin/optouts` (mauxy's per-site do-not-contact record, patch 0007)
+- `POST /api/admin/optouts/{site}/check` `{"email"}` → `{"opted_out": bool}` (address in the body, never in a URL).
+- `POST /api/admin/optouts/{site}/lift` `{"email"}` → `{"lifted": true}` / `404`. Only on the person's explicit
+  request (re-subscribe); written automatically on every unsubscribe, read by the do-not-contact gate of routed
+  sites (README "Per site").
+
 ### Deliveries — `/api/admin/deliveries` (fan-out outbox)
 - `GET [?state=queued|done|failed&site=…&action=…&limit=100]` — per-target rows (`sink`, `params`, `state`,
-  `result`, `attempts`, `last_error`, …; never the payload).
+  `result` (`dnc_skip` = do-not-contact gate), `attempts`, `last_error`, …; never the payload).
 - `POST /api/admin/deliveries/{id}/retry` — failed -> queued (attempts reset); `409` if not failed or purged.
 
 ---

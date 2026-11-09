@@ -163,6 +163,12 @@ class MauticSubscriberSink:
             return "blocked"
         return "none"
 
+    async def dnc(self, email: str) -> bool:
+        """Do-not-contact (DNC on the e-mail channel), whatever the tags say."""
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            contact = await self._contact(client, email)
+        return bool(contact and contact_is_dnc(contact))
+
     async def subscribe(self, email, list_key, *, lang, source, page_url, name=None, company=None, segment=None):
         fields = {"newsletter_locale": lang, "newsletter_source": source,
                   "newsletter_consented_at": _now_iso(), "newsletter_page_url": page_url}

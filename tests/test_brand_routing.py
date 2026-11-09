@@ -9,6 +9,10 @@ routing ("hooks") with fan-out through the route_delivery outbox, signed webhook
   T-RT-001..021  route admin validation matrix ("route_admin")
   T-RT-030..041  fan-out, partial failure + retry, idempotency, permanent failure + mail + admin
                  retry, unsubscribe reaches every target, routed leads / self-check, fallback
+  T-DNC-001..009 do-not-contact gate of routed sites (security review): fallback blacklist, one of
+                 several targets, webhook-only + mauxy opt-out record, check error -> fail closed,
+                 block at the click, outbox gate for lead / selfcheck webhooks + lists, uniform
+                 responses, admin check / lift
   T-WH-001..005  signature, headers, body, receiver reference check
   T-WH-010..024  SSRF matrix ("ssrf"), T-WH-030..039 response handling ("responses")
   T-WH-040..041  real TLS on 10.0.99.1: connection pinned to the checked address, SNI + certificate
@@ -536,7 +540,7 @@ def test_t_rt_031_partial_failure_retry_no_duplicates(client, outbox, odoo, hook
         assert webhooks.verify(SECRET.encode(), r.headers["x-mauxy-timestamp"], r.content, r.headers["x-mauxy-signature"])
 
 
-def test_t_rt_032_idempotent_enqueue(client, hooks):
+def test_t_rt_032_idempotent_enqueue(client, odoo, hooks):  # odoo: the gate of the subscribe row checks the fallback
     async def go(app):
         to = [routing.Target(1, "webhook", FLYWHEEL)]
         a = await routing.fan_out(app.state.db, site="s", action="unsubscribe", event_ref="unsub:1", data={"email": "a@b.de"}, to=to)
@@ -579,7 +583,7 @@ def test_t_rt_034_odoo_transient_retried_independently(client, outbox, odoo, hoo
     put_routes(client, "simplify-web", "subscribe", [{"sink": "odoo", "params": {"lists": {"newsletter": 5}}},
                                                      {"sink": "webhook", "params": FLYWHEEL}])
     token, _ = nl_subscribe(client, outbox, "ida@example.com")
-    odoo.fail[("mail.blacklist", "search_read")] = ["http502"]  # first Odoo call of the delivery
+    odoo.fail[("mailing.contact", "create")] = ["http502"]  # inside the Odoo delivery (after every check)
     click_confirm(client, f"/api/confirm?token={token}")
     drain(client)
     by_sink = {d["sink"]: d for d in deliveries(client)}
@@ -847,3 +851,157 @@ def test_t_br_065_image_and_secret_carry_the_new_parts():
         assert var in deploy.SECRET_KEYS
     assert "WEBHOOK_CA_FILE" not in deploy.KNOWN_VARS
     assert deploy.WEBHOOK_SECRET_RE.match("WEBHOOK_SECRET_FLYWHEEL") and not deploy.WEBHOOK_SECRET_RE.match("WEBHOOK_SECRET_")
+
+
+# ------------------------------------------------------------------------------------------ do-not-contact gate
+
+
+def _blacklist(odoo, email):
+    odoo.add("mail.blacklist", email=email)
+
+
+def _subscribe_status(client, outbox, email, key=WEB_KEY):
+    """Every subscribe answers the same, immediately; returns (response json, DOI mails to the address)."""
+    body = {"email": email, "locale": "de", "source": "footer", "consent": True, "pageUrl": "https://site.test/de/"}
+    r = client.post("/api/subscribe", headers={"Authorization": f"Bearer {key}"}, json=body)
+    return r.status_code, r.json(), [m for m in outbox if m["to"] == email]
+
+
+def test_t_dnc_001_blacklisted_in_fallback_webhook_only(client, outbox, odoo, hooks):
+    """simplify-web routes subscribe to a webhook only; its fallback sink is Odoo: a blacklisted
+    address gets no DOI mail and the webhook never sees it."""
+    put_routes(client, "simplify-web", "subscribe", [{"sink": "webhook", "params": FLYWHEEL}])
+    _blacklist(odoo, "bl@example.com")
+    assert _subscribe_status(client, outbox, "bl@example.com") == (200, {"status": "pending_confirmation"}, [])
+    assert _subscribe_status(client, outbox, "ok@example.com")[2]  # control: a clean address gets its DOI
+    assert hooks.requests == [] and deliveries(client) == []
+
+
+def test_t_dnc_002_opted_out_on_one_of_several_targets(client, outbox, odoo, hooks):
+    """Opt-out on list 6 (second odoo target of another action) blocks, although list 5 is clean."""
+    for lid in (5, 6):
+        odoo.add("mailing.list", id=lid, name=f"L{lid}")
+    put_routes(client, "simplify-web", "subscribe", [{"sink": "odoo", "params": {"lists": {"newsletter": 5}}},
+                                                     {"sink": "webhook", "params": FLYWHEEL}])
+    put_routes(client, "simplify-web", "selfcheck", [{"sink": "odoo", "params": {"lists": {"radar": 6}}}])
+    cid = odoo.add("mailing.contact", name="x", email="oo@example.com")
+    odoo.add("mailing.subscription", contact_id=cid, list_id=6, opt_out=True)
+    assert _subscribe_status(client, outbox, "oo@example.com")[2] == []
+
+
+@respx.mock(assert_all_called=False)
+def test_t_dnc_003_mautic_dnc_target_blocks(respx_mock, client, outbox, odoo, hooks):
+    """Mautic DNC counts even when the contact still carries the newsletter tag."""
+    put_routes(client, "simplify-web", "subscribe", [{"sink": "mautic"}, {"sink": "webhook", "params": FLYWHEEL}])
+    respx_mock.get(re.compile(r"https://mautic\.test/api/contacts(\?.*)?$")).mock(return_value=httpx.Response(200, json={
+        "contacts": {"11": {"id": 11, "fields": {"core": {"email": {"value": "md@example.com"}}},
+                            "tags": [{"tag": "newsletter_confirmed"}], "doNotContact": [{"channel": "email", "reason": 1}]}}}))
+    assert _subscribe_status(client, outbox, "md@example.com")[2] == []
+
+
+def test_t_dnc_004_webhook_only_site_opt_out_record(client, outbox, odoo, hooks, monkeypatch):
+    """A webhook-only site whose fallback is 'none': mauxy's own opt-out record is the source.
+    Unsubscribe -> record (hash only) -> no DOI mail, no webhook; admin lift on request -> DOI again."""
+    monkeypatch.setitem(mauxy_main._SITES_BY_KEY[WEB_KEY], "sink", "none")
+    put_routes(client, "simplify-web", "subscribe", [{"sink": "webhook", "params": FLYWHEEL}])
+    assert unsubscribe(client, "Ov@Example.com").json() == {"status": "ok"}
+    (row,) = q(client, "SELECT * FROM site_optout")
+    assert row["site"] == "simplify-web" and row["email_hash"] == hashlib.sha256(b"ov@example.com").hexdigest()
+    assert "ov@example.com" not in json.dumps(q(client, "SELECT * FROM site_optout"))
+    hooks.requests.clear()
+    assert _subscribe_status(client, outbox, "ov@example.com")[2] == [] and hooks.requests == []
+    check = lambda: client.request("POST", "/api/admin/optouts/simplify-web/check", headers=ADMIN, json={"email": "OV@example.com"})  # noqa: E731
+    assert check().json() == {"opted_out": True}
+    assert client.request("POST", "/api/admin/optouts/simplify-web/check", json={"email": "ov@example.com"}).status_code == 401
+    assert client.request("POST", "/api/admin/optouts/simplify-web/lift", headers=ADMIN, json={"email": "ov@example.com"}).json() == {"lifted": True}
+    assert check().json() == {"opted_out": False}
+    assert _subscribe_status(client, outbox, "ov@example.com")[2]
+
+
+@respx.mock(assert_all_called=False)
+def test_t_dnc_005_fallback_path_records_opt_out(respx_mock, client, odoo):
+    respx_mock.get(re.compile(r"https://mautic\.test/api/contacts(\?.*)?$")).mock(return_value=httpx.Response(200, json={"contacts": {}}))
+    assert unsubscribe(client, "lu@example.com", LUDO_KEY).json() == {"status": "ok"}
+    assert [r["site"] for r in q(client, "SELECT site FROM site_optout")] == ["ludo"]
+    assert deliveries(client) == []  # ludo itself: unchanged, synchronous
+
+
+def test_t_dnc_006_check_error_fails_closed_uniformly(client, outbox, odoo, hooks):
+    """Blacklist lookup errors: no DOI mail, same immediate answer as for any other address."""
+    put_routes(client, "simplify-web", "subscribe", [{"sink": "webhook", "params": FLYWHEEL}])
+    odoo.fail[("mail.blacklist", "search_read")] = ["http502"]
+    err = _subscribe_status(client, outbox, "er@example.com")
+    _blacklist(odoo, "bl2@example.com")
+    blocked = _subscribe_status(client, outbox, "bl2@example.com")
+    clean = _subscribe_status(client, outbox, "cl@example.com")
+    assert err[:2] == blocked[:2] == clean[:2] == (200, {"status": "pending_confirmation"})
+    assert err[2] == [] and blocked[2] == [] and clean[2]
+    log = {r["email"]: r["result"] for r in client.request("GET", "/api/actions", headers=ADMIN).json()["actions"]}
+    assert log["er@example.com"] == "sink_error" and log["bl2@example.com"] == "subscribe_dnc_skip"
+
+
+def test_t_dnc_007_blocked_at_the_click(client, outbox, odoo, hooks):
+    """Opt-out between DOI mail and click: token burnt, nobody gets it, the SAME confirmed page;
+    a check error at the click releases the token (fail closed, retry possible)."""
+    put_routes(client, "simplify-web", "subscribe", [{"sink": "webhook", "params": FLYWHEEL}])
+    ok_token, _ = nl_subscribe(client, outbox, "fine@example.com")
+    token, _ = nl_subscribe(client, outbox, "late@example.com")
+    unsubscribe(client, "late@example.com")
+    hooks.requests.clear()
+    blocked = click_confirm(client, f"/api/confirm?token={token}")
+    drain(client)
+    ok = click_confirm(client, f"/api/confirm?token={ok_token}")
+    drain(client)
+    assert blocked.status_code == ok.status_code == 303 and blocked.headers["location"] == ok.headers["location"]
+    assert [e["data"]["email"] for e in hooks.events("flywheel.test")] == ["fine@example.com"]
+    assert is_burnt(client, token)
+    # error at the click -> nothing sent, token still valid
+    token3, _ = nl_subscribe(client, outbox, "retry@example.com")
+    odoo.fail[("mail.blacklist", "search_read")] = ["http502"]
+    hooks.requests.clear()
+    r = click_confirm(client, f"/api/confirm?token={token3}")
+    assert r.headers["location"].endswith("confirm-error?reason=service_unavailable") and hooks.requests == []
+    assert click_confirm(client, f"/api/confirm?token={token3}").headers["location"].endswith("/newsletter/confirmed")
+
+
+def is_burnt(client, token):
+    return confirm_form(client.get(f"/api/confirm?token={token}")) is None
+
+
+def test_t_dnc_008_lead_and_selfcheck_marketing_gated(client, outbox, odoo, hooks):
+    """Opted-out address sends a contact form with the newsletter box + a Selbst-Check with radar:
+    the crm.lead (confirmed contact request) and the operator mail happen; no list subscription,
+    no lead / selfcheck webhook (outbox result dnc_skip)."""
+    put_routes(client, "simplify-erp", "lead", [{"sink": "odoo"}, {"sink": "webhook", "params": FLYWHEEL}])
+    put_routes(client, "simplify-erp", "selfcheck", [{"sink": "odoo"}, {"sink": "webhook", "params": OTHER}])
+
+    async def opt_out(app):
+        await routing.record_optout(app.state.db, "simplify-erp", "dora@example.com")
+    client.portal.call(opt_out, client.app)
+    client.post("/api/lead", headers={"Origin": "https://site.test"},
+                json={**copy.deepcopy(LEAD_BASE), "email": "dora@example.com", "newsletter": True})
+    click_confirm(client, "/api/lead/confirm?token=" + re.search(r"token=(\S+)", outbox[-1]["body"]).group(1))
+    client.post("/api/selfcheck", headers={"Origin": "https://site.test"}, json={**copy.deepcopy(SC_BASE), "email": "dora@example.com"})
+    click_confirm(client, "/api/selfcheck/confirm?token=" + re.search(r"token=(\S+)", outbox[-1]["body"]).group(1))
+    drain(client)
+    assert len(odoo.leads()) == 2 and odoo.writes_to("mailing.contact") == [] and odoo.writes_to("mailing.subscription") == []
+    assert hooks.requests == []
+    assert sorted((d["action"], d["result"]) for d in deliveries(client)) == [("lead", "dnc_skip"), ("selfcheck", "dnc_skip")]
+    assert any(m["to"] == "owner@site.test" for m in outbox)  # operator still informed
+
+
+def test_t_dnc_009_outbox_gate_error_retries_never_delivers_unchecked(client, outbox, odoo, hooks):
+    """The check inside the outbox fails every time -> the webhook is never called, the row fails
+    (operator mail), the retry after the fix delivers."""
+    put_routes(client, "simplify-erp", "lead", [{"sink": "webhook", "params": FLYWHEEL}])
+    client.post("/api/lead", headers={"Origin": "https://site.test"}, json={**copy.deepcopy(LEAD_BASE), "email": "gus@example.com"})
+    token = re.search(r"token=(\S+)", outbox[-1]["body"]).group(1)
+    odoo.fail[("mail.blacklist", "search_read")] = ["http502"] * 20
+    click_confirm(client, f"/api/lead/confirm?token={token}")
+    drain(client)
+    (row,) = deliveries(client)
+    assert row["state"] == "failed" and hooks.requests == []
+    odoo.fail.clear()
+    client.request("POST", f"/api/admin/deliveries/{row['id']}/retry", headers=ADMIN)
+    drain(client)
+    assert deliveries(client)[0]["state"] == "done" and len(hooks.requests) == 1
