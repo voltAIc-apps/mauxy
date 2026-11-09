@@ -7,7 +7,7 @@ Tests for every endpoint. Mautic is mocked via `respx`; Odoo is ALWAYS the in-me
 |---|---|
 | T-MAIL-0xx | mailer: real SMTP server (aiosmtpd) on 10.0.99.1 with a test CA (trustme): STARTTLS / implicit TLS, refusal without STARTTLS, untrusted cert, hostname mismatch, MIME (alternative / related / mixed, umlauts, RFC 2231), size / type / magic limits, header injection, audience policy, retries, idempotency, per-recipient limit, List-Unsubscribe, resume, log hygiene (test_mailer) |
 | T-NL-0xx | newsletter authority: site key + quiz gate matrix (cases/newsletter_gate_cases.json), per-site policy (quiz off, pinned sink, doi_owner), website contract, ludo upstream flow, admin CRUD, db-patches upgrade / strict start, k8s Recreate (test_newsletter_gate) |
-| T-SEC-0xx | newsletter DOI security (test_subscribe, test_confirm, test_timing) |
+| T-SEC-0xx | newsletter DOI security (test_subscribe, test_confirm, test_timing); DOI links vs. prefetch: GET read-only page, POST click, CSRF, neutral page, page hardening, parallel clicks for newsletter / lead / Selbst-Check (T-SEC-020..038, test_confirm_click, cases/confirm_click_cases.json); atomic per-address caps under concurrency (T-SEC-040..045, test_throttle_race) |
 | T-SC-1xx | Selbst-Check (test_selfcheck, cases/selfcheck_api_cases.json) |
 | T-ODOO-0xx | Odoo client: https, allowlist, errors, no key leaks (test_odoo_client) |
 | T-SINK-0xx | Odoo sinks: partner match, lead vals, follower, lists, opt-out (test_sinks) |

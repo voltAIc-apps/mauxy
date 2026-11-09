@@ -11,6 +11,7 @@ import re
 
 import httpx
 import respx
+from tests.conftest import click_confirm
 
 CONTACTS_URL = re.compile(r"https://mautic\.test/api/contacts(\?.*)?$")
 ANY_WRITE = re.compile(r"https://mautic\.test/api/(contacts/new|contacts/\d+/edit|emails/.*)$")
@@ -120,8 +121,8 @@ def test_t_sec_008_client_consent_time_is_not_stored(respx_mock, client, outbox,
     token = re.search(r"token=(\S+)", outbox[0]["body"]).group(1)
     create = respx_mock.post("https://mautic.test/api/contacts/new").mock(
         return_value=httpx.Response(201, json={"contact": {"id": 7}}))
-    resp = client.get(f"/api/confirm?token={token}", follow_redirects=False)
-    assert resp.status_code == 302 and resp.headers["location"].endswith("/en/newsletter/confirmed")
+    resp = click_confirm(client, f"/api/confirm?token={token}")
+    assert resp.status_code == 303 and resp.headers["location"].endswith("/en/newsletter/confirmed")
     sent = create.calls.last.request.read().decode()
     assert "1999-01-01" not in sent and "newsletter_consented_at" in sent  # server time used
 

@@ -8,10 +8,14 @@ call to action that ends as a crm.lead in erp.wapsol.
                                  POST /api/selfcheck (selfcheck_api.py). Immediate uniform
                                  200 {"status": "pending_confirmation"}; storage + ONE DOI mail run
                                  as a job after the response. Nothing goes to any sink here.
-  GET  /api/lead/confirm?token=  single use (SHA-256, constant time), own salt. Burns the token,
-                                 queues the delivery (lead_sync): crm.lead + newsletter if ticked.
-                                 302 to {LEAD_WEBSITE_URL}/{lang}/anfrage/bestaetigt?art=<kind>
-                                 (error: /{lang}/anfrage/fehler).
+  GET  /api/lead/confirm?token=  DOI mail link, READ-ONLY: confirmation page with a "Bestätigen"
+                                 button (confirm_page.py; mail scanners prefetch links). Invalid /
+                                 expired / used: uniform neutral page.
+  POST /api/lead/confirm         form field token: single use (SHA-256, constant time, atomic
+                                 claim), own salt. Burns the token, queues the delivery
+                                 (lead_sync): crm.lead + newsletter if ticked.
+                                 303 to {LEAD_WEBSITE_URL}/{lang}/anfrage/bestaetigt?art=<kind>
+                                 (misconfigured: /{lang}/anfrage/fehler).
   GET  /api/lead/submissions     admin (Bearer ADMIN_API_KEY): submissions + CRM state.
   POST /api/lead/sync/{id}/retry admin: re-queue a failed CRM delivery.
 
@@ -37,6 +41,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
 
+import confirm_page
 import jobs
 import lead_sync
 import mailer
@@ -288,10 +293,28 @@ def _origin_ok(request: Request) -> bool:
     return request.headers.get("origin", "").rstrip("/") in LEAD_ALLOWED_ORIGINS
 
 
-def _redirect(lang: str, ok: bool, kind: str = "") -> RedirectResponse:
+def _redirect(lang: str, ok: bool, kind: str = "", status: int = 302) -> RedirectResponse:
     lang = lang if lang in ("de", "en") else "de"
     path = f"anfrage/bestaetigt?art={kind}" if ok else "anfrage/fehler"
-    return RedirectResponse(f"{LEAD_WEBSITE_URL}/{lang}/{path}", status_code=302)
+    return RedirectResponse(f"{LEAD_WEBSITE_URL}/{lang}/{path}", status_code=status)
+
+
+async def _pending(db: aiosqlite.Connection, token: Optional[str]):
+    """Read-only token check (own salt, max_age, pending row, SHA-256 constant time). Row or None."""
+    if not _signer or not token or len(token) > 1000:
+        return None
+    try:
+        data = _signer.loads(token, max_age=CONFIRM_TOKEN_MAX_AGE)
+    except (SignatureExpired, BadSignature):
+        return None
+    lid = data.get("l") if isinstance(data, dict) else None
+    if not isinstance(lid, int):
+        return None
+    async with db.execute("SELECT * FROM lead_submission WHERE id = ?", (lid,)) as cur:
+        row = await cur.fetchone()
+    if row is None or row["status"] != "pending" or not row["token_hash"] or not hmac.compare_digest(row["token_hash"], _hash(token)):
+        return None
+    return row
 
 
 async def _submit_job(db: aiosqlite.Connection, payload) -> None:
@@ -299,17 +322,18 @@ async def _submit_job(db: aiosqlite.Connection, payload) -> None:
     await purge(db)
     email = payload.email.lower()
     since = _iso(_now() - timedelta(hours=24))
-    async with db.execute("SELECT COUNT(*) FROM lead_submission WHERE email = ? AND created_at >= ?", (email, since)) as cur:
-        (recent,) = await cur.fetchone()
-    if recent >= MAX_PENDING_PER_EMAIL:
-        logger.info("LEAD_THROTTLED kind=%s", payload.kind)
-        return
     data = payload.model_dump(mode="json", exclude={"email", "lang", "newsletter", "page_url", "company_website", "kind"},
                               exclude_none=True)
+    # cap + insert in ONE statement (atomic, no COUNT-then-INSERT race; security review 2026-11-09)
     cur = await db.execute(
-        "INSERT INTO lead_submission (kind, created_at, email, lang, newsletter, page_url, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO lead_submission (kind, created_at, email, lang, newsletter, page_url, data) "
+        "SELECT ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM lead_submission WHERE email = ? AND created_at >= ?) < ?",
         (payload.kind, _iso(_now()), email, payload.lang, int(payload.newsletter), payload.page_url,
-         json.dumps(data, ensure_ascii=False)))
+         json.dumps(data, ensure_ascii=False), email, since, MAX_PENDING_PER_EMAIL))
+    if cur.rowcount != 1:
+        await db.commit()  # end the (empty) implicit transaction
+        logger.info("LEAD_THROTTLED kind=%s", payload.kind)
+        return
     lid = cur.lastrowid
     token = _signer.dumps({"l": lid})
     await db.execute("UPDATE lead_submission SET token_hash = ? WHERE id = ?", (_hash(token), lid))
@@ -347,25 +371,39 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
 
     @router.get("/api/lead/confirm")
     @limiter.limit(os.environ.get("CONFIRM_RATE_LIMIT", "30/minute"))
-    async def lead_confirm(request: Request, token: str = Query(..., min_length=1, max_length=1000)):
+    async def lead_confirm_page(request: Request, token: str = Query(..., min_length=1, max_length=1000)):
+        """DOI link, step 1 READ-ONLY (mail scanners prefetch links): confirmation page with a
+        "Bestätigen" button (POST). Invalid / expired / used: uniform neutral page."""
         if not _signer:
             return _redirect("de", False)
-        try:
-            data = _signer.loads(token, max_age=CONFIRM_TOKEN_MAX_AGE)
-        except (SignatureExpired, BadSignature):
-            return _redirect("de", False)
-        lid = data.get("l") if isinstance(data, dict) else None
-        if not isinstance(lid, int):
-            return _redirect("de", False)
+        row = await _pending(request.app.state.db, token)
+        if row is None:
+            return confirm_page.neutral()
+        return confirm_page.render("lead", row["lang"], "/api/lead/confirm", token, LEAD_WEBSITE_URL)
+
+    @router.post("/api/lead/confirm")
+    @limiter.limit(os.environ.get("CONFIRM_RATE_LIMIT", "30/minute"))
+    async def lead_confirm(request: Request):
+        """DOI step 2, the human click: claims the token atomically (single use), queues the
+        delivery (crm.lead + newsletter if ticked), 303 to the website's confirmed page."""
+        if not _signer:
+            return _redirect("de", False, status=303)
+        if not confirm_page.same_origin(request):
+            logger.warning("LEAD_CONFIRM_FOREIGN_ORIGIN")
+            return confirm_page.neutral(403)
+        token = await confirm_page.form_token(request)
         db: aiosqlite.Connection = request.app.state.db
-        async with db.execute("SELECT * FROM lead_submission WHERE id = ?", (lid,)) as cur:
-            row = await cur.fetchone()
-        if row is None or row["status"] != "pending" or not row["token_hash"] or not hmac.compare_digest(row["token_hash"], _hash(token)):
-            return _redirect(row["lang"] if row else "de", False)
-        # burn first: a parallel second click finds no pending row
-        await db.execute("UPDATE lead_submission SET status = 'confirmed', confirmed_at = ?, token_hash = NULL WHERE id = ?",
-                         (_iso(_now()), lid))
+        row = await _pending(db, token)
+        if row is None:
+            return confirm_page.neutral()
+        lid = row["id"]
+        # burn first, conditionally: a parallel second POST finds no pending row (rowcount 0)
+        cur = await db.execute("UPDATE lead_submission SET status = 'confirmed', confirmed_at = ?, token_hash = NULL "
+                               "WHERE id = ? AND status = 'pending' AND token_hash = ?", (_iso(_now()), lid, _hash(token)))
+        claimed = cur.rowcount == 1
         await db.commit()
+        if not claimed:
+            return confirm_page.neutral()
         async with db.execute("SELECT * FROM lead_submission WHERE id = ?", (lid,)) as cur:
             row = await cur.fetchone()
         d = json.loads(row["data"])
@@ -374,7 +412,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
                      "lists": ["newsletter"] if row["newsletter"] else []}
         await lead_sync.enqueue(db, origin="lead", origin_id=lid, lead=lead_for(row, lead_sync.new_ref()), subscribe=subscribe)
         logger.info("LEAD_CONFIRMED id=%s kind=%s", lid, row["kind"])
-        return _redirect(row["lang"], True, row["kind"])
+        return _redirect(row["lang"], True, row["kind"], status=303)
 
     @router.get("/api/lead/submissions")
     async def lead_submissions(request: Request, status: Literal["pending", "confirmed"] = Query("confirmed"),

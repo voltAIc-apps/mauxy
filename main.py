@@ -2,7 +2,7 @@
 mauxy -- the website's interface to other systems (owner decision 2026-11-08): public consent
 service of simplify-erp.de for newsletter, Migration Radar, Selbst-Check and every lead CTA.
 
-  newsletter   GET /api/challenge, POST /api/subscribe, GET /api/confirm,
+  newsletter   GET /api/challenge, POST /api/subscribe, GET+POST /api/confirm,
                POST /api/unsubscribe                                        (this file)
   admin        /api/actions, /api/admin/sites|quiz|mautic-instance          (this file)
   self-check   /api/selfcheck*                                              (selfcheck_api.py, SPEC-020)
@@ -21,7 +21,8 @@ point for all sites (simplify-erp, ludo, re-cloud, ...). Two gates sit in front 
      expiring token; (un)subscribe must echo the token and the correct answer (else 409).
      Honeypot `company_website` silently drops bots.
 Behind the gates mauxy owns the double opt-in (not Mautic): ALL pending data stays server-side in
-SQLite, nothing is written to any sink before the confirmation link is clicked; confirmation
+SQLite, nothing is written to any sink before the person clicks "Bestätigen" on the confirmation
+page (GET of the mail link is read-only: scanners prefetch links, confirm_page.py); confirmation
 tokens are signed, time-limited and single-use (stored as SHA-256, compared in constant time).
 
 Schema: versioned patches in db-patches/ (db_migrate.py), applied by the deployer
@@ -52,6 +53,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 import auth_api
+import confirm_page
 import db_migrate  # schema patches live in db-patches/; this is the shared runner
 import jobs
 import lead_sync
@@ -660,23 +662,24 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
 
     await purge_newsletter_pending(db)
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
-    async with db.execute(
-        "SELECT COUNT(*) FROM newsletter_pending WHERE email = ? AND created_at >= ?", (email, since)
-    ) as cur:
-        (recent,) = await cur.fetchone()
-    if recent >= MAX_PENDING_PER_EMAIL:
-        await log_action(request, email, "subscribe_throttled", **log)
-        return
-
     pid = secrets.token_urlsafe(16)
     token = _token_signer.dumps({"p": pid})
-    await db.execute(
+    # Cap + insert in ONE statement (security review 2026-11-09, throttle race): a separate
+    # COUNT followed by an INSERT let N parallel requests all see "below the cap". SQLite takes
+    # the write lock at the start of a writing statement, so the sub-select and the insert are
+    # atomic (also across connections / processes). rowcount 0 = capped.
+    cur = await db.execute(
         "INSERT INTO newsletter_pending (id, token_hash, email, locale, source, page_url, site, segment, sink, "
-        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        "WHERE (SELECT COUNT(*) FROM newsletter_pending WHERE email = ? AND created_at >= ?) < ?",
         (pid, token_hash(token), email, payload.locale, payload.source, payload.page_url,
-         site["site"], site["segment"] or "", site["sink"] or "", now_iso()),
+         site["site"], site["segment"] or "", site["sink"] or "", now_iso(), email, since, MAX_PENDING_PER_EMAIL),
     )
-    await db.commit()
+    inserted = cur.rowcount == 1
+    await db.commit()  # also ends the (empty) implicit transaction when capped
+    if not inserted:
+        await log_action(request, email, "subscribe_throttled", **log)
+        return
 
     subject, body = NEWSLETTER_DOI[payload.locale]
     ok = await mailer.send(email, subject, body.format(
@@ -691,36 +694,17 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
     await log_action(request, email, "subscribe_ok", **log)
 
 
-@app.get("/api/confirm")
-@limiter.limit(CONFIRM_RATE_LIMIT)
-async def confirm(request: Request, token: str = Query(..., min_length=1, max_length=1000)):
-    """
-    Double opt-in landing (link in the DOI mail). Always a 302 back to the website.
-
-    Checks, in order: signature + max_age; pending row exists; stored token hash equals the
-    presented token (constant time) and is unused (single use). Then the subscriber sink
-    subscribes (Odoo: mailing.contact / mailing.subscription on ODOO_LIST_NEWSLETTER_ID;
-    deprecated Mautic: tag newsletter_confirmed, server-side consent time). Blocked (blacklist /
-    DNC) -> token burnt, error page. Sink unreachable -> token stays valid, the person can retry.
-    """
-    db: aiosqlite.Connection = request.app.state.db
-
-    def fail(locale: str, reason: str) -> RedirectResponse:
-        return RedirectResponse(_website_redirect(locale, "newsletter/confirm-error", reason=reason), status_code=302)
-
-    if not _token_signer or not PUBLIC_WEBSITE_BASE_URL:
-        logger.error("CONFIRM_MISCONFIGURED signer=%s site=%s", bool(_token_signer), bool(PUBLIC_WEBSITE_BASE_URL))
-        return fail("en", "server_misconfigured")
-
+async def _pending_for_token(db: aiosqlite.Connection, token: Optional[str]) -> tuple[Optional[aiosqlite.Row], str]:
+    """Read-only token check of the newsletter DOI: signature + max_age, pending row exists, stored
+    hash equals the presented token (constant time), unused. (row, "") or (None, reason)."""
+    if not token or len(token) > 1000:
+        return None, "confirm_invalid"
     try:
         data = _token_signer.loads(token, max_age=CONFIRM_TOKEN_MAX_AGE)
     except SignatureExpired:
-        await log_action(request, "", "confirm_expired", action="confirm")
-        return fail("en", "invalid_or_expired")
+        return None, "confirm_expired"
     except BadSignature:
-        await log_action(request, "", "confirm_invalid", action="confirm")
-        return fail("en", "invalid_or_expired")
-
+        return None, "confirm_invalid"
     pid = data.get("p") if isinstance(data, dict) else None
     row = None
     if isinstance(pid, str):
@@ -728,32 +712,93 @@ async def confirm(request: Request, token: str = Query(..., min_length=1, max_le
             row = await cur.fetchone()
     # Legacy tokens ({email, locale}) and replays both end here: no pending row / hash burnt.
     if row is None or row["used_at"] or not tokens_equal(row["token_hash"], token):
-        await log_action(request, row["email"] if row else "", "confirm_invalid", error_detail="not_pending_or_used",
-                         action="confirm", site=row["site"] if row else "")
-        return fail(row["locale"] if row else "en", "invalid_or_expired")
+        return None, "confirm_invalid"
+    return row, ""
 
-    email, locale = row["email"], row["locale"]
+
+def _confirm_misconfigured() -> bool:
+    if _token_signer and PUBLIC_WEBSITE_BASE_URL:
+        return False
+    logger.error("CONFIRM_MISCONFIGURED signer=%s site=%s", bool(_token_signer), bool(PUBLIC_WEBSITE_BASE_URL))
+    return True
+
+
+@app.get("/api/confirm")
+@limiter.limit(CONFIRM_RATE_LIMIT)
+async def confirm_page_get(request: Request, token: str = Query(..., min_length=1, max_length=1000)):
+    """
+    Newsletter DOI link (mail) -- step 1, READ-ONLY (security review 2026-11-09: mail scanners
+    prefetch links). Validates the token and renders the confirmation page (confirm_page.py) with a
+    "Bestätigen" / "Confirm" button that POSTs the token. Nothing is burnt, logged to action_log or
+    written to any sink here. Invalid / expired / used: the uniform neutral page.
+    """
+    if _confirm_misconfigured():
+        return RedirectResponse(_website_redirect("en", "newsletter/confirm-error", reason="server_misconfigured"),
+                                status_code=302)
+    row, reason = await _pending_for_token(request.app.state.db, token)
+    if row is None:
+        logger.info("CONFIRM_PAGE_INVALID reason=%s", reason)
+        return confirm_page.neutral()
+    return confirm_page.render("newsletter", row["locale"], "/api/confirm", token, PUBLIC_WEBSITE_BASE_URL)
+
+
+@app.post("/api/confirm")
+@limiter.limit(CONFIRM_RATE_LIMIT)
+async def confirm(request: Request):
+    """
+    Newsletter DOI -- step 2, the human click (form POST, field `token`). Always ends on the website
+    (303) except for an invalid token (uniform neutral page) or a foreign Origin/Referer (403).
+
+    Same checks as step 1, then the token is CLAIMED atomically (conditional UPDATE, single use:
+    a parallel second POST finds it burnt), then the subscriber sink subscribes (Odoo:
+    mailing.contact / mailing.subscription on ODOO_LIST_NEWSLETTER_ID; deprecated Mautic: tag
+    newsletter_confirmed, server-side consent time). Blocked (blacklist / DNC) -> stays burnt,
+    error page. Sink unreachable -> claim released, the token stays valid, the person can retry.
+    """
+    db: aiosqlite.Connection = request.app.state.db
+
+    def fail(locale: str, reason: str) -> RedirectResponse:
+        return RedirectResponse(_website_redirect(locale, "newsletter/confirm-error", reason=reason), status_code=303)
+
+    if _confirm_misconfigured():
+        return fail("en", "server_misconfigured")
+    if not confirm_page.same_origin(request):
+        await log_action(request, "", "confirm_foreign_origin", action="confirm")
+        return confirm_page.neutral(403)
+    token = await confirm_page.form_token(request)
+    row, reason = await _pending_for_token(db, token)
+    if row is None:
+        await log_action(request, "", reason, error_detail="not_pending_or_used" if token else "no_token",
+                         action="confirm")
+        return confirm_page.neutral()
+
+    pid, email, locale = row["id"], row["email"], row["locale"]
     log = dict(action="confirm", site=row["site"])
-
-    async def burn():
-        await db.execute("UPDATE newsletter_pending SET used_at = ?, token_hash = NULL WHERE id = ?", (now_iso(), pid))
-        await db.commit()
+    cur = await db.execute(
+        "UPDATE newsletter_pending SET used_at = ?, token_hash = NULL WHERE id = ? AND used_at IS NULL AND token_hash = ?",
+        (now_iso(), pid, token_hash(token)))
+    claimed = cur.rowcount == 1
+    await db.commit()
+    if not claimed:  # a parallel POST got it first
+        await log_action(request, email, "confirm_invalid", error_detail="not_pending_or_used", **log)
+        return confirm_page.neutral()
 
     try:
         result = await sinks.subscriber_sink(row["sink"] or None).subscribe(
             email, "newsletter", lang=locale, source=row["source"], page_url=row["page_url"],
             segment=row["segment"] or None)
     except (sinks.SinkTransient, sinks.SinkPermanent) as exc:
+        await db.execute("UPDATE newsletter_pending SET used_at = NULL, token_hash = ? WHERE id = ?",
+                         (token_hash(token), pid))
+        await db.commit()
         await log_action(request, email, "confirm_error", error_detail=str(exc)[:200], **log)
         return fail(locale, "service_unavailable")  # token stays valid, user can retry
     if result == "blocked":
-        await burn()
         await log_action(request, email, "confirm_dnc_refused", **log)
         return fail(locale, "unavailable")
 
-    await burn()
     await log_action(request, email, "confirm_ok", error_detail=None if result == "ok" else result, **log)
-    return RedirectResponse(_website_redirect(locale, "newsletter/confirmed"), status_code=302)
+    return RedirectResponse(_website_redirect(locale, "newsletter/confirmed"), status_code=303)
 
 
 # -- Routes -----------------------------------------------------------------

@@ -29,7 +29,7 @@ from fastapi.testclient import TestClient
 import db_migrate
 import jobs
 import main as mauxy_main
-from tests.conftest import LUDO_KEY, RECLOUD_KEY, SITE_KEY, WEB_KEY, solve_challenge
+from tests.conftest import LUDO_KEY, RECLOUD_KEY, SITE_KEY, WEB_KEY, solve_challenge, click_confirm
 
 HERE = Path(__file__).parent
 CASES = json.loads((HERE / "cases" / "newsletter_gate_cases.json").read_text(encoding="utf-8"))
@@ -120,7 +120,7 @@ def test_t_nl_024_mautic_sink_adds_the_site_segment_after_confirm_only(respx_moc
     row = client.portal.call(_one, client, "SELECT site, segment, sink FROM newsletter_pending")
     assert tuple(row) == ("re-cloud", "re-cloud", "mautic")
     token = re.search(r"token=(\S+)", outbox[-1]["body"]).group(1)
-    loc = client.get(f"/api/confirm?token={token}", follow_redirects=False).headers["location"]
+    loc = click_confirm(client, f"/api/confirm?token={token}").headers["location"]
     assert loc.endswith("/de/newsletter/confirmed")
     assert new.called and add.called
 
@@ -136,7 +136,7 @@ def test_t_nl_025_mautic_segment_created_when_missing(respx_mock, client, outbox
     body = {**PAGE, "email": "lu@example.com", **solve_challenge(client, RECLOUD_KEY, send=client.request_raw)}
     client.post("/api/subscribe", json=body, headers={"Authorization": f"Bearer {RECLOUD_KEY}"})
     token = re.search(r"token=(\S+)", outbox[-1]["body"]).group(1)
-    client.get(f"/api/confirm?token={token}", follow_redirects=False)
+    click_confirm(client, f"/api/confirm?token={token}")
     assert json.loads(created.calls.last.request.read()) == {"name": "re-cloud", "alias": "re-cloud", "isPublished": True}
     assert add.called
 
@@ -153,7 +153,7 @@ def test_t_nl_026_website_contract_public_key_no_quiz_odoo_pinned(client, outbox
     assert r.json() == {"status": "pending_confirmation"}
     assert odoo.writes_to("mailing.contact") == []
     token = re.search(r"token=(\S+)", outbox[-1]["body"]).group(1)
-    client.get(f"/api/confirm?token={token}", follow_redirects=False)
+    click_confirm(client, f"/api/confirm?token={token}")
     (contact,) = odoo.db["mailing.contact"].values()
     assert contact["email"] == "web@example.com"
     assert [s["list_id"] for s in odoo.db["mailing.subscription"].values()] == [1]  # ODOO_LIST_NEWSLETTER_ID
@@ -190,7 +190,7 @@ def test_t_nl_031_health_detail_reports_gate_and_mautic_version(client, monkeypa
 def test_t_nl_032_action_log_has_action_and_site(client, outbox, odoo):
     client.post("/api/subscribe", json={**PAGE, "email": "nina@example.com"})
     token = re.search(r"token=(\S+)", outbox[-1]["body"]).group(1)
-    client.get(f"/api/confirm?token={token}", follow_redirects=False)
+    click_confirm(client, f"/api/confirm?token={token}")
     client.post("/api/unsubscribe", json={"email": "nina@example.com"})
     rows = client.get("/api/actions", headers=ADMIN).json()["actions"]
     got = {(r["action"], r["site"], r["result"]) for r in rows}

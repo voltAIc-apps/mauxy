@@ -4,8 +4,10 @@ Shared fixtures for mauxy tests.
 Env vars are set BEFORE importing `main` because mauxy reads configuration at
 module load time. Keep this file's top-level imports minimal.
 """
+import html
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -193,6 +195,36 @@ def odoo(monkeypatch):
     sinks.reset()
     yield fake
     sinks.reset()
+
+
+# -- DOI links: two steps (security review 2026-11-09, link prefetch) --------------------------
+CONFIRM_FORM = re.compile(r'<form id="mx-form" method="post" action="([^"]+)">\s*'
+                          r'<input id="mx-token" type="hidden" name="token" value="([^"]+)">')
+MAUXY_ORIGIN = {"Origin": "https://mauxy.test"}
+NEUTRAL_MARK = 'id="mx-heading">Link ungültig oder abgelaufen<'
+
+
+def confirm_form(page) -> tuple[str, str] | None:
+    """(action, token) of the rendered confirmation page, None for any other response."""
+    m = CONFIRM_FORM.search(page.text) if page.status_code == 200 else None
+    return (html.unescape(m.group(1)), html.unescape(m.group(2))) if m else None
+
+
+def click_confirm(client, url: str):
+    """What a human does with a DOI mail link: open it (GET, read-only page), click "Bestätigen"
+    (form POST from mauxy's own page). Returns the POST response, or the GET response when the
+    page has no form (neutral page, misconfiguration redirect)."""
+    page = client.get(url, follow_redirects=False)
+    form = confirm_form(page)
+    if form is None:
+        return page
+    action, token = form
+    return client.post(action, data={"token": token}, headers=MAUXY_ORIGIN, follow_redirects=False)
+
+
+def is_neutral(resp, status: int = 200) -> bool:
+    """The uniform page for invalid / expired / used tokens."""
+    return resp.status_code == status and NEUTRAL_MARK in resp.text and "mx-form" not in resp.text
 
 
 def drain(client):

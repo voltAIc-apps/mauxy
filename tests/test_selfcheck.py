@@ -21,6 +21,7 @@ import respx
 
 import main as mauxy_main
 import selfcheck_api
+from tests.conftest import click_confirm, is_neutral
 
 HERE = Path(__file__).parent
 CASES = json.loads((HERE / "cases" / "selfcheck_api_cases.json").read_text(encoding="utf-8"))
@@ -93,8 +94,8 @@ def test_t_sc_120_one_doi_then_result_radar_and_notification(respx_mock, client,
     assert "Ergebnis und Richtangebot" in doi and "30 Minuten Kennenlernen" in doi and "Migration Radar" in doi
     assert not create.called  # nothing in Mautic before the click
 
-    r = client.get(f"/api/selfcheck/confirm?token={token_of(outbox[0])}", follow_redirects=False)
-    assert r.status_code == 302 and r.headers["location"] == "https://site.test/de/selbst-check?bestaetigt=1"
+    r = click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0])}")
+    assert r.status_code == 303 and r.headers["location"] == "https://site.test/de/selbst-check?bestaetigt=1"
 
     result = next(m for m in outbox[1:] if m["to"] == "bob@example.com")
     assert "Der Wechsel ist machbar" in result["body"]
@@ -114,10 +115,10 @@ def test_t_sc_120_one_doi_then_result_radar_and_notification(respx_mock, client,
 def test_t_sc_121_confirm_link_single_use(respx_mock, client, outbox):
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail"]))
     token = token_of(outbox[0])
-    assert client.get(f"/api/selfcheck/confirm?token={token}", follow_redirects=False).headers["location"].endswith("=1")
+    assert click_confirm(client, f"/api/selfcheck/confirm?token={token}").headers["location"].endswith("=1")
     n = len(outbox)
-    again = client.get(f"/api/selfcheck/confirm?token={token}", follow_redirects=False)
-    assert again.headers["location"].endswith("bestaetigt=fehler")
+    again = click_confirm(client, f"/api/selfcheck/confirm?token={token}")
+    assert is_neutral(again)
     assert len(outbox) == n  # no second round of mails
 
 
@@ -128,7 +129,7 @@ def test_t_sc_122_radar_skipped_for_dnc(respx_mock, client, outbox):
         "doNotContact": [{"channel": "email", "reason": 1}], "tags": []}}}))
     edit = respx_mock.patch(re.compile(r".*/contacts/5/edit$")).mock(return_value=httpx.Response(200, json={"contact": {"id": 5}}))
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["radar"]))
-    client.get(f"/api/selfcheck/confirm?token={token_of(outbox[0])}", follow_redirects=False)
+    click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0])}")
     assert not edit.called
     note = next(m for m in outbox if m["to"] == "owner@site.test")
     assert "Migration Radar: dnc_skip" in note["body"]
@@ -139,7 +140,7 @@ def test_t_sc_122_radar_skipped_for_dnc(respx_mock, client, outbox):
 def test_t_sc_123_call_only_no_result_mail_no_mautic(respx_mock, client, outbox):
     mautic = respx_mock.route(url__regex=MAUTIC_ANY.pattern).mock(return_value=httpx.Response(500))
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["call"], answers=COMPLETE))
-    client.get(f"/api/selfcheck/confirm?token={token_of(outbox[0])}", follow_redirects=False)
+    click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0])}")
     assert [m["to"] for m in outbox] == ["bob@example.com", "owner@site.test"]  # DOI + notification
     assert "Kennenlernen (Meetly): ja" in outbox[1]["body"] and "Richtangebot: nein" in outbox[1]["body"]
     assert not mautic.called
@@ -149,7 +150,7 @@ def test_t_sc_123_call_only_no_result_mail_no_mautic(respx_mock, client, outbox)
 def test_t_sc_124_rough_quote_from_exit_screen(respx_mock, client, outbox):
     partial = {"system": ["ecc"], "why": ["eol", "duty"], "s4": "no", "when": "12", "users": "150"}
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail"], answers=partial, lang="en"))
-    client.get(f"/api/selfcheck/confirm?token={token_of(outbox[0])}", follow_redirects=False)
+    click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0])}")
     result = outbox[1]
     assert result["subject"] == "Your self-check: result"
     assert "You answered 5 of 13 questions" in result["body"] and "Traffic lights" not in result["body"]
@@ -170,7 +171,7 @@ def test_t_sc_126_foreign_tokens_refused(respx_mock, client, outbox, token_signe
     sid = rows(client, "SELECT id FROM selfcheck_submission")[0]["id"]
     newsletter_token = token_signer.dumps({"s": sid})  # right payload, newsletter salt
     for t in (newsletter_token, token_of(outbox[0])[:-3] + "abc"):
-        assert client.get(f"/api/selfcheck/confirm?token={t}", follow_redirects=False).headers["location"].endswith("fehler")
+        assert is_neutral(click_confirm(client, f"/api/selfcheck/confirm?token={t}"))
     assert len(outbox) == 1
 
 
@@ -241,7 +242,7 @@ def test_t_sc_133_event_rate_limit_key_is_global():
 @respx.mock(assert_all_called=False)
 def test_t_sc_140_admin_endpoints(respx_mock, client, outbox):
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail"], answers=COMPLETE))
-    client.get(f"/api/selfcheck/confirm?token={token_of(outbox[0])}", follow_redirects=False)
+    click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0])}")
     client.post("/api/selfcheck/event", headers=ORIGIN, json={"event": "completed", "lang": "de"})
     assert client.get("/api/selfcheck/submissions").status_code == 401
     assert client.get("/api/selfcheck/stats", headers={"Authorization": "Bearer nope"}).status_code == 401

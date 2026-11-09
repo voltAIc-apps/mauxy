@@ -22,7 +22,7 @@ Tests (respx mocks Mautic, mails captured with `MAIL_MODE=memory`):
 PYTHONPATH=. tests/venv/bin/python -m pytest tests -q
 ```
 
-Numbered: T-MAIL-0xx (mailer: TLS, MIME, limits, injection, retries), T-NL-0xx (newsletter authority: site key, quiz, per-site policy, ludo upstream flow, db-patches; cases in `tests/cases/newsletter_gate_cases.json`), T-AUTH-0xx (LinkedIn login, LinkedIn mocked with respx, cases in `tests/cases/auth_cases.json`), T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check), T-ODOO-0xx (Odoo client), T-SINK-0xx (sinks), T-LEAD-0xx (CTA leads, outbox; cases in `tests/cases/`). Odoo is ALWAYS the in-memory fake (`tests/fake_odoo.py`, `odoo` fixture); legacy suites run with `LEAD_SINK=none`, `SUBSCRIBER_SINK=mautic`. Local run with the fake: `tests/scripts/run_local.py` (10.0.99.1:8020; also a mocked LinkedIn at `/__mock_linkedin`). Read-only check against the real erp.wapsol (only with the bot credentials): `scripts/odoo_smoke.py`.
+Numbered: T-MAIL-0xx (mailer: TLS, MIME, limits, injection, retries), T-NL-0xx (newsletter authority: site key, quiz, per-site policy, ludo upstream flow, db-patches; cases in `tests/cases/newsletter_gate_cases.json`), T-AUTH-0xx (LinkedIn login, LinkedIn mocked with respx, cases in `tests/cases/auth_cases.json`), T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017; 2026-11-09: confirm GET page + POST click T-SEC-020..038, cases in `tests/cases/confirm_click_cases.json`; atomic caps / throttle race T-SEC-040..045), T-SC-1xx (self-check), T-ODOO-0xx (Odoo client), T-SINK-0xx (sinks), T-LEAD-0xx (CTA leads, outbox; cases in `tests/cases/`). Odoo is ALWAYS the in-memory fake (`tests/fake_odoo.py`, `odoo` fixture); legacy suites run with `LEAD_SINK=none`, `SUBSCRIBER_SINK=mautic`. Local run with the fake: `tests/scripts/run_local.py` (10.0.99.1:8020; also a mocked LinkedIn at `/__mock_linkedin`). Read-only check against the real erp.wapsol (only with the bot credentials): `scripts/odoo_smoke.py`.
 
 ## Build & Deploy
 
@@ -49,7 +49,8 @@ glob that `--apply` applies, so it can never clobber the real Secret. The Docker
 
 - `main.py` newsletter authority (below), `/api/actions` (admin), lifespan (schema check, site seed, config load, purge, outbox resume, drain with timeout).
 - `selfcheck_api.py` `/api/selfcheck*` (SPEC-020); confirm sends the result mail, then queues Radar + lead + operator mail in the outbox. `vendor/selfcheck/` = rules engine from flywheel (`scripts/sync_selfcheck.py` there; T-SC-150 checks the sha256, never edit).
-- `leads_api.py` `POST /api/lead` (kinds contact/inquiry/webinar/checkout/selfcheck), `GET /api/lead/confirm`, admin `GET /api/lead/submissions`, `POST /api/lead/sync/{id}/retry`; renders the lead title + plain-text description.
+- `confirm_page.py` two-step DOI for every mail link (security review 2026-11-09, link prefetch): GET validates + renders a page with a POST "Bestätigen" form (strict CSP, no-store, noindex, ids on every element), POST (form `token`, Origin/Referer = mauxy) burns + writes; invalid/used -> one neutral page.
+- `leads_api.py` `POST /api/lead` (kinds contact/inquiry/webinar/checkout/selfcheck), `GET+POST /api/lead/confirm`, admin `GET /api/lead/submissions`, `POST /api/lead/sync/{id}/retry`; renders the lead title + plain-text description.
 - `lead_sync.py` outbox table `lead_sync` (UNIQUE per submission), retries with backoff via `jobs.py`, marker search against duplicates, failure mail to `LEAD_NOTIFY_TO`, data cleared after delivery.
 - `sinks.py` `OdooLeadSink`, `OdooSubscriberSink`, none sinks, factory (`LEAD_SINK`, `subscriber_sink(kind)` per site, fallback `SUBSCRIBER_SINK`). `odoo_client.py` JSON-RPC over verified HTTPS, `ALLOWED` / `WRITE_FIELDS`.
 - `auth_api.py` `GET /api/auth/linkedin/start|callback`, `POST /api/auth/session`: return path = same-site path on `AUTH_ALLOWED_ORIGINS`; state signed 10 min, single use, bound by cookie `__Host-mauxy_li`; one-time code (60 s, single use, bound to the tab's `binding`) instead of PII in URLs; tables `auth_state`, `auth_code` (purged every 30 s); audit line without PII. Config problems disable only the login (`/health/detail` `auth_linkedin`).
@@ -57,7 +58,7 @@ glob that `--apply` applies, so it can never clobber the real Secret. The Docker
 - Owner setup of erp.wapsol (bot user, group, rules, lists, UTM): README "erp.wapsol setup".
 
 
-- Newsletter authority in `main.py`: `GET /api/challenge` (per site key), `POST /api/subscribe` (key -> body model per policy -> honeypot -> quiz unless `subscribe_quiz` off -> mauxy DOI job, or immediate Mautic segment for `doi_owner=sink`), `GET /api/confirm` (sink stored in the pending row), `POST /api/unsubscribe` (key + quiz, the site's sink). Admin CRUD `/api/admin/sites|quiz|mautic-instance` (Bearer `ADMIN_API_KEY`, every write -> `reload_config`). `/health` liveness (always 200), `/ready` readiness (local SQLite only, NOT tied to a sink), `/health/detail` (sinks incl. per-site ones, login, sites, quiz, `mautic_version`).
+- Newsletter authority in `main.py`: `GET /api/challenge` (per site key), `POST /api/subscribe` (key -> body model per policy -> honeypot -> quiz unless `subscribe_quiz` off -> mauxy DOI job, or immediate Mautic segment for `doi_owner=sink`), `GET /api/confirm` (read-only confirmation page) + `POST /api/confirm` (the click: atomic claim, sink stored in the pending row), `POST /api/unsubscribe` (key + quiz, the site's sink). Admin CRUD `/api/admin/sites|quiz|mautic-instance` (Bearer `ADMIN_API_KEY`, every write -> `reload_config`). `/health` liveness (always 200), `/ready` readiness (local SQLite only, NOT tied to a sink), `/health/detail` (sinks incl. per-site ones, login, sites, quiz, `mautic_version`).
 - Website contract (simplify-erp.de): README "Website contract".
 
 ### Mautic prerequisites (DEPRECATED, only for sites on the Mautic sink)
@@ -98,7 +99,7 @@ The schema is **not** created at runtime. It is owned by integer-numbered SQL pa
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
 | `RATE_LIMIT` | slowapi rate limit for unsubscribe (default `5/minute`) |
 | `SUBSCRIBE_RATE_LIMIT`, `CHALLENGE_RATE_LIMIT` | subscribe (default `60/minute`, upstream) / challenge (`30/minute`) per IP |
-| `CONFIRM_RATE_LIMIT` | slowapi rate limit for `/api/confirm` (default `30/minute`) |
+| `CONFIRM_RATE_LIMIT` | slowapi rate limit for every confirm GET / POST (default `30/minute`) |
 | `ACTION_LOG_DB` | SQLite database path (default `/data/actions.db`) |
 | `ADMIN_API_KEY` | Bearer token for `/api/actions`, `/api/admin/*`, lead admin (disabled if unset) |
 | `CONFIRM_TOKEN_SECRET` | `itsdangerous` signing key for double opt-in tokens |

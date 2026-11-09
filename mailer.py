@@ -361,17 +361,6 @@ async def _update(mid: str, **vals) -> None:
     await _db.commit()
 
 
-async def _recent_count(rh: str) -> int:
-    if _db is None:
-        return 0
-    since = _iso(_now() - timedelta(hours=1))
-    async with _db.execute(
-            "SELECT COUNT(*) FROM mail_outbox WHERE recipient_hash = ? AND audience != 'internal' "
-            "AND state IN ('queued', 'sent') AND created_at >= ?", (rh, since)) as cur:
-        (n,) = await cur.fetchone()
-    return n
-
-
 def _log(event: str, mid: str, rh: str, **extra) -> None:
     tail = " ".join(f"{k}={v}" for k, v in extra.items())
     logger.info("%s message_id=%s rcpt=%s %s", event, mid, rh[:12], tail)
@@ -448,14 +437,27 @@ async def send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
         if existing["state"] == "failed":
             return False
         return await _attempts(mid, rh, mime, envelope_from, rcpt, meta, existing["attempts"])
-    if audience != "internal" and await _recent_count(rh) >= settings()["hourly_limit"]:
-        _log("MAIL_RATE_LIMITED", mid, rh)
-        return False
     if _db is not None:
-        await _db.execute(
+        # Per-recipient limit + idempotency in ONE statement (security review 2026-11-09, throttle
+        # race): the row is only inserted while the recipient is below the hourly limit (internal
+        # recipients exempt) and only once per Message-ID. Atomic in SQLite, so parallel send()
+        # calls can neither exceed the limit nor deliver the same key twice.
+        since = _iso(_now() - timedelta(hours=1))
+        cur = await _db.execute(
             "INSERT OR IGNORE INTO mail_outbox (message_id, recipient_hash, audience, mime, created_at) "
-            "VALUES (?, ?, ?, ?, ?)", (mid, rh, audience, mime, _iso(_now())))
+            "SELECT ?, ?, ?, ?, ? WHERE ? = 'internal' OR (SELECT COUNT(*) FROM mail_outbox WHERE recipient_hash = ? "
+            "AND audience != 'internal' AND state IN ('queued', 'sent') AND created_at >= ?) < ?",
+            (mid, rh, audience, mime, _iso(_now()), audience, rh, since, settings()["hourly_limit"]))
+        inserted = cur.rowcount == 1
         await _db.commit()
+        if not inserted:
+            other = await _row(mid)
+            if other is None:
+                _log("MAIL_RATE_LIMITED", mid, rh)
+                return False
+            # same key queued in parallel by another task: that task delivers it
+            _log("MAIL_DUPLICATE_SKIPPED", mid, rh)
+            return other["state"] != "failed"
     return await _attempts(mid, rh, mime, envelope_from, rcpt, meta, 0)
 
 

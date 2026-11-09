@@ -30,14 +30,16 @@ site (ludo, ...) = quiz on, Mautic, `doi_owner=sink` (exactly the upstream behav
 
 **Key design property (mauxy-DOI sites):** every contact-specific request gets the same answer
 (`pending_confirmation` / `ok`), immediately, whatever the address -- no enumeration through
-content, status or timing. Nothing is written to any sink before the confirmation link is clicked.
+content, status or timing. Nothing is written to any sink before the person clicks "Bestätigen" on
+the confirmation page (the mail link itself is read-only: mail scanners prefetch links).
 
 | Area | Endpoints | Code |
 |---|---|---|
-| Newsletter | `GET /api/challenge`, `POST /api/subscribe`, `GET /api/confirm`, `POST /api/unsubscribe` | `main.py` |
+| Newsletter | `GET /api/challenge`, `POST /api/subscribe`, `GET+POST /api/confirm`, `POST /api/unsubscribe` | `main.py` |
+| DOI confirmation page | GET page + POST click of every DOI link | `confirm_page.py` |
 | Admin | `/api/actions`, `/api/admin/sites`, `/api/admin/quiz`, `/api/admin/mautic-instance` | `main.py` |
 | Selbst-Check | `/api/selfcheck*` | `selfcheck_api.py` |
-| CTA leads | `POST /api/lead`, `GET /api/lead/confirm`, admin `/api/lead/submissions`, `/api/lead/sync/{id}/retry` | `leads_api.py` |
+| CTA leads | `POST /api/lead`, `GET+POST /api/lead/confirm`, admin `/api/lead/submissions`, `/api/lead/sync/{id}/retry` | `leads_api.py` |
 | Delivery after DOI | outbox with retries | `lead_sync.py` |
 | Sinks | Odoo lead + subscriber sink, deprecated Mautic sink, per-site subscriber sink | `sinks.py`, `mautic_sink.py` |
 | Odoo | the one Odoo client (JSON-RPC, allowlist) | `odoo_client.py` |
@@ -159,7 +161,7 @@ that DNS for `DEPLOY_DOMAIN` points at the ingress.
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins | *(required)* |
 | `RATE_LIMIT` | slowapi rate-limit for unsubscribe | `5/minute` |
 | `SUBSCRIBE_RATE_LIMIT` / `CHALLENGE_RATE_LIMIT` | per-IP limits subscribe / challenge | `60/minute` / `30/minute` |
-| `CONFIRM_RATE_LIMIT` | slowapi rate-limit for `/api/confirm` | `30/minute` |
+| `CONFIRM_RATE_LIMIT` | slowapi rate-limit for every confirm GET / POST (newsletter, lead, Selbst-Check) | `30/minute` |
 | `ACTION_LOG_DB` | SQLite database path | `/data/actions.db` |
 | `ADMIN_API_KEY` | Bearer token for `/api/actions`, `/api/admin/*`, lead admin | *(disabled if unset)* |
 | `MIGRATE_STRICT` | Refuse to start when the DB is behind `db-patches/` | `true` |
@@ -330,11 +332,21 @@ mailed via SMTP. Every valid request (new, already confirmed, DNC, throttled, Ma
 (`jobs.py`), so neither content, status code nor timing reveal anything (T-SEC-017/018). `consent` must be `true`; the consent
 timestamp is the server time of the click; `pageUrl` must be on an `ALLOWED_ORIGINS` origin.
 
-`GET /api/confirm?token=...` checks signature + age and a matching unused pending record (SHA-256,
-constant-time); then the subscriber sink subscribes (Odoo: `mailing.contact` / `mailing.subscription`
-on `ODOO_LIST_NEWSLETTER_ID`; deprecated Mautic: tag `newsletter_confirmed`) and the token is burnt
-(single use). Blacklisted / DNC -> burnt, error page; sink down -> token stays valid. 302 to
-`${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed` (or `confirm-error?reason=...`).
+The mail link `GET /api/confirm?token=...` is READ-ONLY: it checks signature + age and a matching
+unused pending record (SHA-256, constant-time) and shows a minimal confirmation page with a
+"Bestätigen" / "Confirm" button (form POST, no JS; invalid / expired / used -> uniform neutral page).
+Only the click, `POST /api/confirm` (form field `token`, Origin / Referer must be mauxy itself when
+sent), claims the token atomically (single use), then the subscriber sink subscribes (Odoo:
+`mailing.contact` / `mailing.subscription` on `ODOO_LIST_NEWSLETTER_ID`; deprecated Mautic: tag
+`newsletter_confirmed`). Blacklisted / DNC -> burnt, error page; sink down -> token stays valid. 303 to
+`${PUBLIC_WEBSITE_BASE_URL}/{locale}/newsletter/confirmed` (or `confirm-error?reason=...`). Details:
+API.md "DOI mail links".
+
+Security review 2026-11-09: (1) link prefetch by mail scanners (Safe Links, Proofpoint, Mimecast)
+burnt tokens and wrote to sinks / created leads on GET -> two-step GET page + POST click for all
+three DOI flows (T-SEC-020..038); (2) throttle race: COUNT-then-INSERT let parallel requests exceed
+`MAX_PENDING_PER_EMAIL` and the mailer's per-recipient limit -> each cap is one atomic conditional
+`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap` with a rowcount check (T-SEC-040..045).
 
 Security review 2026-11-08 (enumeration, token replay, consent validation, pre-confirmation CRM
 writes): fixed, tests T-SEC-001..018. Tokens issued by the earlier flow are refused (users re-subscribe).
@@ -419,7 +431,8 @@ the report PDF / rendered images), operator notifications. No second SMTP code a
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/selfcheck` | `{email, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company_website}`. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
-| `GET /api/selfcheck/confirm?token=` | Single-use. Result mail (pick `mail`), then the outbox: Migration Radar via the subscriber sink (pick `radar`, not blacklisted), `crm.lead` (picks `mail` / `call`; Radar alone = no lead), notification to `SELFCHECK_NOTIFY_TO` (always: quote request, call yes/no, answers, CRM lead id). 302 to `/{lang}/selbst-check?bestaetigt=1` / `=fehler`. Optional field `company` names the lead. |
+| `GET /api/selfcheck/confirm?token=` | DOI mail link, read-only: confirmation page with a "Bestätigen" button (API.md "DOI mail links"). |
+| `POST /api/selfcheck/confirm` | The click (form field `token`), single-use. Result mail (pick `mail`), then the outbox: Migration Radar via the subscriber sink (pick `radar`, not blacklisted), `crm.lead` (picks `mail` / `call`; Radar alone = no lead), notification to `SELFCHECK_NOTIFY_TO` (always: quote request, call yes/no, answers, CRM lead id). 303 to `/{lang}/selbst-check?bestaetigt=1` (misconfigured: `=fehler`). Optional field `company` names the lead. |
 | `POST /api/selfcheck/event` | `{event: started|completed|exited_early|submitted, lang}` -> 204. Stores day + event + lang only; global rate-limit key (IP never read), access-log lines dropped. |
 | `GET /api/selfcheck/submissions` | Admin (Bearer `ADMIN_API_KEY`): confirmed (or pending) submissions. |
 | `GET /api/selfcheck/stats` | Admin: counters per day (success metric "completed checks"). |
@@ -443,9 +456,11 @@ limited, no control characters; honeypot `company_website`; Origin must be in
 | checkout | email, lang, name, company, product_id, product_title, price_net, order_ref `ORD-...`, billing {street, postal_code, city, country ISO-2}, terms: true | phone, bundle, technology, services[<=20], vat_id, currency EUR |
 
 Flow: immediate `200 {"status":"pending_confirmation"}`; storage + ONE DOI mail (server-side text
-only) run as a job; throttle `MAX_PENDING_PER_EMAIL` / 24 h, silent. `GET /api/lead/confirm?token=`
-(own salt, single use) burns the token and queues the delivery, 302 to
-`/{lang}/anfrage/bestaetigt?art=<kind>` (error `/{lang}/anfrage/fehler`).
+only) run as a job; throttle `MAX_PENDING_PER_EMAIL` / 24 h, silent, atomic. The mail link
+`GET /api/lead/confirm?token=` only shows the confirmation page; the click `POST /api/lead/confirm`
+(own salt, single use) burns the token and queues the delivery, 303 to
+`/{lang}/anfrage/bestaetigt?art=<kind>` (misconfigured `/{lang}/anfrage/fehler`; invalid / used token:
+neutral page).
 
 Delivery (`lead_sync.py`, table `lead_sync`, UNIQUE per submission = at most one lead):
 subscriptions first, then the lead; each finished step is stored. `SinkTransient` -> retry with

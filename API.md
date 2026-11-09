@@ -18,7 +18,7 @@ subscriber sink (Odoo Email Marketing lists by default; Mautic only as the depre
 The honeypot field `company_website` must stay empty; if set, the request is
 accepted-looking but silently dropped.
 
-Lead CTAs (`POST /api/lead`, `GET /api/lead/confirm`, admin endpoints) and the Selbst-Check are
+Lead CTAs (`POST /api/lead`, `GET|POST /api/lead/confirm`, admin endpoints) and the Selbst-Check are
 documented in the README ("CTA leads", "Selbst-Check"). Unsubscribe below works on the active
 subscriber sink (Odoo mailing lists by default; Mautic DNC only with the deprecated Mautic sink).
 
@@ -53,7 +53,9 @@ Newsletter signup with double opt-in. After the gates the answer is ALWAYS an im
 `200 {"status":"pending_confirmation"}` (same status, body and timing for every address); the
 contact-dependent work runs after the response: read-only sink lookup (skip if already subscribed /
 blocked), per-address throttle (`MAX_PENDING_PER_EMAIL` per 24 h), pending row in SQLite (with
-site + segment), DOI mail with a signed, single-use link to `GET /api/confirm`.
+site + segment), DOI mail with a signed, single-use link to `GET /api/confirm`. Throttle = ONE
+conditional `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap` (atomic, parallel requests cannot
+pass it; same for leads, Selbst-Check and the mailer's per-recipient limit).
 
 **Auth:** `Authorization: Bearer <site-key>`. **Rate limit:** `SUBSCRIBE_RATE_LIMIT` (default 60/min per IP).
 
@@ -101,13 +103,37 @@ curl -X POST https://mauxy.engage.wapsol.de/api/subscribe \
   -d '{"email":"user@example.com","locale":"de","source":"footer","consent":true,"pageUrl":"https://simplify-erp.de/de/","challenge":"<token>","answer":0}'
 ```
 
-## GET /api/confirm?token=…
+## DOI mail links: GET page, POST click (all three flows)
 
-Link in the DOI mail. Always a 302 to `PUBLIC_WEBSITE_BASE_URL/{lang}/newsletter/confirmed` or
-`…/newsletter/confirm-error?reason=invalid_or_expired|unavailable|service_unavailable|server_misconfigured`.
-Signature + max age + unused pending row (SHA-256, constant time); then the subscriber sink subscribes
-(Odoo: `mailing.contact` / `mailing.subscription` on `ODOO_LIST_NEWSLETTER_ID`; Mautic: tag + the site's
-segment). Sink down → token stays valid (retry); blocked → token burnt.
+Security review 2026-11-09: mail scanners (Safe Links, Proofpoint, Mimecast) GET every link, some run
+JS. So the mail link never confirms by itself (`confirm_page.py`):
+
+| Flow | GET (mail link, read-only) | POST (the click) → 303 |
+|---|---|---|
+| Newsletter | `/api/confirm?token=` | `/api/confirm` → `PUBLIC_WEBSITE_BASE_URL/{lang}/newsletter/confirmed` |
+| CTA lead | `/api/lead/confirm?token=` | `/api/lead/confirm` → `LEAD_WEBSITE_URL/{lang}/anfrage/bestaetigt?art=<kind>` |
+| Selbst-Check | `/api/selfcheck/confirm?token=` | `/api/selfcheck/confirm` → `SELFCHECK_WEBSITE_URL/{lang}/selbst-check?bestaetigt=1` |
+
+- **GET** validates the token only (signature + max age + unused pending row, SHA-256 constant time;
+  no burn, no sink / lead write, no action_log line) and renders a minimal page (de/en by the
+  submission's locale) with ONE form: hidden `token`, button "Bestätigen" / "Confirm", `method=post`,
+  no JS. Headers: CSP `default-src 'none'; style-src 'sha256-…'; form-action 'self' <website origin>;
+  base-uri 'none'; frame-ancestors 'none'`, `Cache-Control: no-store`, `X-Robots-Tag: noindex, nofollow`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: same-origin`. HEAD → 405.
+- **POST** `application/x-www-form-urlencoded`, field `token` (exactly once, body ≤ 2048 bytes). Origin
+  (else Referer), when present, must be mauxy's own host (`PUBLIC_BASE_URL` / request Host); foreign or
+  `null` → `403` neutral page. Then the token is claimed atomically (conditional UPDATE: a parallel
+  second POST loses) and the write happens: newsletter → subscriber sink (Odoo `mailing.contact` /
+  `mailing.subscription` on `ODOO_LIST_NEWSLETTER_ID`; Mautic: tag + segment); lead → outbox
+  (`crm.lead` + newsletter if ticked); Selbst-Check → result mail + outbox (Radar, lead, operator mail).
+- **Invalid / expired / used / foreign token**, GET or POST: one neutral page (`200`, identical bytes
+  for every reason and flow, bilingual).
+- Newsletter only: sink down → claim released, token stays valid, 303 to
+  `…/newsletter/confirm-error?reason=service_unavailable`; blacklisted → burnt,
+  `…?reason=unavailable`. Misconfigured (no signer / website URL) → `…?reason=server_misconfigured`
+  (leads: `/{lang}/anfrage/fehler`, Selbst-Check: `?bestaetigt=fehler`).
+- Website contract unchanged: same confirmed / error pages on the website; only the mail link flow
+  gained the click.
 
 ---
 

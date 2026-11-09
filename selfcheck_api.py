@@ -4,10 +4,15 @@ Selbst-Check endpoints (simplify-erp.de /:lang/selbst-check, flywheel SPEC-020).
   POST /api/selfcheck            submission: e-mail + picks (mail/call/radar) + answers.
                                  Validated against the vendored rules, stored minimally, ONE
                                  double opt-in mail. Uniform 200 for every contact-specific outcome.
-  GET  /api/selfcheck/confirm    DOI link: result mail (if picked), then the outbox (lead_sync):
+  GET  /api/selfcheck/confirm    DOI mail link, READ-ONLY: confirmation page with a "Bestätigen"
+                                 button (confirm_page.py; mail scanners prefetch links). Invalid /
+                                 expired / used: uniform neutral page.
+  POST /api/selfcheck/confirm    form field token, the human click (atomic single-use claim):
+                                 result mail (if picked), then the outbox (lead_sync):
                                  Migration Radar via the subscriber sink (if picked, not blacklisted),
                                  crm.lead in erp.wapsol (picks mail / call; SPEC-021), notification
-                                 to the operator (always). 302 back to the website (?bestaetigt=1 / =fehler).
+                                 to the operator (always). 303 back to the website (?bestaetigt=1;
+                                 misconfigured: =fehler).
                                  POST /api/lead with kind "selfcheck" is an alias of POST /api/selfcheck.
   POST /api/selfcheck/event      anonymous counter (started/completed/exited_early/submitted):
                                  stores day + event + lang only. No IP (global rate limit key,
@@ -36,6 +41,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+import confirm_page
 import jobs
 import lead_sync
 import mailer
@@ -283,9 +289,28 @@ def _origin_ok(request: Request) -> bool:
     return request.headers.get("origin", "").rstrip("/") in SELFCHECK_ALLOWED_ORIGINS
 
 
-def _redirect(lang: str, ok: bool) -> RedirectResponse:
+def _redirect(lang: str, ok: bool, status: int = 302) -> RedirectResponse:
     lang = lang if lang in ("de", "en") else "de"
-    return RedirectResponse(f"{_site_url(lang)}?bestaetigt={'1' if ok else 'fehler'}", status_code=302)
+    return RedirectResponse(f"{_site_url(lang)}?bestaetigt={'1' if ok else 'fehler'}", status_code=status)
+
+
+async def _pending(db: aiosqlite.Connection, token: Optional[str]):
+    """Read-only token check (own salt, max_age, pending row, SHA-256 constant time). Row or None."""
+    if not _signer or not token or len(token) > 1000:
+        return None
+    try:
+        data = _signer.loads(token, max_age=CONFIRM_TOKEN_MAX_AGE)
+    except (SignatureExpired, BadSignature):
+        return None
+    sid = data.get("s") if isinstance(data, dict) else None
+    if not isinstance(sid, int):
+        return None
+    async with db.execute("SELECT * FROM selfcheck_submission WHERE id = ?", (sid,)) as cur:
+        row = await cur.fetchone()
+    # single use: token hash is cleared on confirm; constant-time compare
+    if row is None or row["status"] != "pending" or not row["token_hash"] or not hmac.compare_digest(row["token_hash"], _hash(token)):
+        return None
+    return row
 
 
 async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", clean: dict) -> None:
@@ -293,23 +318,21 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     await purge(db)
     email = payload.email.lower()
     since = _iso(_now() - timedelta(hours=24))
-    async with db.execute(
-        "SELECT COUNT(*) FROM selfcheck_submission WHERE email = ? AND created_at >= ?", (email, since)
-    ) as cur:
-        (recent,) = await cur.fetchone()
-    if recent >= MAX_PENDING_PER_EMAIL:
-        logger.info("SELFCHECK_THROTTLED")
-        return
-
     stay = payload.stay.model_dump(exclude_none=True) if payload.stay else None
     prog = engine.progress(RULES, clean)
+    # cap + insert in ONE statement (atomic, no COUNT-then-INSERT race; security review 2026-11-09)
     cur = await db.execute(
         "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete, company) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        "WHERE (SELECT COUNT(*) FROM selfcheck_submission WHERE email = ? AND created_at >= ?) < ?",
         (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
          json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"]),
-         " ".join(payload.company.split()) if payload.company else None),
+         " ".join(payload.company.split()) if payload.company else None, email, since, MAX_PENDING_PER_EMAIL),
     )
+    if cur.rowcount != 1:
+        await db.commit()  # end the (empty) implicit transaction
+        logger.info("SELFCHECK_THROTTLED")
+        return
     sid = cur.lastrowid
     token = _signer.dumps({"s": sid})
     await db.execute("UPDATE selfcheck_submission SET token_hash = ? WHERE id = ?", (_hash(token), sid))
@@ -359,31 +382,43 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
 
     @router.get("/api/selfcheck/confirm")
     @limiter.limit(os.environ.get("CONFIRM_RATE_LIMIT", "30/minute"))
-    async def selfcheck_confirm(request: Request, token: str = Query(..., min_length=1, max_length=1000)):
+    async def selfcheck_confirm_page(request: Request, token: str = Query(..., min_length=1, max_length=1000)):
+        """DOI link, step 1 READ-ONLY (mail scanners prefetch links): confirmation page with a
+        "Bestätigen" button (POST). Invalid / expired / used: uniform neutral page."""
         if not _signer:
             return _redirect("de", False)
-        try:
-            data = _signer.loads(token, max_age=CONFIRM_TOKEN_MAX_AGE)
-        except (SignatureExpired, BadSignature):
-            return _redirect("de", False)
-        sid = data.get("s") if isinstance(data, dict) else None
-        if not isinstance(sid, int):
-            return _redirect("de", False)
+        row = await _pending(request.app.state.db, token)
+        if row is None:
+            return confirm_page.neutral()
+        return confirm_page.render("selfcheck", row["lang"], "/api/selfcheck/confirm", token, SELFCHECK_WEBSITE_URL)
 
+    @router.post("/api/selfcheck/confirm")
+    @limiter.limit(os.environ.get("CONFIRM_RATE_LIMIT", "30/minute"))
+    async def selfcheck_confirm(request: Request):
+        """DOI step 2, the human click: claims the token atomically (single use), result mail, then
+        Radar + CRM lead + operator mail via the outbox; 303 back to the website."""
+        if not _signer:
+            return _redirect("de", False, status=303)
+        if not confirm_page.same_origin(request):
+            logger.warning("SELFCHECK_CONFIRM_FOREIGN_ORIGIN")
+            return confirm_page.neutral(403)
+        token = await confirm_page.form_token(request)
         db: aiosqlite.Connection = request.app.state.db
-        async with db.execute("SELECT * FROM selfcheck_submission WHERE id = ?", (sid,)) as cur:
-            row = await cur.fetchone()
-        # single use: token hash is cleared on confirm; constant-time compare
-        if row is None or row["status"] != "pending" or not row["token_hash"] or not hmac.compare_digest(row["token_hash"], _hash(token)):
-            return _redirect(row["lang"] if row else "de", False)
-
+        row = await _pending(db, token)
+        if row is None:
+            return confirm_page.neutral()
+        sid = row["id"]
         confirmed_at = _iso(_now())
-        # burn the token first: a parallel second click cannot trigger a second round of mails
-        await db.execute(
-            "UPDATE selfcheck_submission SET status = 'confirmed', confirmed_at = ?, token_hash = NULL WHERE id = ?",
-            (confirmed_at, sid),
+        # burn the token first, conditionally: a parallel second POST cannot trigger a second round of mails
+        cur = await db.execute(
+            "UPDATE selfcheck_submission SET status = 'confirmed', confirmed_at = ?, token_hash = NULL "
+            "WHERE id = ? AND status = 'pending' AND token_hash = ?",
+            (confirmed_at, sid, _hash(token)),
         )
+        claimed = cur.rowcount == 1
         await db.commit()
+        if not claimed:
+            return confirm_page.neutral()
         async with db.execute("SELECT * FROM selfcheck_submission WHERE id = ?", (sid,)) as cur:
             row = await cur.fetchone()
 
@@ -402,7 +437,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
                      "company": row["company"], "lists": ["radar"] if "radar" in picks else []}
         await lead_sync.enqueue(db, origin="selfcheck", origin_id=sid, lead=lead_for(row, ref), subscribe=subscribe)
         logger.info("SELFCHECK_CONFIRMED id=%s mail=%s", sid, mail_sent)
-        return _redirect(row["lang"], True)
+        return _redirect(row["lang"], True, status=303)
 
     @router.post(EVENT_PATH, status_code=204)
     @limiter.limit(SELFCHECK_EVENT_RATE_LIMIT, key_func=_global_key)

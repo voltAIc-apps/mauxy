@@ -38,7 +38,7 @@ import lead_sync
 import leads_api
 import mailer
 import selfcheck_api
-from tests.conftest import drain
+from tests.conftest import drain, click_confirm, is_neutral
 
 HERE = Path(__file__).parent
 CASES = json.loads((HERE / "cases" / "lead_api_cases.json").read_text(encoding="utf-8"))
@@ -73,7 +73,7 @@ def token_of(mail, path="/api/lead/confirm"):
 
 def submit_and_confirm(client, outbox, payload):
     assert client.post("/api/lead", headers=ORIGIN, json=payload).json() == {"status": "pending_confirmation"}
-    r = client.get(f"/api/lead/confirm?token={token_of(outbox[-1])}", follow_redirects=False)
+    r = click_confirm(client, f"/api/lead/confirm?token={token_of(outbox[-1])}")
     drain(client)
     return r
 
@@ -109,7 +109,7 @@ def test_t_lead_030_nothing_before_confirmation(client, outbox, odoo):
 
 def test_t_lead_031_contact_creates_one_lead(client, outbox, odoo):
     r = submit_and_confirm(client, outbox, base("contact", newsletter=True, page_url="https://site.test/de/contact"))
-    assert r.status_code == 302 and r.headers["location"] == "https://site.test/de/anfrage/bestaetigt?art=contact"
+    assert r.status_code == 303 and r.headers["location"] == "https://site.test/de/anfrage/bestaetigt?art=contact"
     (lead,) = odoo.leads()
     assert lead["name"] == "Website: Kontaktanfrage – Muster GmbH"
     assert lead["type"] == "lead" and lead["user_id"] == 7 and lead["message_partner_ids"] == [70]
@@ -129,9 +129,9 @@ def test_t_lead_031_contact_creates_one_lead(client, outbox, odoo):
 def test_t_lead_032_single_use(client, outbox, odoo):
     client.post("/api/lead", headers=ORIGIN, json=base("contact"))
     token = token_of(outbox[0])
-    assert client.get(f"/api/lead/confirm?token={token}", follow_redirects=False).headers["location"].endswith("art=contact")
-    again = client.get(f"/api/lead/confirm?token={token}", follow_redirects=False)
-    assert again.headers["location"] == "https://site.test/de/anfrage/fehler"
+    assert click_confirm(client, f"/api/lead/confirm?token={token}").headers["location"].endswith("art=contact")
+    again = click_confirm(client, f"/api/lead/confirm?token={token}")
+    assert is_neutral(again)
     drain(client)
     assert len(odoo.leads()) == 1
 
@@ -163,7 +163,7 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
                "answers": COMPLETE, "rules_version": "x", "consent": True, "company": "Muster GmbH"}
     assert client.post("/api/lead", headers=ORIGIN, json=payload).json() == {"status": "pending_confirmation"}
     assert odoo.calls == []
-    r = client.get(f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}", follow_redirects=False)
+    r = click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
     drain(client)
     assert r.headers["location"] == "https://site.test/de/selbst-check?bestaetigt=1"
     (lead,) = odoo.leads()
@@ -182,7 +182,7 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
 def test_t_lead_035_radar_only_is_no_lead(client, outbox, odoo):
     client.post("/api/selfcheck", headers=ORIGIN, json={"email": "bob@example.com", "lang": "de", "picks": ["radar"],
                                                         "answers": {}, "rules_version": "x", "consent": True})
-    client.get(f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}", follow_redirects=False)
+    click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
     drain(client)
     assert odoo.leads() == [] and len(odoo.db["mailing.subscription"]) == 1
     assert "CRM-Lead: keiner (nur Radar)" in outbox[-1]["body"]
@@ -256,7 +256,7 @@ def test_t_lead_041_foreign_tokens_refused(client, outbox, odoo, token_signer):
     forged = [token_signer.dumps({"l": lid}), selfcheck_api._signer.dumps({"l": lid}), token_of(outbox[0])[:-3] + "abc",
               leads_api._signer.dumps({"l": "1"}), leads_api._signer.dumps({"l": lid + 99})]
     for t in forged:
-        assert client.get(f"/api/lead/confirm?token={t}", follow_redirects=False).headers["location"].endswith("/anfrage/fehler")
+        assert is_neutral(click_confirm(client, f"/api/lead/confirm?token={t}"))
     drain(client)
     assert odoo.calls == []
 
@@ -293,7 +293,7 @@ def test_t_lead_044_newsletter_with_odoo_sink(client, outbox, odoo):
     client.post("/api/subscribe", json={**page, "email": "nina@example.com"})
     assert odoo.writes_to("mailing.contact") == []  # read only before the click
     token = re.search(r"token=(\S+)", outbox[-1]["body"]).group(1)
-    assert client.get(f"/api/confirm?token={token}", follow_redirects=False).headers["location"] == "https://site.test/de/newsletter/confirmed"
+    assert click_confirm(client, f"/api/confirm?token={token}").headers["location"] == "https://site.test/de/newsletter/confirmed"
     (contact,) = odoo.db["mailing.contact"].values()
     assert contact["email"] == "nina@example.com"
     n = len(outbox)
