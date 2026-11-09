@@ -355,16 +355,20 @@ async def lifespan(app: FastAPI):
     await leads_api.purge(db)
     await lead_sync.purge(db)
     await auth_api.purge(db)
+    mailer.bind(db)  # mail_outbox (idempotency, retries, per-recipient limit)
+    await mailer.purge(db)
     app.state.db = db
     logger.info("ACTION_LOG_DB opened: %s sites=%d topics=%d mautic_version=%s",
                 ACTION_LOG_DB, len(_SITES_BY_KEY), len(QUIZ_BANK), get_mautic_version() or "unknown")
     await lead_sync.resume(db)  # CRM deliveries interrupted by a restart
+    await mailer.resume(jobs.spawn)  # mails that were queued when the process stopped
     auth_purger = asyncio.get_running_loop().create_task(auth_api.purger(db), name="auth_purger")
     yield
     auth_purger.cancel()
     # finish pending DOI mails before the DB closes; retries sleeping in their backoff are
     # cancelled (state stays in SQLite, resumed on the next start)
     await jobs.drain(timeout=float(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "10")))
+    mailer.bind(None)
     await db.close()
     logger.info("ACTION_LOG_DB closed")
 
@@ -678,7 +682,7 @@ async def _subscribe_job(request: Request, payload: SubscribeRequest, email: str
     ok = await mailer.send(email, subject, body.format(
         link=f"{PUBLIC_BASE_URL}/api/confirm?token={token}",
         hours=CONFIRM_TOKEN_MAX_AGE // 3600, days=NEWSLETTER_PENDING_DAYS,
-    ))
+    ), audience="doi", key=f"nl-doi-{pid}")
     if not ok:
         await db.execute("DELETE FROM newsletter_pending WHERE id = ?", (pid,))
         await db.commit()

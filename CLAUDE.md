@@ -22,7 +22,7 @@ Tests (respx mocks Mautic, mails captured with `MAIL_MODE=memory`):
 PYTHONPATH=. tests/venv/bin/python -m pytest tests -q
 ```
 
-Numbered: T-NL-0xx (newsletter authority: site key, quiz, per-site policy, ludo upstream flow, db-patches; cases in `tests/cases/newsletter_gate_cases.json`), T-AUTH-0xx (LinkedIn login, LinkedIn mocked with respx, cases in `tests/cases/auth_cases.json`), T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check), T-ODOO-0xx (Odoo client), T-SINK-0xx (sinks), T-LEAD-0xx (CTA leads, outbox; cases in `tests/cases/`). Odoo is ALWAYS the in-memory fake (`tests/fake_odoo.py`, `odoo` fixture); legacy suites run with `LEAD_SINK=none`, `SUBSCRIBER_SINK=mautic`. Local run with the fake: `tests/scripts/run_local.py` (10.0.99.1:8020; also a mocked LinkedIn at `/__mock_linkedin`). Read-only check against the real erp.wapsol (only with the bot credentials): `scripts/odoo_smoke.py`.
+Numbered: T-MAIL-0xx (mailer: TLS, MIME, limits, injection, retries), T-NL-0xx (newsletter authority: site key, quiz, per-site policy, ludo upstream flow, db-patches; cases in `tests/cases/newsletter_gate_cases.json`), T-AUTH-0xx (LinkedIn login, LinkedIn mocked with respx, cases in `tests/cases/auth_cases.json`), T-SEC-0xx (security reviews 2026-11-08, incl. timing T-SEC-017), T-SC-1xx (self-check), T-ODOO-0xx (Odoo client), T-SINK-0xx (sinks), T-LEAD-0xx (CTA leads, outbox; cases in `tests/cases/`). Odoo is ALWAYS the in-memory fake (`tests/fake_odoo.py`, `odoo` fixture); legacy suites run with `LEAD_SINK=none`, `SUBSCRIBER_SINK=mautic`. Local run with the fake: `tests/scripts/run_local.py` (10.0.99.1:8020; also a mocked LinkedIn at `/__mock_linkedin`). Read-only check against the real erp.wapsol (only with the bot credentials): `scripts/odoo_smoke.py`.
 
 ## Build & Deploy
 
@@ -53,7 +53,7 @@ glob that `--apply` applies, so it can never clobber the real Secret. The Docker
 - `lead_sync.py` outbox table `lead_sync` (UNIQUE per submission), retries with backoff via `jobs.py`, marker search against duplicates, failure mail to `LEAD_NOTIFY_TO`, data cleared after delivery.
 - `sinks.py` `OdooLeadSink`, `OdooSubscriberSink`, none sinks, factory (`LEAD_SINK`, `subscriber_sink(kind)` per site, fallback `SUBSCRIBER_SINK`). `odoo_client.py` JSON-RPC over verified HTTPS, `ALLOWED` / `WRITE_FIELDS`.
 - `auth_api.py` `GET /api/auth/linkedin/start|callback`, `POST /api/auth/session`: return path = same-site path on `AUTH_ALLOWED_ORIGINS`; state signed 10 min, single use, bound by cookie `__Host-mauxy_li`; one-time code (60 s, single use, bound to the tab's `binding`) instead of PII in URLs; tables `auth_state`, `auth_code` (purged every 30 s); audit line without PII. Config problems disable only the login (`/health/detail` `auth_linkedin`).
-- `mailer.py` SMTP / console / memory. `jobs.py` fire-and-forget tasks (after the response).
+- `mailer.py` the ONE mail path: `send(to, subject, body, html=, attachments=[Attachment], audience=doi|confirmed|internal, key=, list_unsubscribe=)`; validation, MIME (alternative / related / mixed), policy, outbox `mail_outbox` (patch 0005, idempotent per Message-ID, retries, resume, per-recipient limit), SMTP with mandatory verified TLS. Await only from background jobs. Tests T-MAIL-0xx against aiosmtpd on 10.0.99.1 (`tests/test_mailer.py`). `jobs.py` fire-and-forget tasks (after the response).
 - Owner setup of erp.wapsol (bot user, group, rules, lists, UTM): README "erp.wapsol setup".
 
 
@@ -106,8 +106,10 @@ The schema is **not** created at runtime. It is owned by integer-numbered SQL pa
 | `PUBLIC_BASE_URL` | Public URL of mauxy; base of the DOI confirm link |
 | `PUBLIC_WEBSITE_BASE_URL` | Public URL of the website; confirm endpoint redirects here |
 | `NEWSLETTER_PENDING_DAYS`, `MAX_PENDING_PER_EMAIL` | Pending retention (7) / DOI mails per address and 24 h (3) |
-| `MAIL_MODE` | `smtp` / `console` (dry run) / `memory` (tests) |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | mailcow mc1.simplify-erp.de, 587 STARTTLS or 465 SSL |
+| `MAIL_MODE` | `smtp` (default) / `console` (dev only, prints bodies) / `memory` (tests) |
+| `SMTP_HOST`, `SMTP_SECURITY`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_REPLY_TO`, `SMTP_TIMEOUT` | mailcow `mail.mc1.simplify-erp.de`; `starttls` 587 (default) or `ssl` 465; TLS mandatory, verified, fail closed |
+| `SMTP_CA_FILE` | extra trust anchor for local mock servers / tests only |
+| `MAIL_MAX_BYTES`, `MAIL_ATTACHMENT_TYPES`, `MAIL_RECIPIENT_HOURLY_LIMIT`, `MAIL_INTERNAL_RECIPIENTS`, `MAIL_MAX_ATTEMPTS`, `MAIL_BACKOFF_SECONDS`, `MAIL_RETENTION_DAYS` | mail policy: 10 MiB, pdf/png/jpeg/webp, 10 per recipient and hour, retries 4 / 30 s, outbox 7 d |
 | `SELFCHECK_ALLOWED_ORIGINS` | Origins allowed on the self-check endpoints (also in `ALLOWED_ORIGINS`) |
 | `SELFCHECK_WEBSITE_URL`, `SELFCHECK_NOTIFY_TO` | Confirm redirect base; operator mailbox |
 | `SELFCHECK_RATE_LIMIT`, `SELFCHECK_EVENT_RATE_LIMIT` | Per-IP submit limit; global counter limit (no IP) |

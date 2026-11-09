@@ -274,7 +274,8 @@ async def finish(db: aiosqlite.Connection, sync: dict, outcome: str) -> None:
     if outcome == "done" and sync["lead_sink"] == "none" and sync["lead"] and lead_sync.NOTIFY_TO:
         lead = json.loads(sync["lead"])
         await mailer.send(lead_sync.NOTIFY_TO, f"Website-Lead (nicht im CRM): {lead['title']}",
-                          lead_sync.lead_text(sync), reply_to=lead["email"])
+                          lead_sync.lead_text(sync), reply_to=lead["email"], audience="internal",
+                          key=f"lead-none-{sync['id']}")
 
 
 lead_sync.register("lead", finish)
@@ -316,7 +317,8 @@ async def _submit_job(db: aiosqlite.Connection, payload) -> None:
     subject, body = DOI[payload.lang]
     ok = await mailer.send(email, subject, body.format(
         what=KIND_LABEL[payload.kind][payload.lang], nl=NL_NOTE[payload.lang] if payload.newsletter else "",
-        link=f"{PUBLIC_BASE_URL}/api/lead/confirm?token={token}", hours=CONFIRM_TOKEN_MAX_AGE // 3600, days=LEAD_PENDING_DAYS))
+        link=f"{PUBLIC_BASE_URL}/api/lead/confirm?token={token}", hours=CONFIRM_TOKEN_MAX_AGE // 3600, days=LEAD_PENDING_DAYS),
+        audience="doi", key=f"lead-doi-{lid}")
     if not ok:
         await db.execute("DELETE FROM lead_submission WHERE id = ?", (lid,))
         await db.commit()

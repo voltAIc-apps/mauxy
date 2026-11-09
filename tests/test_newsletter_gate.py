@@ -282,7 +282,7 @@ def test_t_nl_051_file_db_must_be_migrated_first(tmp_path, monkeypatch):
         assert set(mauxy_main._SITES_BY_KEY) == {SITE_KEY, WEB_KEY, LUDO_KEY, RECLOUD_KEY}
 
 
-def test_t_nl_052_upgrade_from_upstream_0002_applies_0003_and_0004(tmp_path):
+def test_t_nl_052_upgrade_from_upstream_0002_applies_ours(tmp_path):
     path = tmp_path / "prod.db"
     conn = sqlite3.connect(path)
     db_migrate.ensure_migrations_table(conn)
@@ -293,8 +293,10 @@ def test_t_nl_052_upgrade_from_upstream_0002_applies_0003_and_0004(tmp_path):
         conn.execute("INSERT INTO sites (key, site, segment, topic) VALUES (?, ?, ?, ?)", (key, site, site, site))
     conn.commit()
     conn.close()
-    assert db_migrate.check(path)["pending"] == [(3, "website_consent"), (4, "site_policy")]
-    assert db_migrate.apply_pending(path) == [3, 4]
+    later = [(v, n) for v, n, _ in db_migrate.list_patches()[2:]]
+    assert later[:3] == [(3, "website_consent"), (4, "site_policy"), (5, "mail_outbox")]
+    assert db_migrate.check(path)["pending"] == later
+    assert db_migrate.apply_pending(path) == [v for v, _ in later]
     conn = sqlite3.connect(path)
     policy = {r[0]: r[1:] for r in conn.execute(
         "SELECT key, subscribe_quiz, subscriber_sink, doi_owner FROM sites")}  # data kept, policy set

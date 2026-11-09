@@ -233,7 +233,8 @@ async def mail_failure(row: dict) -> bool:
         lead_text(row),
     ])
     lead = json.loads(row["lead"]) if row["lead"] else {}
-    return await mailer.send(NOTIFY_TO, subject, body, reply_to=lead.get("email"))
+    return await mailer.send(NOTIFY_TO, subject, body, reply_to=lead.get("email"), audience="internal",
+                             key=f"lead-sync-failed-{row['id']}-{row['attempts']}")
 
 
 async def requeue(db: aiosqlite.Connection, sync_id: int) -> bool:

@@ -260,7 +260,8 @@ async def finish(db: aiosqlite.Connection, sync: dict, outcome: str) -> None:
     notify_sent = False
     if SELFCHECK_NOTIFY_TO:
         subject, body = notify_mail(row, radar, bool(row["mail_sent"]), crm)
-        notify_sent = await mailer.send(SELFCHECK_NOTIFY_TO, subject, body, reply_to=row["email"])
+        notify_sent = await mailer.send(SELFCHECK_NOTIFY_TO, subject, body, reply_to=row["email"],
+                                        audience="internal", key=f"sc-notify-{sid}")
     await db.execute("UPDATE selfcheck_submission SET notify_sent = ?, radar_result = ? WHERE id = ?",
                      (int(notify_sent), radar, sid))
     await db.commit()
@@ -320,7 +321,7 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
         link=f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}",
         hours=CONFIRM_TOKEN_MAX_AGE // 3600,
         retention_pending_days=SELFCHECK_PENDING_DAYS,
-    ))
+    ), audience="doi", key=f"sc-doi-{sid}")
     if not ok:
         await db.execute("DELETE FROM selfcheck_submission WHERE id = ?", (sid,))
         await db.commit()
@@ -390,7 +391,8 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         mail_sent = False
         if "mail" in picks:
             subject, body = result_mail(row)
-            mail_sent = await mailer.send(row["email"], subject, body)
+            # address confirmed by the DOI click; the report PDF / images go here as mailer.Attachment
+            mail_sent = await mailer.send(row["email"], subject, body, audience="confirmed", key=f"sc-result-{sid}")
         await db.execute("UPDATE selfcheck_submission SET mail_sent = ? WHERE id = ?", (int(mail_sent), sid))
         await db.commit()
 
