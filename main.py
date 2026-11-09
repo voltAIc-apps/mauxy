@@ -834,14 +834,14 @@ async def confirm(request: Request):
             await db.commit()
             await log_action(request, email, "confirm_error", error_detail=f"dnc_check: {str(exc)[:180]}", **log)
             return fail(locale, "service_unavailable", site)
-        reconfirmed = False
+        reconfirmed_at = None
         if dnc == "optout":
             # self-service opt-out: only a re-signup link issued AFTER it is fresh consent -> lift
             # (audited, hash only) and re-subscribe; an older link stays blocked
             orow = await routing.optout_row(db, site, email)
             if row["resignup"] and orow and row["created_at"] >= orow["created_at"]:
-                reconfirmed = await routing.lift_optout(db, site, email, "doi_reconfirm")
-            dnc = "none" if reconfirmed else "blocked"
+                reconfirmed_at = await routing.lift_optout(db, site, email, "doi_reconfirm")
+            dnc = "none" if reconfirmed_at else "blocked"
         if dnc == "blocked":
             await log_action(request, email, "confirm_dnc_refused", error_detail="routed", **log)
             return RedirectResponse(_nl_redirect(site, locale, "confirmed"), status_code=303)
@@ -849,9 +849,9 @@ async def confirm(request: Request):
         # nor repeats the others; the outbox gate re-checks do-not-contact per delivery)
         await routing.fan_out(db, site=site, action="subscribe", event_ref=f"nl:{pid}", to=to, data={
             "email": email, "locale": locale, "source": row["source"], "page_url": row["page_url"],
-            "segment": row["segment"] or "", "lists": ["newsletter"], **({"_reconfirmed": True} if reconfirmed else {})})
+            "segment": row["segment"] or "", "lists": ["newsletter"], **({"_reconfirmed_at": reconfirmed_at} if reconfirmed_at else {})})
         await log_action(request, email, "confirm_ok",
-                         error_detail=f"routed:{len(to)}" + (" reconfirmed" if reconfirmed else ""), **log)
+                         error_detail=f"routed:{len(to)}" + (" reconfirmed" if reconfirmed_at else ""), **log)
         return RedirectResponse(_nl_redirect(site, locale, "confirmed"), status_code=303)
 
     try:
@@ -949,7 +949,12 @@ async def unsubscribe(payload: UnsubscribeRequest, request: Request):
         await log_action(request, email, "unsubscribe_queued", error_detail=f"routed:{len(to)}", **log)
         return JSONResponse({"status": "ok"})
     try:
-        result, ref = await sinks.subscriber_sink(site["sink"]).unsubscribe(email)
+        sink = sinks.subscriber_sink(site["sink"])
+        if isinstance(sink, sinks.OdooSubscriberSink):  # provenance of mauxy's Odoo opt-outs (patch 0009)
+            result, ref, marks = await sink.unsubscribe_marked(email)
+            await routing.record_odoo_marks(request.app.state.db, site["site"], email, marks)
+        else:
+            result, ref = await sink.unsubscribe(email)
     except sinks.SinkTransient as exc:
         logger.error("UNSUBSCRIBE_SINK_UNREACHABLE error=%s", str(exc)[:200])
         await log_action(request, email, "sink_unreachable", error_detail=str(exc)[:200], **log)

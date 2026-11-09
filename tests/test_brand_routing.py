@@ -12,6 +12,9 @@ routing ("hooks") with fan-out through the route_delivery outbox, signed webhook
   T-DNC-010..015 re-signup after a self-service opt-out (owner decision): DOI allowed, no fan-out
                  before the click, the new click lifts (audit) + re-subscribes, hard blocks suppress,
                  old links never lift, abuse cap 1 / 30 days + per-address cap
+  T-DNC-016..022 provenance of Odoo opt-outs (review of 7b52b69): foreign opt-out with a self row,
+                 write_date drift, retries after a later Odoo opt-out / new self opt-out, admin lift
+                 keeps the Odoo opt-out hard, the fallback path records provenance
   T-DNC-001..009 do-not-contact gate of routed sites (security review): fallback blacklist, one of
                  several targets, webhook-only + mauxy opt-out record, check error -> fail closed,
                  block at the click, outbox gate for lead / selfcheck webhooks + lists, uniform
@@ -104,6 +107,9 @@ class Hooks:
         self.requests.append(request)
         queue = self.answers.get(request.headers["host"].split(":")[0]) or []
         a = queue.pop(0) if queue else 200
+        if callable(a):  # side effect at delivery time (e.g. a later Odoo opt-out), then a 503
+            a()
+            a = 503
         if a == "timeout":
             raise httpx.ReadTimeout("fake timeout", request=request)
         return httpx.Response(a, headers={"Location": "https://169.254.169.254/latest"} if 300 <= a < 400 else {})
@@ -1050,7 +1056,7 @@ def test_t_dnc_010_011_resignup_doi_then_click_lifts_and_resubscribes(client, ou
     assert audit["email_hash"] == hashlib.sha256(b"re@example.com").hexdigest() and audit["lifted_at"]
     assert odoo.db["mailing.subscription"][sub["id"]]["opt_out"] is False
     (ev,) = hooks.events("flywheel.test")
-    assert ev["event"] == "subscribe" and "_reconfirmed" not in ev["data"]  # internal flag never sent
+    assert ev["event"] == "subscribe" and "_reconfirmed_at" not in ev["data"]  # internal lift time never sent
     log = client.request("GET", "/api/actions?result=confirm_ok", headers=ADMIN).json()["actions"]
     assert log[0]["error_detail"] == "routed:2 reconfirmed"
 
@@ -1109,3 +1115,106 @@ def test_t_dnc_015_resignup_counts_toward_per_address_cap(client, outbox, odoo, 
     assert q(client, "SELECT resignup_at FROM site_optout") == [{"resignup_at": None}]
     monkeypatch.setattr(mauxy_main, "MAX_PENDING_PER_EMAIL", 3)
     assert len(_subscribe_status(client, outbox, "pa@example.com")[2]) == 1
+
+
+# ------------------------------------------------------------------------------------------ provenance (review of 7b52b69)
+
+
+def _own_optout(client, outbox, odoo, email):
+    """Subscribed on list 5 via the routed site, then the person's own unsubscribe via mauxy."""
+    _routed_odoo_web(client, odoo)
+    nl_confirm(client, outbox, email)
+    unsubscribe(client, email)
+    (sub,) = [r for r in odoo.db["mailing.subscription"].values() if r["list_id"] == 5]
+    return sub
+
+
+def test_t_dnc_016_mark_recorded_with_write_date(client, outbox, odoo, hooks):
+    sub = _own_optout(client, outbox, odoo, "pv@example.com")
+    (mark,) = q(client, "SELECT * FROM odoo_optout_mark")
+    assert mark["site"] == "simplify-web" and mark["list_id"] == 5 and mark["subscription_id"] == sub["id"]
+    assert mark["write_date"] == sub["write_date"] and mark["email_hash"] == hashlib.sha256(b"pv@example.com").hexdigest()
+    assert len(_subscribe_status(client, outbox, "pv@example.com")[2]) == 2  # self-service: re-signup DOI allowed
+
+
+def test_t_dnc_017_foreign_odoo_optout_with_self_row_is_hard(client, outbox, odoo, hooks):
+    """A self row exists, but Odoo's own link opted the address out of another list of the site
+    (radar 6, no mark): hard block -> no DOI mail."""
+    sub = _own_optout(client, outbox, odoo, "fo@example.com")
+    odoo.add("mailing.list", id=6, name="Radar")
+    put_routes(client, "simplify-web", "selfcheck", [{"sink": "odoo", "params": {"lists": {"radar": 6}}}])
+    odoo.add("mailing.subscription", contact_id=sub["contact_id"], list_id=6, opt_out=True)
+    status, body, mails = _subscribe_status(client, outbox, "fo@example.com")
+    assert (status, body, len(mails)) == (200, {"status": "pending_confirmation"}, 1)  # only the first DOI
+
+
+def test_t_dnc_018_write_date_drift_is_hard(client, outbox, odoo, hooks):
+    """Same subscription, but Odoo / staff touched it after mauxy's write (newer write_date): hard."""
+    sub = _own_optout(client, outbox, odoo, "wd@example.com")
+    odoo.execute("mailing.subscription", "write", [[sub["id"]], {"opt_out": True}], {})  # staff re-saves it
+    assert odoo.db["mailing.subscription"][sub["id"]]["write_date"] > q(client, "SELECT write_date FROM odoo_optout_mark")[0]["write_date"]
+    assert len(_subscribe_status(client, outbox, "wd@example.com")[2]) == 1  # no re-signup DOI
+    # another subscription than the marked one on the same list is not mauxy's either
+    async def swap(app):
+        await app.state.db.execute("UPDATE odoo_optout_mark SET subscription_id = 999999, write_date = '2999-01-01 00:00:00'")
+        await app.state.db.commit()
+    client.portal.call(swap, client.app)
+    assert len(_subscribe_status(client, outbox, "wd@example.com")[2]) == 1
+
+
+def test_t_dnc_019_retry_after_later_odoo_optout_is_blocked(client, outbox, odoo, hooks):
+    """Re-signup click lifts at T; the webhook's first attempt fails and meanwhile Odoo's own link
+    opts the address out again (newer write_date): the retry is NOT exempted -> dnc_skip."""
+    sub = _own_optout(client, outbox, odoo, "rt@example.com")
+    token, _ = nl_subscribe(client, outbox, "rt@example.com")
+
+    def later_odoo_optout():
+        odoo.execute("mailing.subscription", "write", [[sub["id"]], {"opt_out": True}], {})
+    hooks.answers["flywheel.test"] = [later_odoo_optout]
+    hooks.requests.clear()
+    click_confirm(client, f"/api/confirm?token={token}")
+    drain(client)
+    web = [d for d in deliveries(client) if d["action"] == "subscribe" and d["sink"] == "webhook"][-1]
+    assert web["state"] == "done" and web["result"] == "dnc_skip" and web["attempts"] == 2
+    assert len(hooks.to("flywheel.test")) == 1  # the retry never left
+    assert odoo.db["mailing.subscription"][sub["id"]]["opt_out"] is True
+
+
+def test_t_dnc_020_reconfirmed_at_semantics(client, outbox, odoo, hooks):
+    """dnc_status with the lift time: a mauxy-marked opt-out from before the lift is ignored, a mark
+    written after it is not, and a NEW self row after the lift blocks again."""
+    sub = _own_optout(client, outbox, odoo, "rc@example.com")
+
+    async def go(app):
+        db = app.state.db
+        mark_at = (await _q(app, "SELECT marked_at FROM odoo_optout_mark"))[0]["marked_at"]
+        lifted = await routing.lift_optout(db, "simplify-web", "rc@example.com", "doi_reconfirm")
+        before = routing.iso(routing.now() - routing.timedelta(hours=1))
+        res = [await routing.dnc_status(db, "simplify-web", "rc@example.com", primary=False, reconfirmed_at=lifted),
+               await routing.dnc_status(db, "simplify-web", "rc@example.com", primary=False, reconfirmed_at=before),
+               await routing.dnc_status(db, "simplify-web", "rc@example.com", primary=False)]
+        await routing.record_optout(db, "simplify-web", "rc@example.com")  # new own opt-out after the lift
+        res.append(await routing.dnc_status(db, "simplify-web", "rc@example.com", primary=False, reconfirmed_at=lifted))
+        return mark_at <= lifted, res
+    ordered, res = client.portal.call(go, client.app)
+    assert ordered and res == ["none", "blocked", "blocked", "optout"]  # 'optout' = marketing still blocked
+    assert odoo.db["mailing.subscription"][sub["id"]]["opt_out"] is True
+
+
+def test_t_dnc_021_admin_lift_keeps_odoo_optout_hard(client, outbox, odoo, hooks):
+    """Admin lifts mauxy's row only: the Odoo opt-out mauxy wrote then has no self row -> hard."""
+    _own_optout(client, outbox, odoo, "al@example.com")
+    client.request("POST", "/api/admin/optouts/simplify-web/lift", headers=ADMIN, json={"email": "al@example.com"})
+    assert len(_subscribe_status(client, outbox, "al@example.com")[2]) == 1  # no re-signup DOI
+
+
+def test_t_dnc_022_fallback_path_records_provenance_only_for_own_writes(client, outbox, odoo):
+    """Non-routed Odoo site: the synchronous unsubscribe records marks for what IT opted out; a
+    subscription already opted out by someone else gets none."""
+    nl_confirm(client, outbox, "fb@example.com")
+    (sub1,) = odoo.db["mailing.subscription"].values()
+    other = odoo.add("mailing.subscription", contact_id=sub1["contact_id"], list_id=2, opt_out=True)
+    assert unsubscribe(client, "fb@example.com").json() == {"status": "ok"}
+    marks = q(client, "SELECT list_id, subscription_id FROM odoo_optout_mark")
+    assert marks == [{"list_id": 1, "subscription_id": sub1["id"]}] and other not in [m["subscription_id"] for m in marks]
+    assert deliveries(client) == []

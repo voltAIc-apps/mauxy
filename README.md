@@ -239,7 +239,8 @@ outbox, login state/code), 0004 per-site policy, 0005 mail outbox, 0006 per-site
 (`site_brand`, `site_mail_footer`, `site_redirect`, `site_origin`, `site_route`, `route_delivery`;
 `site` on leads / self-checks, `target` on `lead_sync`; seed: simplify-erp profile), 0007 `site_optout`
 (mauxy's per-site do-not-contact record, hashed), 0008 re-signup (`source` self / admin, `resignup_at`,
-`newsletter_pending.resignup`, audit `site_optout_lift`). Tests with `ACTION_LOG_DB=:memory:` apply the patches
+`newsletter_pending.resignup`, audit `site_optout_lift`), 0009 `odoo_optout_mark` (provenance of mauxy's Odoo
+opt-outs). Tests with `ACTION_LOG_DB=:memory:` apply the patches
 in-process. Never edit a deployed patch; add the next one.
 
 Dev loop: change your local DB schema, run `--generate <name>`, review the emitted patch
@@ -681,8 +682,13 @@ row (audit `site_optout_lift`: reason `doi_reconfirm`, timestamps, hashed addres
 targets (Odoo: `opt_out` back to False with the bot's existing write on `mailing.subscription.opt_out` -- no new
 rights). Links issued before the opt-out never lift it. **Hard blocks** still suppress the DOI mail and need a
 manual lift: admin block (`POST /api/admin/optouts/{site}/block`), Odoo `mail.blacklist`, Mautic DNC (mauxy never
-removes a DNC), and an Odoo list opt-out mauxy did not write (Odoo's own unsubscribe link, opt-outs from before
-0007). Abuse guard: re-signup DOI mails count toward `MAX_PENDING_PER_EMAIL` plus at most 1 per site and address
+removes a DNC), and an Odoo list opt-out mauxy did not write (Odoo's own unsubscribe link, staff, opt-outs from
+before 0009). Provenance (patch 0009, `odoo_optout_mark`): every Odoo opt-out mauxy writes is recorded per site,
+hashed address and list with the subscription id, mauxy's write time and the `write_date` read back from Odoo; an
+Odoo opt-out is self-service only if it matches that mark AND its current `write_date` is not newer (re-saved /
+re-set later = hard). The click passes its lift time (`_reconfirmed_at`) to its outbox rows: retries ignore only
+mauxy-marked opt-outs written before it; a later Odoo opt-out or a new own opt-out blocks again. An admin lift
+removes only mauxy's row; the Odoo opt-out then stays hard until removed in Odoo. Abuse guard: re-signup DOI mails count toward `MAX_PENDING_PER_EMAIL` plus at most 1 per site and address
 per `OPTOUT_RESIGNUP_DAYS` (30), atomic. A lead's ticked newsletter box is not a re-signup (lists stay skipped).
 Manual lift: `POST /api/admin/optouts/{site}/lift` (audited, reason `admin`).
 Sites without routes keep their sink's semantics (Odoo blacklist, Mautic DNC) -- unchanged.
