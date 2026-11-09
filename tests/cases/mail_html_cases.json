@@ -1,0 +1,23 @@
+{
+  "suite": "Branded HTML part of the Selbst-Check mails (mail_html.py, owner request 2026-11-09)",
+  "description": "xss: names that pass the name validation (clean_name) and reach the result mail greeting. The HTML part must contain `escaped` and none of `forbidden`; the plain-text part keeps the name literally (`plain_first_line`). lang: words that must appear in the HTML of that language (labels from the rules engine + frame texts) and words of the other language that must not.",
+  "xss": [
+    { "id": "T-HTML-020", "name": "<script>alert(1)</script>", "escaped": "&lt;script&gt;alert(1)&lt;/script&gt;", "forbidden": ["<script"], "plain_first_line": "Guten Tag <script>alert(1)</script>," },
+    { "id": "T-HTML-021", "name": "<img src=x onerror=alert(1)>", "escaped": "&lt;img src=x onerror=alert(1)&gt;", "forbidden": ["<img src=x"], "plain_first_line": "Guten Tag <img src=x onerror=alert(1)>," },
+    { "id": "T-HTML-022", "name": "Bob\" onmouseover=\"alert(1)", "escaped": "Bob&quot; onmouseover=&quot;alert(1)", "forbidden": ["\" onmouseover=\""], "plain_first_line": "Guten Tag Bob\" onmouseover=\"alert(1)," },
+    { "id": "T-HTML-023", "name": "O'Brien & <b>Co</b>", "escaped": "O&#x27;Brien &amp; &lt;b&gt;Co&lt;/b&gt;", "forbidden": ["<b>Co</b>"], "plain_first_line": "Guten Tag O'Brien & <b>Co</b>," },
+    { "id": "T-HTML-024", "name": "<a href=\"https://evil.test\">Bob</a>", "escaped": "&lt;a href=&quot;https://evil.test&quot;&gt;Bob&lt;/a&gt;", "forbidden": ["href=\"https://evil.test\""], "plain_first_line": "Guten Tag <a href=\"https://evil.test\">Bob</a>," }
+  ],
+  "lang": {
+    "de": {
+      "subject": "Ihr Selbst-Check: Ergebnis",
+      "present": ["lang=\"de\"", "Guten Tag Bob Beispiel,", "Ampeln", "Die drei größten Risiken und was Sie tun können", "Sinnvolle Reihenfolge", "Ergebnis online ansehen", "Richtangebot", "Genauigkeit: präzise", "Weiterlesen", "Ihre Antworten", "Impressum", "handeln"],
+      "absent": ["Traffic lights", "View your result online", "Imprint", "Precision"]
+    },
+    "en": {
+      "subject": "Your self-check: result",
+      "present": ["lang=\"en\"", "Hello Bob Beispiel,", "Traffic lights", "The three biggest risks and what you can do", "A sensible order", "View your result online", "Indicative quote", "Precision: precise", "Read more", "Your answers", "Imprint", "act"],
+      "absent": ["Ampeln", "Ergebnis online ansehen", "Impressum", "Genauigkeit"]
+    }
+  }
+}

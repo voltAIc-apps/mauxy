@@ -343,7 +343,8 @@ def test_t_sc_194_greeting_plain_text_literal(respx_mock, client, outbox):
     result = outbox[1]
     first = result["body"].split("\n", 1)[0]
     assert first == "Guten Tag <b>Bob</b> & Co,"  # plain text: shown literally, never rendered
-    assert result["html"] is None  # plain-text mail, no HTML part
+    # branded HTML part (T-HTML-0xx): the name escaped there, literal in the text part
+    assert "&lt;b&gt;Bob&lt;/b&gt; &amp; Co" in result["html"] and "<b>Bob</b>" not in result["html"]
     assert selfcheck_api.greet("Hello,\nx", "O'Brien \"Jr\"", "en") == "Hello O'Brien \"Jr\",\nx"  # quotes stay
     assert selfcheck_api.greet("Hi there", "Bob", "en") == "Hi there"  # foreign opening: unchanged
 
