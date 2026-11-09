@@ -168,7 +168,7 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
     drain(client)
     assert r.headers["location"] == "https://site.test/de/selbst-check?bestaetigt=1"
     (lead,) = odoo.leads()
-    assert lead["name"] == "Selbst-Check: SAP ECC / R/3 – Muster GmbH"
+    assert lead["name"] == "Self-Check: SAP ECC / R/3 – Muster GmbH"
     assert lead["campaign_id"] == 20 and lead["partner_name"] == "Muster GmbH"
     assert lead["contact_name"] == "Bob Beispiel" and lead["phone"] == "+49 (0)30 / 123-45"
     assert "Angefragt: Ergebnis und Richtangebot per Mail; 30 Minuten Kennenlernen (Meetly)" in lead["description"]
@@ -381,5 +381,5 @@ def test_t_lead_035_selfcheck_lead_title_short_with_several_systems(client, outb
     click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
     drain(client)
     (lead,) = odoo.leads()
-    assert lead["name"] == "Selbst-Check: SAP ECC / R/3 +2 – Eve Beispiel"
+    assert lead["name"] == "Self-Check: SAP ECC / R/3 +2 – Eve Beispiel"
     assert "Systeme: SAP ECC / R/3 + " in lead["description"]
