@@ -103,7 +103,7 @@ The schema is **not** created at runtime. It is owned by integer-numbered SQL pa
 | `ADMIN_API_KEY` | Bearer token for `/api/actions`, `/api/admin/*`, lead admin (disabled if unset) |
 | `CONFIRM_TOKEN_SECRET` | `itsdangerous` signing key for double opt-in tokens |
 | `CONFIRM_TOKEN_MAX_AGE` | Token lifetime in seconds (default 86400) |
-| `PUBLIC_BASE_URL` | Public URL of mauxy; base of the DOI confirm link |
+| `PUBLIC_BASE_URL` | Public URL of mauxy (prod canonical `https://mauxy.engage.wapsol.de`); base of every DOI confirm link and the LinkedIn redirect URI |
 | `PUBLIC_WEBSITE_BASE_URL` | Public URL of the website; confirm endpoint redirects here |
 | `NEWSLETTER_PENDING_DAYS`, `MAX_PENDING_PER_EMAIL` | Pending retention (7) / DOI mails per address and 24 h (3) |
 | `MAIL_MODE` | `smtp` (default) / `console` (dev only, prints bodies) / `memory` (tests) |

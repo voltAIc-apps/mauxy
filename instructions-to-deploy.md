@@ -82,5 +82,8 @@ must NOT have such a campaign (mauxy already confirmed them).
 - Add a new calling site at runtime via `POST /api/admin/sites` (+ quiz questions via
   `POST /api/admin/quiz`), or seed keys by appending to `MAUXY_SITES` and re-running
   `--secret --apply`. Schema changes ship as new `db-patches/NNNN_*.sql`.
-- The legacy `unsubscribe.engage.wapsol.de` / `mautic-unsubscribe-proxy` deployment can
-  keep running during the transition; retire it once consumers point at `mauxy.engage`.
+- Canonical host `mauxy.engage.wapsol.de` (owner decision 2026-11-09): `DEPLOY_DOMAIN`,
+  `PUBLIC_BASE_URL`, the site's `VITE_MAUXY_URL` and the LinkedIn portal redirect URL
+  (`https://mauxy.engage.wapsol.de/api/auth/linkedin/callback`) all name this one host.
+- `unsubscribe.engage.wapsol.de` stays only as an alias for old mail links; the alias ingress is
+  a separate later step (the ingress here serves `DEPLOY_DOMAIN` only).

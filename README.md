@@ -78,7 +78,13 @@ async function subscribe(email, answerIndex) {
 ### CORS
 
 Browser requests are restricted to whitelisted origins (`ALLOWED_ORIGINS`). If your
-domain is not yet allowed, contact the service operator to add it.
+domain is not yet allowed, contact the service operator to add it. The site origins call the
+canonical host `https://mauxy.engage.wapsol.de` (never the old `unsubscribe.engage.wapsol.de`):
+
+```ini
+ALLOWED_ORIGINS=https://simplify-erp.de,https://www.simplify-erp.de,https://ludo.de
+# dev (site on the loopback alias): add http://10.0.99.1:5182
+```
 
 ### Rate Limiting
 
@@ -163,7 +169,7 @@ that DNS for `DEPLOY_DOMAIN` points at the ingress.
 | `ODOO_*`, `LEAD_*` | erp.wapsol + CTA leads, see "CTA leads" and `.env.example` | |
 | `CONFIRM_TOKEN_SECRET` | HMAC secret signing the double opt-in token | *(required for subscribe)* |
 | `CONFIRM_TOKEN_MAX_AGE` | Token lifetime in seconds | `86400` |
-| `PUBLIC_BASE_URL` | Public URL of this mauxy (base of the DOI confirm link) | *(required for subscribe)* |
+| `PUBLIC_BASE_URL` | Public URL of this mauxy: base of every DOI confirm link and of the LinkedIn redirect URI; prod `https://mauxy.engage.wapsol.de` (= `https://$DEPLOY_DOMAIN`) | *(required for subscribe)* |
 | `PUBLIC_WEBSITE_BASE_URL` | Public URL of the website; confirm redirects here | *(required for subscribe)* |
 | `MAIL_MODE` | `smtp` / `console` (dev only, prints bodies) / `memory` (tests) | `smtp` |
 | `SMTP_HOST` / `SMTP_SECURITY` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_REPLY_TO` / `SMTP_TIMEOUT` | mailcow SMTP, see "Mail (SMTP)" | `starttls`, 587, 30 s; host + from *(required for every mail)* |
@@ -350,6 +356,7 @@ The site entry `simplify-erp` exists in `sites` (patch 0004: `subscribe_quiz=0`,
   Answers: `200 {"status":"ok"}` (always, whether subscribed or not), `401`, `409 quiz_failed` (fetch a new
   challenge), `422`, `429`, `503` (sink down). Newsletter mails from Odoo carry Odoo's own unsubscribe link
   (no quiz) -- the website form is the second way.
+- Host: every call goes to `VITE_MAUXY_URL` = `https://mauxy.engage.wapsol.de` (= `PUBLIC_BASE_URL`).
 - CORS: the site origin in `ALLOWED_ORIGINS` (GET + POST, headers `Content-Type`, `Authorization`).
 - Lead CTAs, Selbst-Check and LinkedIn login are unchanged (Origin allowlists, no site key).
 
@@ -546,8 +553,8 @@ site  --POST /api/auth/session {code, binding}  (Origin = that site)-->  mauxy
   `auth_api.verify_session()` verifies it. The site keeps it in sessionStorage only.
 - **Config guard**: missing / unsafe settings disable only the login (`error=unavailable`,
   `/health/detail` -> `auth_linkedin: disabled: <names>`); newsletter and leads keep running.
-- **Host**: start and callback must be the same host (the cookie). Prod: the host this code runs on,
-  `unsubscribe.engage.wapsol.de` (see "Public host" below).
+- **Host**: start and callback must be the same host (the cookie). Both derive from `PUBLIC_BASE_URL`;
+  prod `https://mauxy.engage.wapsol.de` (see "Public host" below).
 
 | Variable | Purpose |
 |---|---|
@@ -559,12 +566,16 @@ site  --POST /api/auth/session {code, binding}  (Origin = that site)-->  mauxy
 | `LINKEDIN_AUTH_URL`, `LINKEDIN_TOKEN_URL`, `LINKEDIN_USERINFO_URL` | LinkedIn defaults; override only for a local mock on 10.0.99.1 |
 
 LinkedIn developer portal (app of simplify-erp.de, Auth tab): product "Sign In with LinkedIn using
-OpenID Connect"; Authorized redirect URL exactly `https://unsubscribe.engage.wapsol.de/api/auth/linkedin/callback`.
+OpenID Connect"; Authorized redirect URL exactly `https://mauxy.engage.wapsol.de/api/auth/linkedin/callback`.
 
-**Public host**: this code (repo mautic-unsubscribe) runs as `simplify-web/mautic-unsubscribe-proxy`
-behind `unsubscribe.engage.wapsol.de` (`PUBLIC_BASE_URL`, the site's `VITE_MAUXY_URL`).
-`mauxy.engage.wapsol.de` (namespace `mauxy`) is a DIFFERENT service (repo voltAIc-apps/mauxy,
-multi-site Mautic proxy): do not point the LinkedIn redirect there. Merging the two is an open CRIE item.
+**Public host** (owner decision 2026-11-09): canonical host `https://mauxy.engage.wapsol.de`, namespace
+`mauxy` (repo voltAIc-apps/mauxy, formerly mautic-unsubscribe). One value drives everything:
+`PUBLIC_BASE_URL` = `https://$DEPLOY_DOMAIN` = the site's `VITE_MAUXY_URL`. Derived from it: the DOI
+confirm links (`/api/confirm`, `/api/selfcheck/confirm`, `/api/lead/confirm`) and the LinkedIn redirect
+URI (start and callback on the same host). mauxy itself puts no unsubscribe link in mails (newsletter
+mails come from Odoo with Odoo's own link; the website form calls `/api/unsubscribe` on this host).
+`unsubscribe.engage.wapsol.de` stays only as an alias for old mail links; that alias ingress is a
+separate later step (not in `k8s/`).
 
 Local: `tests/scripts/run_local.py` mounts a mocked LinkedIn at `/__mock_linkedin` (fake person);
 tests `tests/test_auth.py` (T-AUTH-0xx, respx).

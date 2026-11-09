@@ -1,6 +1,7 @@
 # API Reference
 
-Base URL: `https://mauxy.engage.wapsol.de` (set via `DEPLOY_DOMAIN`)
+Base URL: `https://mauxy.engage.wapsol.de` (canonical host; `DEPLOY_DOMAIN`, `PUBLIC_BASE_URL`). The old
+`unsubscribe.engage.wapsol.de` is only an alias for old mail links.
 
 Mauxy is the single newsletter (un)subscribe authority for all sites. It owns the double
 opt-in itself (mail via SMTP, nothing reaches a sink before the click) and then delivers to the
@@ -209,7 +210,9 @@ SQLite, retries). `/health/detail` (operator, always HTTP 200): `status ok|degra
 
 ## LinkedIn login: /api/auth/linkedin/start, /api/auth/linkedin/callback, POST /api/auth/session
 
-Sign-in only (`openid profile email`). See README "LinkedIn login" for the flow.
+Sign-in only (`openid profile email`). See README "LinkedIn login" for the flow. Start and callback on the
+same host: redirect URI `https://mauxy.engage.wapsol.de/api/auth/linkedin/callback` (default
+`PUBLIC_BASE_URL` + path; must equal the LinkedIn portal entry).
 
 - `GET /api/auth/linkedin/start?lang=de|en&return=/de/...&binding=<43+ url-safe chars>`: 302 to LinkedIn
   + `Set-Cookie: __Host-mauxy_li` (HttpOnly, Secure, SameSite=Lax, 10 min). 400 `{"status": "invalid_request"}`
