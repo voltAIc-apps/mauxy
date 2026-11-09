@@ -31,6 +31,7 @@ NEEDED = [  # (model, operation) the bot must have
     ("res.partner", "read"), ("res.users", "read"), ("crm.lead", "read"), ("crm.lead", "create"),
     ("crm.lead", "write"),  # needed by message_subscribe, record rule must limit it to the bot's own leads
     ("utm.source", "read"), ("utm.medium", "read"), ("utm.campaign", "read"),
+    ("ir.model.data", "read"), ("res.partner.title", "read"),  # salutation -> crm.lead.title (by xml id)
     ("mail.blacklist", "read"), ("mailing.list", "read"),
     ("mailing.contact", "read"), ("mailing.contact", "create"),
     ("mailing.subscription", "read"), ("mailing.subscription", "create"), ("mailing.subscription", "write"),
@@ -107,6 +108,16 @@ async def main() -> int:
         print(f"{model} {name!r}: {rows[0]['id'] if rows else 'MISSING'}")
         if not rows:
             problems.append(f"create {model} {name!r} in Odoo")
+
+    from sinks import TITLE_XMLIDS
+    rows = await read("ir.model.data", "search_read", [[["module", "=", "base"], ["model", "=", "res.partner.title"],
+                                                       ["name", "in", sorted(TITLE_XMLIDS.values())]]],
+                      {"fields": ["name", "res_id"]})
+    found = {r["name"]: r["res_id"] for r in rows}
+    for sal, xmlid in TITLE_XMLIDS.items():
+        print(f"res.partner.title base.{xmlid} ({sal}): {found.get(xmlid, 'MISSING')}")
+        if xmlid not in found:
+            problems.append(f"base.{xmlid} not readable: leads with salutation {sal!r} get no title")
 
     lists = await read("mailing.list", "search_read", [[]], {"fields": ["name", "contact_count"], "limit": 50})
     print(f"mailing lists: {[(m['id'], m['name']) for m in lists]}")

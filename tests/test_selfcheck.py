@@ -9,6 +9,8 @@ Self-check endpoints (flywheel SPEC-020): T-SC-101 .. T-SC-150.
   T-SC-160..183  name / phone validation (cases in selfcheck_api_cases.json, owner request 2026-11-09)
   T-SC-190..199  name / phone delivery: crm.lead fields, result mail greeting (plain text, literal), operator mail,
                  rollout flag SELFCHECK_NAME_REQUIRED, /api/lead alias, admin, db-patches/0010
+  T-SC-200..213  salutation validation (cases in selfcheck_api_cases.json, db-patches/0012); delivery in
+                 test_salutation.py (T-SAL)
 """
 import copy
 import hashlib
@@ -72,6 +74,7 @@ def token_of(mail):
 @respx.mock(assert_all_called=False)
 def test_submit_validation(case, respx_mock, client, outbox, monkeypatch):
     monkeypatch.setattr(selfcheck_api, "SELFCHECK_NAME_REQUIRED", case.get("flag", True))
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_SALUTATION_REQUIRED", case.get("salutation_flag", True))
     mautic = respx_mock.route(url__regex=MAUTIC_ANY.pattern).mock(return_value=httpx.Response(500))
     b = body(**case.get("set", {}))
     for k in case.get("delete", []):

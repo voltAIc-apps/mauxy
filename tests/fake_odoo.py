@@ -31,7 +31,7 @@ class FakeOdoo:
         self.fail: dict[tuple[str, str], list[str]] = {}
         self.db: dict[str, dict[int, dict]] = {m: {} for m in (
             "res.partner", "res.users", "crm.lead", "utm.source", "utm.medium", "utm.campaign", "mail.blacklist",
-            "mailing.list", "mailing.contact", "mailing.subscription")}
+            "mailing.list", "mailing.contact", "mailing.subscription", "ir.model.data", "res.partner.title")}
         self._next = 1000
         self._tick = 0  # fake clock of write_date (strictly increasing, deterministic)
         # seed: Ashant (user 7 / partner 70), UTM, lists 1 + 2
@@ -41,6 +41,13 @@ class FakeOdoo:
         self.add("utm.medium", id=12, name="Website")
         for i, c in enumerate(("selfcheck", "contact", "inquiry", "webinar", "checkout")):
             self.add("utm.campaign", id=20 + i, name=c)
+        # standard partner titles + their xml ids (module base), as in a fresh Odoo
+        for rid, xmlid, name in ((3, "res_partner_title_madam", "Madam"), (4, "res_partner_title_mister", "Mister"),
+                                 (5, "res_partner_title_doctor", "Doctor")):
+            self.add("res.partner.title", id=rid, name=name)
+            xid = self._new_id()  # direct insert: "model" is a field name of ir.model.data (clashes with add())
+            self.db["ir.model.data"][xid] = {"id": xid, "module": "base", "model": "res.partner.title", "name": xmlid,
+                                             "res_id": rid, "write_date": self.stamp()}
         self.add("mailing.list", id=1, name="Newsletter")
         self.add("mailing.list", id=2, name="Migration Radar")
 

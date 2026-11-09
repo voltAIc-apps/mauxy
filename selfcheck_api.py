@@ -1,9 +1,11 @@
 """
 Selbst-Check endpoints (simplify-erp.de /:lang/selbst-check, flywheel SPEC-020).
 
-  POST /api/selfcheck            submission: e-mail + name + optional phone + picks (mail/call/radar)
-                                 + answers. name required unless SELFCHECK_NAME_REQUIRED=false
-                                 (rollout transition, db-patches/0010).
+  POST /api/selfcheck            submission: e-mail + salutation + name + optional phone + picks
+                                 (mail/call/radar) + answers. name required unless
+                                 SELFCHECK_NAME_REQUIRED=false (rollout transition, db-patches/0010);
+                                 salutation (ms / mr / none, stated by the person, never inferred)
+                                 required unless SELFCHECK_SALUTATION_REQUIRED=false (db-patches/0012).
                                  Validated against the vendored rules, stored minimally, ONE
                                  double opt-in mail. Uniform 200 for every contact-specific outcome.
   GET  /api/selfcheck/confirm    DOI mail link, READ-ONLY: confirmation page with a "Bestätigen"
@@ -89,6 +91,10 @@ def env_flag(raw: Optional[str], default: bool = True) -> bool:
 # live website does not send it yet), then the website, then flip to true. Only a MISSING name is
 # tolerated while false; a sent but blank / too long name is always 422.
 SELFCHECK_NAME_REQUIRED = env_flag(os.environ.get("SELFCHECK_NAME_REQUIRED"))
+# Same rollout pattern for the salutation (owner 2026-11-09, db-patches/0012): mauxy with false first,
+# then the website, then true. While false a MISSING salutation is stored as "none"; an unknown value is
+# always 422.
+SELFCHECK_SALUTATION_REQUIRED = env_flag(os.environ.get("SELFCHECK_SALUTATION_REQUIRED"))
 
 if not SELFCHECK_ALLOWED_ORIGINS:
     logger.warning("SELFCHECK_ALLOWED_ORIGINS is not set -- /api/selfcheck rejects every browser origin")
@@ -160,16 +166,59 @@ def clean_phone(v: str) -> Optional[str]:
     return v
 
 
+# --------------------------------------------------------------------------- salutation / greeting
+
+# Salutation as STATED by the person on the website (owner 2026-11-09): never inferred from the name
+# (no misgendering by guessing). "none" = "Keine Angabe" / not sent -> greeting with the full name.
+Salutation = Literal["ms", "mr", "none"]
+SALUTATION_LABEL = {"ms": "Ms", "mr": "Mr"}  # operator mail / CRM description (English); else "not given"
+
 # Personal greeting of the result mail (Sie-form, after the DOI click only): replaces the vendored
-# neutral opening line. The name is HTML-escaped (owner requirement: safe if the mail gets an HTML part).
-GREETING = {"de": ("Guten Tag,", "Guten Tag {name},"), "en": ("Hello,", "Hello {name},")}
+# neutral opening line ("plain"). ms / mr -> formal greeting with the surname, none -> full name (as
+# before). Plain text part: literal; the HTML part escapes it (mail_html.text_html).
+GREETING = {
+    "de": {"plain": "Guten Tag,", "none": "Guten Tag {name},",
+           "ms": "Sehr geehrte Frau {surname},", "mr": "Sehr geehrter Herr {surname},"},
+    "en": {"plain": "Hello,", "none": "Hello {name},", "ms": "Dear Ms {surname},", "mr": "Dear Mr {surname},"},
+}
+# leading academic titles stay in the formal greeting ("Prof. Dr. Max Mustermann" -> "Herr Prof. Dr.
+# Mustermann"): Prof / Dr (with or without dot, also Dr.-Ing. / Dr.med.) and h.c. / mult.
+_ACADEMIC = re.compile(r"^(?:prof|dr|h\.c|mult)\.?(?:-?[a-zäöü]+\.)*$", re.IGNORECASE)
+# lower-case name particles belong to the surname ("Anna von Muster" -> "Frau von Muster")
+_PARTICLES = {"von", "vom", "zu", "zum", "zur", "van", "de", "der", "den", "del", "della", "di", "da", "du",
+              "la", "le", "ten", "ter"}
 
 
-def greet(text: str, name: Optional[str], lang: str) -> str:
-    plain, personal = GREETING[lang]
-    if not name or not text.startswith(plain):
+def surname(name: str) -> str:
+    """Surname for the formal greeting: last whitespace token (+ lower-case particles before it), with the
+    leading academic titles kept in front. A single token is used as is. Never guesses anything else."""
+    tokens = name.split()
+    if len(tokens) <= 1:
+        return name.strip()
+    titles: list[str] = []
+    while len(titles) < len(tokens) - 1 and _ACADEMIC.match(tokens[len(titles)]):
+        titles.append(tokens[len(titles)])
+    last = [tokens[-1]]
+    i = len(tokens) - 2
+    while i >= len(titles) + 1 and tokens[i] in _PARTICLES:  # a first name stays (>= one token before)
+        last.insert(0, tokens[i])
+        i -= 1
+    return " ".join(titles + last)
+
+
+def greet(text: str, name: Optional[str], lang: str, salutation: Optional[str] = None) -> str:
+    """Replace the vendored neutral opening line by the personal greeting. No name or a foreign opening
+    -> text unchanged. salutation None / unknown -> "none" (full name, the greeting of before 0012)."""
+    g = GREETING[lang]
+    if not name or not text.startswith(g["plain"]):
         return text
-    return personal.format(name=name) + text[len(plain):]  # plain-text mail: no HTML escaping (name is control-char-stripped on input)
+    key = salutation if salutation in ("ms", "mr") else "none"
+    personal = g[key].format(name=name, surname=surname(name))
+    return personal + text[len(g["plain"]):]  # plain-text mail: no HTML escaping (name is control-char-stripped on input)
+
+
+def salutation_label(salutation: Optional[str]) -> str:
+    return SALUTATION_LABEL.get(salutation or "", "not given")
 
 
 # --------------------------------------------------------------------------- models
@@ -199,6 +248,8 @@ class SelfCheckRequest(BaseModel):
     # first + last name (CRM contact_name, result mail greeting); raw cap here, NAME_MAX after cleaning
     name: Optional[str] = Field(default=None, max_length=400)
     phone: Optional[str] = Field(default=None, max_length=200)
+    # stated by the person (website segmented choice); missing -> 422 or "none" (SELFCHECK_SALUTATION_REQUIRED)
+    salutation: Optional[Salutation] = None
 
     @field_validator("name")
     @classmethod
@@ -221,6 +272,8 @@ class SelfCheckRequest(BaseModel):
     def _name_required(self):
         if self.name is None and SELFCHECK_NAME_REQUIRED:
             raise ValueError("name is required")
+        if self.salutation is None and SELFCHECK_SALUTATION_REQUIRED:
+            raise ValueError("salutation is required (ms, mr or none)")
         return self
 
     @field_validator("picks")
@@ -307,7 +360,7 @@ def result_mail(row: aiosqlite.Row) -> tuple[str, str, Optional[str], list]:
     url = _site_url(lang, site)
     head = (m["intro"] if prog["complete"] else m["partial"])[lang].format(
         answered=prog["answered"], total=prog["total"], url=url)
-    head = greet(head, row["name"], lang)
+    head = greet(head, row["name"], lang, row["salutation"])
     result = engine.result_text(RULES, answers, lang, stay)
     outro = m["outro"][lang].format(url=url)
     body = "\n\n".join([head, result, outro])
@@ -360,6 +413,7 @@ def _summary(row, radar_result: str, mail_sent: Optional[bool]) -> tuple[str, li
         f"Self-Check #{row['id']} confirmed on {row['confirmed_at'] or _iso(_now())} (language {row['lang']}).",
         f"E-mail: {row['email']}",
     ]
+    lines.append(f"Salutation: {salutation_label(row['salutation'])}")
     if row["name"]:
         lines.append(f"Name: {row['name']}")
     if row["phone"]:
@@ -418,7 +472,7 @@ def lead_for(row, ref: str) -> Optional[dict]:
     label = brand.label(_row_site(row), SELFCHECK_WEBSITE_URL)
     desc = _body(row, lines) + f"\n\nSource: {label} / Website / campaign selfcheck\nReference: {ref}"
     return {"ref": ref, "kind": "selfcheck", "campaign": "selfcheck", "title": title, "email": row["email"],
-            "contact_name": row["name"], "partner_name": row["company"], "phone": row["phone"], "lang": row["lang"], "description": desc}
+            "contact_name": row["name"], "salutation": row["salutation"], "partner_name": row["company"], "phone": row["phone"], "lang": row["lang"], "description": desc}
 
 
 async def finish(db: aiosqlite.Connection, sync: dict, outcome: str) -> None:
@@ -508,12 +562,12 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     # cap + insert in ONE statement (atomic, no COUNT-then-INSERT race; security review 2026-11-09)
     cur = await db.execute(
         "INSERT INTO selfcheck_submission (created_at, email, lang, picks, answers, stay, rules_version, complete, company, "
-        "site, name, phone) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+        "site, name, phone, salutation) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
         "WHERE (SELECT COUNT(*) FROM selfcheck_submission WHERE email = ? AND created_at >= ?) < ?",
         (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
          json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"]),
          " ".join(payload.company.split()) if payload.company else None, site, payload.name, payload.phone,
-         email, since, MAX_PENDING_PER_EMAIL),
+         payload.salutation or "none", email, since, MAX_PENDING_PER_EMAIL),
     )
     if cur.rowcount != 1:
         await db.commit()  # end the (empty) implicit transaction
@@ -629,7 +683,8 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         await leads_api.route_confirmed(
             db, origin="selfcheck", origin_id=sid, site=site, action="selfcheck", lead=lead_for(row, ref),
             subscribe=subscribe, data={"ref": ref, "email": row["email"], "lang": row["lang"], "picks": picks,
-                                       "name": row["name"], "phone": row["phone"], "company": row["company"],
+                                       "name": row["name"], "salutation": row["salutation"], "phone": row["phone"],
+                                       "company": row["company"],
                                        "source": "selfcheck", "page_url": page_url})
         logger.info("SELFCHECK_CONFIRMED id=%s mail=%s site=%s", sid, mail_sent, site)
         return _redirect(row["lang"], True, status=303, site=site)
@@ -657,7 +712,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
     ):
         if not admin_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        sql = ("SELECT s.id, s.created_at, s.confirmed_at, s.email, s.name, s.phone, s.company, s.lang, s.picks, s.answers, s.stay, "
+        sql = ("SELECT s.id, s.created_at, s.confirmed_at, s.email, s.salutation, s.name, s.phone, s.company, s.lang, s.picks, s.answers, s.stay, "
                "s.rules_version, s.complete, s.mail_sent, s.notify_sent, s.radar_result, "
                "l.odoo_lead_id, l.state AS crm_state FROM selfcheck_submission s "
                "LEFT JOIN lead_sync l ON l.origin = 'selfcheck' AND l.origin_id = s.id WHERE s.status = ?")

@@ -78,7 +78,7 @@ SQLite via `aiosqlite` at `ACTION_LOG_DB` (default `/data/actions.db`): `action_
 
 ### Schema as a versioned artifact (db-patches/)
 
-The schema is **not** created at runtime. It is owned by integer-numbered SQL patches in `db-patches/` (`NNNN_name.sql`): 0001 init, 0002 quiz seed, 0003 website consent tables (DOI pending, self-check, leads, outbox, login), 0004 per-site policy, 0005 mail outbox, 0006 per-site brand + routing (+ simplify-erp seed), 0007 per-site opt-out record (hashed), 0008 re-signup (self / admin source, resignup cap, lift audit), 0009 provenance of mauxy's Odoo opt-outs (subscription + write_date), 0010 Selbst-Check name / phone, 0011 simplify-erp accent = website CTA red (seed value only). `db_migrate.py` is the shared runner; `schema_migrations` records what's applied.
+The schema is **not** created at runtime. It is owned by integer-numbered SQL patches in `db-patches/` (`NNNN_name.sql`): 0001 init, 0002 quiz seed, 0003 website consent tables (DOI pending, self-check, leads, outbox, login), 0004 per-site policy, 0005 mail outbox, 0006 per-site brand + routing (+ simplify-erp seed), 0007 per-site opt-out record (hashed), 0008 re-signup (self / admin source, resignup cap, lift audit), 0009 provenance of mauxy's Odoo opt-outs (subscription + write_date), 0010 Selbst-Check name / phone, 0011 simplify-erp accent = website CTA red (seed value only), 0012 Selbst-Check salutation. `db_migrate.py` is the shared runner; `schema_migrations` records what's applied.
 
 - **Deployers apply** patches: `python scripts/sqlite_db.py --migrate` (k8s initContainer). First boot creates the schema this way.
 - **App startup only checks**: DB behind the shipped patches -> refuses to start (`MIGRATE_STRICT=false` warns instead). Exception: `ACTION_LOG_DB=:memory:` (tests) applies the patches in-process.
@@ -121,6 +121,7 @@ The schema is **not** created at runtime. It is owned by integer-numbered SQL pa
 | `SELFCHECK_RATE_LIMIT`, `SELFCHECK_EVENT_RATE_LIMIT` | Per-IP submit limit; global counter limit (no IP) |
 | `SELFCHECK_PENDING_DAYS`, `SELFCHECK_RETENTION_DAYS` | Retention 7 / 90 days |
 | `SELFCHECK_NAME_REQUIRED` | `name` required on `POST /api/selfcheck` (default true); false = rollout transition, only a missing name tolerated (README "Selbst-Check") |
+| `SELFCHECK_SALUTATION_REQUIRED` | `salutation` (ms / mr / none) required on `POST /api/selfcheck` (default true); false = rollout transition, missing stored as none (README "Selbst-Check") |
 | `MAUTIC_RADAR_TAG`, `MAUTIC_RADAR_SEGMENT_ID` | DEPRECATED: Migration Radar in Mautic |
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, `LINKEDIN_REDIRECT_URI` | LinkedIn login (secret); redirect default `PUBLIC_BASE_URL/api/auth/linkedin/callback` |
 | `AUTH_ALLOWED_ORIGINS`, `AUTH_TOKEN_SECRET`, `AUTH_SESSION_TTL`, `AUTH_RATE_LIMIT`, `AUTH_SESSION_RATE_LIMIT` | login return sites, signing key (>= 32), session 3600 s, limits |

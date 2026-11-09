@@ -47,6 +47,7 @@ ALLOWED: frozenset[tuple[str, str]] = frozenset({
     ("utm.source", "search_read"),         # UTM mapping (no create: map to existing records)
     ("utm.medium", "search_read"),
     ("utm.campaign", "search_read"),
+    ("ir.model.data", "search_read"),      # res.partner.title ids by xml id (salutation -> crm.lead.title; no create)
     # subscriber sink (Email Marketing)
     ("mail.blacklist", "search_read"),     # blacklisted -> never (re)subscribe, no DOI mail
     ("mailing.list", "search_read"),       # smoke check only

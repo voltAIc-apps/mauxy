@@ -18,6 +18,8 @@ Contract (every sink):
 Odoo specifics (Odoo 18, erp.wapsol.de, dedicated bot user, see README "erp.wapsol setup"):
   lead: crm.lead type 'lead', user_id = ODOO_LEAD_USER_ID (Ashant), Ashant also follower,
         UTM source/medium/campaign mapped to EXISTING records by name (bot cannot create UTM),
+        title (res.partner.title) from the stated salutation ms / mr, by xml id base.res_partner_title_madam
+        / _mister (read-only lookup, cached; never created; missing -> no title, warning),
         optional team (ODOO_LEAD_TEAM_ID) and tags (ODOO_LEAD_TAG_IDS),
         partner_id only when exactly ONE active partner has that e-mail; then email_from / phone
         are NOT sent (crm.lead's inverse would write them back onto the partner). Otherwise
@@ -43,6 +45,8 @@ logger = logging.getLogger("mauxy.sinks")
 ListKey = Literal["newsletter", "radar"]
 LIST_KEYS: tuple[str, ...] = ("newsletter", "radar")
 CAMPAIGNS = ("selfcheck", "contact", "inquiry", "webinar", "checkout")
+# stated salutation -> xml id (module base) of the standard res.partner.title record
+TITLE_XMLIDS = {"ms": "res_partner_title_madam", "mr": "res_partner_title_mister"}
 
 
 class SinkTransient(RuntimeError):
@@ -141,6 +145,7 @@ class OdooLeadSink:
         self.utm_source = os.environ.get("ODOO_UTM_SOURCE", "simplify-erp.de")
         self.utm_medium = os.environ.get("ODOO_UTM_MEDIUM", "Website")
         self._utm: dict[tuple[str, str], Optional[int]] = {}
+        self._titles: Optional[dict[str, int]] = None
         self._user_partner: Optional[int] = None
 
     async def _utm_id(self, model: str, name: str) -> Optional[int]:
@@ -152,6 +157,21 @@ class OdooLeadSink:
             if not rows:
                 logger.warning("ODOO_UTM_MISSING model=%s name=%s (create it in Odoo)", model, name)
         return self._utm[key]
+
+    async def title_id(self, salutation: Optional[str]) -> Optional[int]:
+        """res.partner.title id for a stated salutation (ms -> Madam, mr -> Mister), else None. Read-only
+        lookup of the standard records by xml id, cached per process; the bot never creates titles."""
+        xmlid = TITLE_XMLIDS.get(salutation or "")
+        if not xmlid:
+            return None
+        if self._titles is None:
+            rows = await self.odoo.search_read(
+                "ir.model.data", [["module", "=", "base"], ["model", "=", "res.partner.title"],
+                                  ["name", "in", sorted(TITLE_XMLIDS.values())]], ["name", "res_id"])
+            self._titles = {r["name"]: int(r["res_id"]) for r in rows if r.get("res_id")}
+            for name in sorted(set(TITLE_XMLIDS.values()) - set(self._titles)):
+                logger.warning("ODOO_TITLE_MISSING xmlid=base.%s (no title on leads with that salutation)", name)
+        return self._titles.get(xmlid)
 
     async def _salesperson_partner(self) -> int:
         if self._user_partner is None:
@@ -205,6 +225,9 @@ class OdooLeadSink:
             rid = await self._utm_id(model, name)
             if rid:
                 vals[field] = rid
+        tid = await self.title_id(lead.get("salutation"))
+        if tid:  # lead-only field (no inverse onto a linked partner), so set in both branches below
+            vals["title"] = tid
         partner_id = await self.match_partner(lead["email"])
         if partner_id:
             # Linked: Odoo fills e-mail / phone from the partner. Do NOT send email_from / phone:

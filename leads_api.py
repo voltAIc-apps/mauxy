@@ -117,7 +117,13 @@ class _Base(BaseModel):
         return v
 
 
-class ContactLead(_Base):
+class _Named(_Base):
+    # optional on the CTA kinds (no greeting mail there): crm.lead.title + "Salutation:" line when sent.
+    # Stated by the person, never inferred from the name (owner 2026-11-09).
+    salutation: Optional[selfcheck_api.Salutation] = None
+
+
+class ContactLead(_Named):
     kind: Literal["contact"]
     name: Line(120)
     company: Line(160)
@@ -125,7 +131,7 @@ class ContactLead(_Base):
     message: Text(4000)
 
 
-class InquiryLead(_Base):
+class InquiryLead(_Named):
     kind: Literal["inquiry"]
     name: Optional[Line(120)] = None
     company: Optional[Line(160)] = None
@@ -136,7 +142,7 @@ class InquiryLead(_Base):
     message: Optional[Text(2000)] = None
 
 
-class WebinarLead(_Base):
+class WebinarLead(_Named):
     kind: Literal["webinar"]
     name: Line(120)
     company: Line(160)
@@ -162,7 +168,7 @@ class Billing(BaseModel):
     country: Annotated[str, StringConstraints(min_length=2, max_length=2, pattern=r"^[A-Z]{2}$")]
 
 
-class CheckoutLead(_Base):
+class CheckoutLead(_Named):
     kind: Literal["checkout"]
     name: Line(120)
     company: Line(160)
@@ -270,6 +276,8 @@ def lead_for(row, ref: str) -> dict:
                  f"Billing address: {b['street']}, {b['postal_code']} {b['city']}, {b['country']}",
                  f"VAT ID: {d.get('vat_id') or '-'}", "Terms accepted: yes"]
     lines = [f"{head}. Confirmed by double opt-in on {_fmt_date(row['confirmed_at'])} (language {row['lang']}).", ""]
+    if "salutation" in d:  # only when the form sent it (stated by the person)
+        lines.append(f"Salutation: {selfcheck_api.salutation_label(d['salutation'])}")
     for label, key in (("Name", "name"), ("Company", "company"), ("Phone", "phone")):
         if d.get(key):
             lines.append(f"{label}: {d[key]}")
@@ -281,7 +289,7 @@ def lead_for(row, ref: str) -> dict:
     site = brand.lead_site(row["site"])
     lines += ["", f"Source: {brand.label(site, LEAD_WEBSITE_URL)} / Website / campaign {kind}", f"Reference: {ref}"]
     return {"ref": ref, "kind": kind, "campaign": kind, "title": title[:200], "email": row["email"],
-            "contact_name": d.get("name"), "partner_name": d.get("company"), "phone": d.get("phone"),
+            "contact_name": d.get("name"), "salutation": d.get("salutation"), "partner_name": d.get("company"), "phone": d.get("phone"),
             "lang": row["lang"], "description": "\n".join(lines)}
 
 
@@ -469,7 +477,8 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         lead = lead_for(row, lead_sync.new_ref())
         await route_confirmed(db, origin="lead", origin_id=lid, site=site, action="lead", lead=lead, subscribe=subscribe,
                               data={"ref": lead["ref"], "kind": row["kind"], "email": row["email"], "lang": row["lang"],
-                                    "name": d.get("name"), "company": d.get("company"), "phone": d.get("phone"),
+                                    "name": d.get("name"), "salutation": d.get("salutation"), "company": d.get("company"),
+                                    "phone": d.get("phone"),
                                     "newsletter": bool(row["newsletter"]), "page_url": row["page_url"] or ""})
         logger.info("LEAD_CONFIRMED id=%s kind=%s site=%s", lid, row["kind"], site)
         return _redirect(row["lang"], True, row["kind"], status=303, site=site)
