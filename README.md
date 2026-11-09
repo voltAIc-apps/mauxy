@@ -463,7 +463,7 @@ Name + phone (owner request 2026-11-09, db-patches/0010, tests T-SC-160..199):
 - After the click: `crm.lead` `contact_name` = name, `phone` = phone (not with a linked partner, see
   "What is written to erp.wapsol"; then in the description), title "... – company or name or e-mail",
   `partner_name` = company as before; result mail opens "Guten Tag {name}," / "Hello {name}," (name
-  HTML-escaped; neutral greeting without name); operator mail + lead description list Name / Telefon.
+  HTML-escaped; neutral greeting without name); operator mail + lead description list Name / Phone (English, README "Language").
 - Rollout switch `SELFCHECK_NAME_REQUIRED` (default `true`): 1) deploy mauxy with `false` (the live
   website does not send `name` yet; a missing name is accepted, a blank / invalid one never), 2) deploy
   the website, 3) set `true` (`.env`, `scripts/deploy.py --secret`, restart). Same for the `/api/lead`
@@ -497,15 +497,27 @@ neutral page).
 Delivery (`lead_sync.py`, table `lead_sync`, UNIQUE per submission = at most one lead):
 subscriptions first, then the lead; each finished step is stored. `SinkTransient` -> retry with
 backoff (`LEAD_SYNC_BACKOFF_SECONDS` x 2^n, max 1 h, `LEAD_SYNC_MAX_ATTEMPTS`), resumed after a
-restart. A retry first looks for the lead of an earlier attempt (marker `Referenz: mauxy-<hex>` in
+restart. A retry first looks for the lead of an earlier attempt (marker `Reference: mauxy-<hex>` in
 the description), so a lost response never yields a duplicate. Permanent failure / retries
 exhausted -> mail with the whole submission to `LEAD_NOTIFY_TO`; after fixing the cause:
 `POST /api/lead/sync/{id}/retry` (admin). Delivered rows keep only ids (`odoo_lead_id`, list
 results); submissions are deleted after `LEAD_RETENTION_DAYS` (30), unconfirmed after 7 days.
 
+### Language (owner decision 2026-11-09)
+
+- FOR THE OWNER = English: crm.lead title + description (all kinds incl. Selbst-Check; answers / picks /
+  precision rendered with the rules engine's `en` labels, notify subject `mail.notify.subject.en`),
+  operator mails (`SELFCHECK_NOTIFY_TO`, `LEAD_NOTIFY_TO`: lead by mail, failed CRM / routed delivery),
+  admin API messages, log lines. The contact's language stays visible as `(language de|en)`.
+- TO THE CONTACT = the submission's locale (`lang` / `locale` from the website page, stored with every
+  submission): DOI mails, confirmation page, redirect, Selbst-Check result mail, brand footer of that
+  locale. Unknown locale -> the site's brand `default_locale` (`brand.locale_for`), unbranded -> `de`.
+  Neutral page: bilingual by design (no locale from an invalid token). Unsubscribe answers are JSON
+  status codes only (the website renders the text). Tests T-LANG-0xx.
+
 ### What is written to erp.wapsol (and nothing else)
 
-- `crm.lead` create: `name` ("Website: Kontaktanfrage – Muster GmbH", "Self-Check: SAP ECC / R/3 +2 – Muster GmbH" (first system + count of the others; full list in the description), ...
+- `crm.lead` create: `name` (English: "Website: Contact request – Muster GmbH", "Self-Check: SAP ECC / R/3 +2 – Muster GmbH" (first system + count of the others; full list in the description), ...
   from submitted fields only), `type=lead`, `user_id=ODOO_LEAD_USER_ID`, `description` (plain text,
   HTML-escaped: submitted content, Selbst-Check answers + result text from the shared rules engine,
   what was requested, UTM line, marker), `source_id` / `medium_id` / `campaign_id` (existing UTM records

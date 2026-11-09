@@ -116,7 +116,7 @@ def test_t_sc_120_one_doi_then_result_radar_and_notification(respx_mock, client,
     assert "https://simplify-erp.de/de/wissen/ist-prozesse-aufnehmen-ohne-sie-im-neuen-system-nachzubauen" in result["body"]
     assert "750.000 €" in result["body"]
     note = next(m for m in outbox if m["to"] == "owner@site.test")
-    assert "Kennenlernen (Meetly): ja" in note["body"] and "Richtangebot: ja" in note["body"]
+    assert "Introduction call (Meetly): yes" in note["body"] and "Indicative quote: yes" in note["body"]
     assert "Migration Radar: ok" in note["body"] and note["reply_to"] == "bob@example.com"
     sent = create.calls.last.request.read().decode()
     assert "migration_radar_confirmed" in sent and '"newsletter_source": "selfcheck"' in sent.replace('":"', '": "')
@@ -155,7 +155,7 @@ def test_t_sc_123_call_only_no_result_mail_no_mautic(respx_mock, client, outbox)
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["call"], answers=COMPLETE))
     click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0])}")
     assert [m["to"] for m in outbox] == ["bob@example.com", "owner@site.test"]  # DOI + notification
-    assert "Kennenlernen (Meetly): ja" in outbox[1]["body"] and "Richtangebot: nein" in outbox[1]["body"]
+    assert "Introduction call (Meetly): yes" in outbox[1]["body"] and "Indicative quote: no" in outbox[1]["body"]
     assert not mautic.called
 
 
@@ -168,7 +168,7 @@ def test_t_sc_124_rough_quote_from_exit_screen(respx_mock, client, outbox):
     assert result["subject"] == "Your self-check: result"
     assert "You answered 5 of 13 questions" in result["body"] and "Traffic lights" not in result["body"]
     note = outbox[2]
-    assert "5 von 13 Antworten, Genauigkeit grob" in note["body"]
+    assert "5 of 13 answers, precision rough" in note["body"]
 
 
 @respx.mock(assert_all_called=False)
@@ -301,7 +301,7 @@ def test_t_sc_190_crm_lead_gets_contact_name_and_phone(client, outbox, odoo):
     assert lead["contact_name"] == "Bob Beispiel" and lead["phone"] == PHONE
     assert lead["partner_name"] == "Muster GmbH" and lead["email_from"] == "bob@example.com"
     assert lead["name"].endswith("– Muster GmbH")  # company still names the lead
-    assert "Name: Bob Beispiel" in lead["description"] and f"Telefon: {PHONE}" in lead["description"]
+    assert "Name: Bob Beispiel" in lead["description"] and f"Phone: {PHONE}" in lead["description"]
 
 
 def test_t_sc_191_without_company_the_name_titles_the_lead(client, outbox, odoo):
@@ -320,7 +320,7 @@ def test_t_sc_192_known_partner_name_but_no_phone_write(client, outbox, odoo):
     _confirm(client, outbox)
     (lead,) = odoo.leads()
     assert lead["partner_id"] == 81 and lead["contact_name"] == "Bob Beispiel"
-    assert "phone" not in lead and f"Telefon: {PHONE}" in lead["description"]
+    assert "phone" not in lead and f"Phone: {PHONE}" in lead["description"]
 
 
 @pytest.mark.parametrize("lang,greeting,neutral", [("de", "Guten Tag Bob Beispiel,\n\ndanke", "Guten Tag,"),
@@ -353,12 +353,12 @@ def test_t_sc_195_operator_mail_shows_name_and_phone(respx_mock, client, outbox)
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["call"], phone=PHONE))
     _confirm(client, outbox)
     note = next(m for m in outbox if m["to"] == "owner@site.test")
-    assert "Name: Bob Beispiel" in note["body"] and f"Telefon: {PHONE}" in note["body"]
+    assert "Name: Bob Beispiel" in note["body"] and f"Phone: {PHONE}" in note["body"]
     outbox.clear()
     client.post("/api/selfcheck", headers=ORIGIN, json=body(email="eva@example.com", name="Eva Ohnetelefon", picks=["call"]))
     _confirm(client, outbox)
     note = next(m for m in outbox if m["to"] == "owner@site.test")
-    assert "Name: Eva Ohnetelefon" in note["body"] and "Telefon:" not in note["body"]
+    assert "Name: Eva Ohnetelefon" in note["body"] and "Phone:" not in note["body"]
 
 
 def test_t_sc_196_flag_off_missing_name_delivers_as_before(client, outbox, odoo, monkeypatch):

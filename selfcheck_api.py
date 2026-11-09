@@ -281,73 +281,81 @@ def result_mail(row: aiosqlite.Row) -> tuple[str, str]:
     return m["subject"][lang], brand.replace_signature(body, site, lang, SIGNATURE[lang])
 
 
+# Texts FOR THE OWNER (operator mail, crm.lead) are English (owner decision 2026-11-09): the engine
+# renders answers / picks / precision with its "en" labels. Texts TO THE CONTACT (DOI, result mail,
+# confirmation page) use the submission's lang.
+OPERATOR_LANG = "en"
+CHOSEN, NOT_CHOSEN = "chosen", "not chosen"
+
+
 def _summary(row, radar_result: str, mail_sent: Optional[bool]) -> tuple[str, list[str]]:
-    """(short pick titles, German summary lines) shared by the operator mail and the CRM lead."""
+    """(short pick titles, English summary lines) shared by the operator mail and the CRM lead."""
     picks = json.loads(row["picks"])
     answers = json.loads(row["answers"])
     prog = engine.progress(RULES, answers)
-    prec = RULES["precision"]["words"][prog["precision"]["level"]]["de"]
-    short = ", ".join(engine.pick_titles(RULES, picks, "de"))
+    prec = RULES["precision"]["words"][prog["precision"]["level"]][OPERATOR_LANG]
+    short = ", ".join(engine.pick_titles(RULES, picks, OPERATOR_LANG))
     lines = [
-        f"Selbst-Check #{row['id']} bestätigt am {row['confirmed_at'] or _iso(_now())} (Sprache {row['lang']}).",
-        f"E-Mail: {row['email']}",
+        f"Self-Check #{row['id']} confirmed on {row['confirmed_at'] or _iso(_now())} (language {row['lang']}).",
+        f"E-mail: {row['email']}",
     ]
     if row["name"]:
         lines.append(f"Name: {row['name']}")
     if row["phone"]:
-        lines.append(f"Telefon: {row['phone']}")
+        lines.append(f"Phone: {row['phone']}")
     if row["company"]:
-        lines.append(f"Firma: {row['company']}")
+        lines.append(f"Company: {row['company']}")
     lines += [
-        f"Gewählt: {short}",
-        f"Richtangebot: {'ja' if 'mail' in picks else 'nein'} ({prog['answered']} von {prog['total']} Antworten, Genauigkeit {prec})",
-        f"Kennenlernen (Meetly): {'ja, Termin wählt die Person selbst' if 'call' in picks else 'nein'}",
+        f"Chosen: {short}",
+        f"Indicative quote: {'yes' if 'mail' in picks else 'no'} ({prog['answered']} of {prog['total']} answers, precision {prec})",
+        f"Introduction call (Meetly): {'yes, the person picks the slot' if 'call' in picks else 'no'}",
         f"Migration Radar: {radar_result}",
     ]
     if mail_sent is not None:
-        lines.append(f"Ergebnis-Mail an die Person: {'gesendet' if mail_sent else ('nicht gewählt' if 'mail' not in picks else 'FEHLER, bitte manuell senden')}")
+        state = "sent" if mail_sent else (NOT_CHOSEN if "mail" not in picks else "FAILED, please send it by hand")
+        lines.append(f"Result mail to the person ({row['lang']}): {state}")
     return short, lines
 
 
 def _body(row, lines: list[str]) -> str:
     answers = json.loads(row["answers"])
     stay = json.loads(row["stay"]) if row["stay"] else None
-    return "\n".join(lines + ["", engine.result_text(RULES, answers, "de", stay), "",
-                              f"Regeln {row['rules_version']} (Server {RULES['version']}). Aufbewahrung {SELFCHECK_RETENTION_DAYS} Tage."])
+    return "\n".join(lines + ["", engine.result_text(RULES, answers, OPERATOR_LANG, stay), "",
+                              f"Rules {row['rules_version']} (server {RULES['version']}). Retention {SELFCHECK_RETENTION_DAYS} days."])
 
 
 def notify_mail(row, radar_result: str, mail_sent: bool, crm_line: str = "") -> tuple[str, str]:
-    """Operator mail (always German): indicative-quote request + call yes/no + answers + CRM lead."""
+    """Operator mail (English, for the owner): indicative-quote request + call yes/no + answers + CRM lead."""
     answers = json.loads(row["answers"])
     prog = engine.progress(RULES, answers)
-    prec = RULES["precision"]["words"][prog["precision"]["level"]]["de"]
+    prec = RULES["precision"]["words"][prog["precision"]["level"]][OPERATOR_LANG]
     short, lines = _summary(row, radar_result, mail_sent)
     if crm_line:
         lines.append(crm_line)
-    subject = RULES["mail"]["notify"]["subject"]["de"].format(picks_short=short, precision=prec)
+    subject = RULES["mail"]["notify"]["subject"][OPERATOR_LANG].format(picks_short=short, precision=prec)
     return subject, _body(row, lines)
 
 
 def lead_for(row, ref: str) -> Optional[dict]:
     """CRM lead of a confirmed self-check (SPEC-021): only for picks mail (Richtangebot) / call.
-    Radar alone is a subscription, not a lead. Title from submitted fields only."""
+    Radar alone is a subscription, not a lead. Title from submitted fields only. English (owner)."""
     picks = json.loads(row["picks"])
     if not ({"mail", "call"} & set(picks)):
         return None
     answers = json.loads(row["answers"])
-    labels = {o["id"]: o["label"]["de"] for q in RULES["questions"] if q["id"] == "system" for o in q["options"]}
+    labels = {o["id"]: o["label"][OPERATOR_LANG] for q in RULES["questions"] if q["id"] == "system" for o in q["options"]}
     picked = [labels[x] for x in (answers.get("system") or []) if x in labels]
     # short title: first system + count of the others (the full list is in the description)
     systems = picked[0] + (f" +{len(picked) - 1}" if len(picked) > 1 else "") if picked else ""
     who = row["company"] or row["name"] or row["email"]
     title = f"Self-Check: {systems} – {who}" if systems else f"Self-Check – {who}"
-    _, lines = _summary(row, "gewählt" if "radar" in picks else "nicht gewählt", None)
-    wanted = [t for p, t in zip(("mail", "call"), ("Ergebnis und Richtangebot per Mail", "30 Minuten Kennenlernen (Meetly)")) if p in picks]
-    lines.insert(2, "Angefragt: " + "; ".join(wanted))
+    _, lines = _summary(row, CHOSEN if "radar" in picks else NOT_CHOSEN, None)
+    wanted = [t for p, t in zip(("mail", "call"), ("result and indicative quote by mail", "30-minute introduction (Meetly)")) if p in picks]
+    lines.insert(2, "Requested: " + "; ".join(wanted))
     if picked:
-        lines.insert(3, "Systeme: " + " + ".join(picked))  # full list (title shows only the first)
+        lines.insert(3, "Systems: " + " + ".join(picked))  # full list (title shows only the first)
     label = brand.label(_row_site(row), SELFCHECK_WEBSITE_URL)
-    desc = _body(row, lines) + f"\n\nQuelle: {label} / Website / Kampagne selfcheck\nReferenz: {ref}"
+    desc = _body(row, lines) + f"\n\nSource: {label} / Website / campaign selfcheck\nReference: {ref}"
     return {"ref": ref, "kind": "selfcheck", "campaign": "selfcheck", "title": title, "email": row["email"],
             "contact_name": row["name"], "partner_name": row["company"], "phone": row["phone"], "lang": row["lang"], "description": desc}
 
@@ -362,17 +370,17 @@ async def finish(db: aiosqlite.Connection, sync: dict, outcome: str) -> None:
     picks = json.loads(row["picks"])
     results = json.loads(sync["sub_results"] or "{}")
     if "radar" not in picks:
-        radar = "nicht gewählt"
+        radar = NOT_CHOSEN
     else:
         radar = results.get("radar") or f"error:{(sync['last_error'] or 'unknown')[:80]}"
     if sync["odoo_lead_id"]:
-        crm = f"CRM-Lead (erp.wapsol): #{sync['odoo_lead_id']}"
+        crm = f"CRM lead (erp.wapsol): #{sync['odoo_lead_id']}"
     elif not sync["lead"]:
-        crm = "CRM-Lead: keiner (nur Radar)"
+        crm = "CRM lead: none (Radar only)"
     elif outcome == "failed":
-        crm = f"CRM-Lead: FEHLER, bitte manuell anlegen ({(sync['last_error'] or '')[:120]})"
+        crm = f"CRM lead: FAILED, please create it by hand ({(sync['last_error'] or '')[:120]})"
     else:
-        crm = "CRM-Lead: nicht angelegt (LEAD_SINK=none)"
+        crm = "CRM lead: not created (LEAD_SINK=none)"
     notify_sent = False
     if SELFCHECK_NOTIFY_TO:
         subject, body = notify_mail(row, radar, bool(row["mail_sent"]), crm)
@@ -401,8 +409,7 @@ def _origin_ok(request: Request) -> bool:
 
 def _target(site: Optional[str], lang: str, ok: bool) -> str:
     """After the click: the site's explicit target > its website_url > SELFCHECK_WEBSITE_URL."""
-    b = brand.get(site)
-    lang = lang if lang in ("de", "en") else (b.default_locale if b else "de")
+    lang = brand.locale_for(site, lang)  # unknown locale -> the site's default_locale
     return brand.redirect_url(site, "selfcheck", lang, "confirmed" if ok else "error", env_base=SELFCHECK_WEBSITE_URL,
                               path=f"/{lang}{RULES['route']}", params={"bestaetigt": "1" if ok else "fehler"})
 
@@ -507,7 +514,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         """DOI link, step 1 READ-ONLY (mail scanners prefetch links): confirmation page with a
         "Bestätigen" button (POST). Invalid / expired / used: uniform neutral page."""
         if not _signer:
-            return _redirect("de", False)
+            return _redirect("", False, site=brand.DEFAULT_SITE)
         row = await _pending(request.app.state.db, token)
         if row is None:
             return confirm_page.neutral(brand=brand.get(confirm_page.token_site(_signer, token)))
@@ -522,7 +529,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         """DOI step 2, the human click: claims the token atomically (single use), result mail, then
         Radar + CRM lead + operator mail via the outbox; 303 back to the website."""
         if not _signer:
-            return _redirect("de", False, status=303)
+            return _redirect("", False, status=303, site=brand.DEFAULT_SITE)
         if not confirm_page.same_origin(request):
             logger.warning("SELFCHECK_CONFIRM_FOREIGN_ORIGIN")
             return confirm_page.neutral(403)
