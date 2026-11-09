@@ -168,7 +168,7 @@ def test_t_lead_034_selfcheck_lead_radar_and_operator_mail(client, outbox, odoo)
     drain(client)
     assert r.headers["location"] == "https://site.test/de/selbst-check?bestaetigt=1"
     (lead,) = odoo.leads()
-    assert lead["name"] == "Website: Selbst-Check SAP ECC / R/3 – Muster GmbH"
+    assert lead["name"] == "Selbst-Check: SAP ECC / R/3 – Muster GmbH"
     assert lead["campaign_id"] == 20 and lead["partner_name"] == "Muster GmbH"
     assert lead["contact_name"] == "Bob Beispiel" and lead["phone"] == "+49 (0)30 / 123-45"
     assert "Angefragt: Ergebnis und Richtangebot per Mail; 30 Minuten Kennenlernen (Meetly)" in lead["description"]
@@ -370,3 +370,16 @@ def test_t_lead_050_smoke_script_never_writes():
     guard = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "READ_METHODS")
     assert {e.value for e in guard.value.elts} == {"search_read", "read", "has_access", "check_access_rights"}
     assert '"create"' not in src.split("NEEDED")[0] and ".execute(" not in src  # only the guarded read() path
+
+
+def test_t_lead_035_selfcheck_lead_title_short_with_several_systems(client, outbox, odoo):
+    """Title shows the first system + count of the others; the description keeps the full list."""
+    payload = {"kind": "selfcheck", "email": "eve@example.com", "lang": "de", "picks": ["mail"],
+               "answers": {**COMPLETE, "system": ["ecc", "other", "excel"]}, "rules_version": "x", "consent": True,
+               "name": "Eve Beispiel"}
+    assert client.post("/api/lead", headers=ORIGIN, json=payload).json() == {"status": "pending_confirmation"}
+    click_confirm(client, f"/api/selfcheck/confirm?token={token_of(outbox[0], '/api/selfcheck/confirm')}")
+    drain(client)
+    (lead,) = odoo.leads()
+    assert lead["name"] == "Selbst-Check: SAP ECC / R/3 +2 – Eve Beispiel"
+    assert "Systeme: SAP ECC / R/3 + " in lead["description"]

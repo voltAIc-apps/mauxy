@@ -336,12 +336,16 @@ def lead_for(row, ref: str) -> Optional[dict]:
         return None
     answers = json.loads(row["answers"])
     labels = {o["id"]: o["label"]["de"] for q in RULES["questions"] if q["id"] == "system" for o in q["options"]}
-    systems = " + ".join(labels[x] for x in (answers.get("system") or []) if x in labels)
+    picked = [labels[x] for x in (answers.get("system") or []) if x in labels]
+    # short title: first system + count of the others (the full list is in the description)
+    systems = picked[0] + (f" +{len(picked) - 1}" if len(picked) > 1 else "") if picked else ""
     who = row["company"] or row["name"] or row["email"]
-    title = f"Website: Selbst-Check {systems} – {who}" if systems else f"Website: Selbst-Check – {who}"
+    title = f"Selbst-Check: {systems} – {who}" if systems else f"Selbst-Check – {who}"
     _, lines = _summary(row, "gewählt" if "radar" in picks else "nicht gewählt", None)
     wanted = [t for p, t in zip(("mail", "call"), ("Ergebnis und Richtangebot per Mail", "30 Minuten Kennenlernen (Meetly)")) if p in picks]
     lines.insert(2, "Angefragt: " + "; ".join(wanted))
+    if picked:
+        lines.insert(3, "Systeme: " + " + ".join(picked))  # full list (title shows only the first)
     label = brand.label(_row_site(row), SELFCHECK_WEBSITE_URL)
     desc = _body(row, lines) + f"\n\nQuelle: {label} / Website / Kampagne selfcheck\nReferenz: {ref}"
     return {"ref": ref, "kind": "selfcheck", "campaign": "selfcheck", "title": title, "email": row["email"],

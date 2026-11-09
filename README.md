@@ -505,7 +505,7 @@ results); submissions are deleted after `LEAD_RETENTION_DAYS` (30), unconfirmed 
 
 ### What is written to erp.wapsol (and nothing else)
 
-- `crm.lead` create: `name` ("Website: Kontaktanfrage – Muster GmbH", "Website: Selbst-Check SAP ECC / R/3 – Muster GmbH", ...
+- `crm.lead` create: `name` ("Website: Kontaktanfrage – Muster GmbH", "Selbst-Check: SAP ECC / R/3 +2 – Muster GmbH" (first system + count of the others; full list in the description), ...
   from submitted fields only), `type=lead`, `user_id=ODOO_LEAD_USER_ID`, `description` (plain text,
   HTML-escaped: submitted content, Selbst-Check answers + result text from the shared rules engine,
   what was requested, UTM line, marker), `source_id` / `medium_id` / `campaign_id` (existing UTM records
