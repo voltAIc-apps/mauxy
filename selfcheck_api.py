@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import html
 import json
 import logging
 import os
@@ -169,7 +168,7 @@ def greet(text: str, name: Optional[str], lang: str) -> str:
     plain, personal = GREETING[lang]
     if not name or not text.startswith(plain):
         return text
-    return personal.format(name=html.escape(name, quote=False)) + text[len(plain):]
+    return personal.format(name=name) + text[len(plain):]  # plain-text mail: no HTML escaping (name is control-char-stripped on input)
 
 
 # --------------------------------------------------------------------------- models

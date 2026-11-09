@@ -7,7 +7,7 @@ Self-check endpoints (flywheel SPEC-020): T-SC-101 .. T-SC-150.
   T-SC-140       admin endpoints
   T-SC-150       vendored rules engine unchanged (sha256 vs SOURCE.json)
   T-SC-160..183  name / phone validation (cases in selfcheck_api_cases.json, owner request 2026-11-09)
-  T-SC-190..199  name / phone delivery: crm.lead fields, result mail greeting (escaped), operator mail,
+  T-SC-190..199  name / phone delivery: crm.lead fields, result mail greeting (plain text, literal), operator mail,
                  rollout flag SELFCHECK_NAME_REQUIRED, /api/lead alias, admin, db-patches/0010
 """
 import copy
@@ -337,13 +337,13 @@ def test_t_sc_193_result_mail_greets_by_name(respx_mock, client, outbox, lang, g
 
 
 @respx.mock(assert_all_called=False)
-def test_t_sc_194_greeting_is_html_escaped(respx_mock, client, outbox):
+def test_t_sc_194_greeting_plain_text_literal(respx_mock, client, outbox):
     client.post("/api/selfcheck", headers=ORIGIN, json=body(picks=["mail"], name="<b>Bob</b> & Co"))
     _confirm(client, outbox)
     result = outbox[1]
     first = result["body"].split("\n", 1)[0]
-    assert first == "Guten Tag &lt;b&gt;Bob&lt;/b&gt; &amp; Co,"
-    assert "<b>" not in result["body"] and result["html"] is None  # plain-text mail, no markup anywhere
+    assert first == "Guten Tag <b>Bob</b> & Co,"  # plain text: shown literally, never rendered
+    assert result["html"] is None  # plain-text mail, no HTML part
     assert selfcheck_api.greet("Hello,\nx", "O'Brien \"Jr\"", "en") == "Hello O'Brien \"Jr\",\nx"  # quotes stay
     assert selfcheck_api.greet("Hi there", "Bob", "en") == "Hi there"  # foreign opening: unchanged
 
