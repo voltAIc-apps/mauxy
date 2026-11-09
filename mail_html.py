@@ -37,7 +37,7 @@ from typing import Iterable, Optional
 
 import mailer
 
-LOGO_CID = "brand-logo"
+LOGO_CID = mailer.BRAND_LOGO_CID
 LOGO_HEIGHT = 40          # px in the header
 LOGO_MAX_WIDTH = 220
 
@@ -433,12 +433,12 @@ def selfcheck_result(brand, lang: str, p: dict) -> tuple[Optional[str], list[mai
 
 
 def letter(brand, lang: str, *, subject: str, paragraphs: list[str], footer_lines: list[str],
-           link: Optional[str] = None, link_label: Optional[str] = None) -> Optional[str]:
+           link: Optional[str] = None, link_label: Optional[str] = None) -> tuple[Optional[str], list]:
     """Simple branded letter (DOI mail): the plain-text paragraphs in the frame; the paragraph that is
-    exactly `link` becomes a button (+ the URL as small fallback text). No logo: the DOI mail goes to an
-    unconfirmed address and mailer refuses attachments there, so the header is the wordmark."""
+    exactly `link` becomes a button (+ the URL as small fallback text). Returns (html, attachments): the
+    brand's PNG logo inline (mailer allows exactly that one on a DOI mail), else the wordmark header."""
     if brand is None:
-        return None
+        return None, []
     lang = lang if lang in TEXTS else "de"
     pal = Palette(brand)
     ids = Ids("mx")
@@ -458,5 +458,7 @@ def letter(brand, lang: str, *, subject: str, paragraphs: list[str], footer_line
         else:
             out.append(text_html(ids, f"p{i}", para, {}, pal))
     preheader = paragraphs[1] if len(paragraphs) > 1 else subject
-    return frame(brand=brand, lang=lang, title=subject, preheader=preheader.split("\n")[0], inner="".join(out),
-                 ids=ids, pal=pal, footer_lines=footer_lines, logo=None, legal_links=legal_links(brand, lang))
+    logo = logo_attachment(brand)
+    doc = frame(brand=brand, lang=lang, title=subject, preheader=preheader.split("\n")[0], inner="".join(out),
+                ids=ids, pal=pal, footer_lines=footer_lines, logo=logo, legal_links=legal_links(brand, lang))
+    return doc, [logo] if logo else []

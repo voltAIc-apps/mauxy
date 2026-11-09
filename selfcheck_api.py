@@ -267,10 +267,10 @@ def _row_site(row) -> str:
     return brand.lead_site(row["site"] if "site" in row.keys() else "")
 
 
-def doi_mail(site: Optional[str], lang: str, picks: list[str], link: str) -> tuple[str, str, Optional[str]]:
-    """(subject, plain text, branded HTML or None) of the DOI mail. Server text only (no name, no free
-    text). HTML = the same paragraphs in the brand frame, the link as a "Bestätigen" button (no logo:
-    attachments are refused for an unconfirmed address). No brand profile -> plain text only."""
+def doi_mail(site: Optional[str], lang: str, picks: list[str], link: str) -> tuple[str, str, Optional[str], list]:
+    """(subject, plain text, branded HTML or None, inline attachments) of the DOI mail. Server text only
+    (no name, no free text). HTML = the same paragraphs in the brand frame with the brand logo inline, the
+    link as a "Bestätigen" button. No brand profile -> plain text only."""
     doi = RULES["mail"]["doi"]
     text = doi["body"][lang].format(picks=_picks_block(picks, lang), link=link, hours=CONFIRM_TOKEN_MAX_AGE // 3600,
                                     retention_pending_days=SELFCHECK_PENDING_DAYS)
@@ -278,11 +278,11 @@ def doi_mail(site: Optional[str], lang: str, picks: list[str], link: str) -> tup
     plain = brand.replace_signature(text, site, lang, SIGNATURE[lang])
     b = brand.get(site)
     if b is None:
-        return subject, plain, None
+        return subject, plain, None, []
     core, footer_lines = _split_signature(text, site, lang)
-    html_part = mail_html.letter(b, lang, subject=subject, paragraphs=[x for x in core.split("\n\n") if x],
+    html_part, atts = mail_html.letter(b, lang, subject=subject, paragraphs=[x for x in core.split("\n\n") if x],
                                  footer_lines=footer_lines, link=link, link_label=confirm_page.BUTTON[lang])
-    return subject, plain, html_part
+    return subject, plain, html_part, atts
 
 
 def _split_signature(text: str, site: Optional[str], lang: str) -> tuple[str, list[str]]:
@@ -524,9 +524,9 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
     await db.execute("UPDATE selfcheck_submission SET token_hash = ? WHERE id = ?", (_hash(token), sid))
     await db.commit()
 
-    subject, body, html_part = doi_mail(site, payload.lang, payload.picks,
-                                        f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}")
-    ok = await mailer.send(email, subject, body, html=html_part, audience="doi", key=f"sc-doi-{sid}",
+    subject, body, html_part, atts = doi_mail(site, payload.lang, payload.picks,
+                                              f"{PUBLIC_BASE_URL}/api/selfcheck/confirm?token={token}")
+    ok = await mailer.send(email, subject, body, html=html_part, attachments=atts, audience="doi", key=f"sc-doi-{sid}",
                            sender=brand.sender(site))
     if not ok:
         await db.execute("DELETE FROM selfcheck_submission WHERE id = ?", (sid,))
