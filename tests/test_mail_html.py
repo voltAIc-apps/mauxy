@@ -30,6 +30,7 @@ import pytest
 import brand
 import db_migrate
 import mail_html
+import mailer
 import selfcheck_api
 from tests.conftest import click_confirm, drain
 
@@ -255,7 +256,8 @@ def test_t_html_012_doi_mail_same_frame(client, outbox):
     assert "Eve" not in doc and "Eve" not in doi["body"]  # DOI: server text only
     _msg, ps = parts(doi["mime"])
     assert [t for t, _ in ps][:3] == ["multipart/alternative", "text/plain", "text/html"]
-    subject, plain, html_en = selfcheck_api.doi_mail("simplify-erp", "en", ["mail"], "https://mauxy.test/x?token=t")
+    subject, plain, html_en, atts_en = selfcheck_api.doi_mail("simplify-erp", "en", ["mail"], "https://mauxy.test/x?token=t")
+    assert atts_en == []  # seeded simplify-erp has no logo
     assert subject == "Please confirm: your self-check" and 'lang="en"' in html_en and ">Confirm</a>" in html_en
     assert "Imprint" in html_en and plain.endswith(selfcheck_api.SIGNATURE["en"])
 
@@ -312,3 +314,27 @@ def test_t_html_020_024_name_escaped(case, client, outbox):
     assert result["body"].split("\n", 1)[0] == case["plain_first_line"]
     anchors = [a["href"] for t, a in tags(result["html"]) if t == "a"]
     assert anchors and all(h.startswith((f"{SIMPLIFY}/", IMPRINT)) for h in anchors)  # no link from the name
+
+
+def test_t_html_014_doi_mail_carries_only_the_brand_logo(client, outbox, monkeypatch):
+    """A brand with a PNG logo: the DOI mail shows it inline (cid:brand-logo), the only attachment allowed."""
+    assert client.request("PUT", "/api/admin/brands/re-cloud", headers=ADMIN, json=RECLOUD).status_code == 201
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_ALLOWED_ORIGINS", ["https://site.test", "https://re-cloud.test"])
+    doi, _result = submit_and_confirm(client, outbox, origin={"Origin": "https://re-cloud.test"}, email="lia@example.com")
+    assert doi["attachments"] == [("logo.png", "image/png", "brand-logo")]
+    (img,) = [a for t, a in tags(doi["html"]) if t == "img"]
+    assert img["src"] == "cid:brand-logo"
+
+
+def test_t_html_015_doi_mail_refuses_any_other_attachment():
+    good = mailer.Attachment(filename="logo.png", content=png(), mime_type="image/png", inline_cid=mailer.BRAND_LOGO_CID)
+    mailer.build("x@example.com", "s", "b", html="<p>x</p>", attachments=[good], audience="doi")
+    bad = [
+        [mailer.Attachment(filename="r.pdf", content=b"%PDF-1.4 x", mime_type="application/pdf")],
+        [mailer.Attachment(filename="logo.png", content=png(), mime_type="image/png", inline_cid="other")],
+        [mailer.Attachment(filename="logo.png", content=png(), mime_type="image/png")],
+        [good, good],
+    ]
+    for atts in bad:
+        with pytest.raises(mailer.MailRejected):
+            mailer.build("x@example.com", "s", "b", html="<p>x</p>", attachments=atts, audience="doi")

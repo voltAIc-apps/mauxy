@@ -21,7 +21,8 @@ SMTP (12-factor, env only):
   AUTH only after TLS. There is no "none" security mode.
 
 Policy (no open relay -- there is no endpoint that takes a recipient + content from outside):
-  audience doi        the DOI link mail itself (address not confirmed yet): no attachments
+  audience doi        the DOI link mail itself (address not confirmed yet): no attachments except the
+                      brand's inline PNG logo (BRAND_LOGO_CID, <= 64 KiB)
   audience confirmed  the address passed the double opt-in (caller's responsibility)
   audience internal   recipient must be configured (MAIL_INTERNAL_RECIPIENTS, SELFCHECK_NOTIFY_TO,
                       LEAD_NOTIFY_TO)
@@ -246,6 +247,21 @@ def message_id(domain: str, key: Optional[str]) -> str:
 # ---------------------------------------------------------------------------- build
 
 
+# The DOI mail may carry exactly one attachment: the brand's own inline PNG logo (server-owned bytes from
+# the brand profile, Content-ID BRAND_LOGO_CID, <= BRAND_LOGO_MAX). Anything else stays refused for an
+# unconfirmed address (no attacker-chosen content to arbitrary recipients).
+BRAND_LOGO_CID = "brand-logo"
+BRAND_LOGO_MAX = 64 * 1024
+
+
+def _doi_logo_only(atts: list) -> bool:
+    if len(atts) != 1:
+        return False
+    a = atts[0]
+    return (a.inline_cid == BRAND_LOGO_CID and a.mime_type == "image/png"
+            and len(a.content) <= BRAND_LOGO_MAX and bytes(a.content[:8]) == b"\x89PNG\r\n\x1a\n")
+
+
 def build(to: str, subject: str, body: str, *, html: Optional[str] = None,
           attachments: Iterable[Attachment] = (), reply_to: Optional[str] = None,
           audience: Audience = "doi", key: Optional[str] = None,
@@ -259,7 +275,7 @@ def build(to: str, subject: str, body: str, *, html: Optional[str] = None,
     if audience == "internal" and rcpt not in internal_recipients():
         raise MailRejected("internal audience but recipient not configured")
     atts = list(attachments)
-    if atts and audience == "doi":
+    if atts and audience == "doi" and not _doi_logo_only(atts):
         raise MailRejected("attachments only to confirmed or internal recipients")
     total = len(body.encode()) + len((html or "").encode())
     for a in atts:
