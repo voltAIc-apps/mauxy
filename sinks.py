@@ -104,6 +104,13 @@ def text_to_html(text: str) -> str:
     return "".join("<p>" + "<br>".join(html.escape(line) for line in p.split("\n")) + "</p>" for p in paras)
 
 
+def _sub_fact(row: dict) -> dict:
+    """{id, list_id, write_date} of a mailing.subscription row (list_id comes as [id, name])."""
+    lid = row.get("list_id")
+    return {"id": row["id"], "list_id": lid[0] if isinstance(lid, (list, tuple)) else lid,
+            "write_date": str(row.get("write_date") or "")}
+
+
 class _wrap:
     """async with _wrap(): OdooTransient -> SinkTransient, OdooPermanent -> SinkPermanent."""
 
@@ -293,22 +300,28 @@ class OdooSubscriberSink:
         logger.info("ODOO_SUBSCRIBED list=%s source=%s", list_key, source)
         return "ok"
 
-    async def dnc(self, email: str, list_ids: list[int]) -> Optional[str]:
-        """Do-not-contact for routed sites: 'blacklist' (hard), 'optout' (opted out on any of
-        `list_ids`; soft only when mauxy's own unsubscribe wrote it, routing.dnc_status) or None."""
+    async def dnc(self, email: str, list_ids: list[int]) -> dict:
+        """Do-not-contact facts for routed sites: {"blacklist": bool, "optouts": [{id, list_id,
+        write_date}]} (every opted-out subscription on `list_ids`). routing.dnc_status decides which
+        opt-out is self-service (provenance, db-patches/0009) and which is a hard block."""
         norm = normalize_email(email)
         async with _wrap():
             if await self._blacklisted(norm):
-                return "blacklist"
-            if list_ids and await self.odoo.search_read(
-                    "mailing.subscription", [["list_id", "in", list_ids], ["contact_id.email_normalized", "=", norm],
-                                             ["opt_out", "=", True]], ["id"], limit=1):
-                return "optout"
-        return None
+                return {"blacklist": True, "optouts": []}
+            rows = await self.odoo.search_read(
+                "mailing.subscription", [["list_id", "in", list_ids], ["contact_id.email_normalized", "=", norm],
+                                         ["opt_out", "=", True]], ["id", "list_id", "write_date"]) if list_ids else []
+        return {"blacklist": False, "optouts": [_sub_fact(r) for r in rows]}
 
     async def unsubscribe(self, email: str, *, list_ids: Optional[list[int]] = None):
         """Opt-out on every given list (routed: all lists the site's odoo targets hold), else the
         fallback lists."""
+        result, ref, _marks = await self.unsubscribe_marked(email, list_ids=list_ids)
+        return result, ref
+
+    async def unsubscribe_marked(self, email: str, *, list_ids: Optional[list[int]] = None):
+        """unsubscribe + provenance: (result, ref, [{id, list_id, write_date}] of the subscriptions
+        mauxy just opted out, write_date read back from Odoo after the write)."""
         norm = normalize_email(email)
         list_ids = [lid for lid in (list_ids or self.lists.values()) if lid]
         if not list_ids:
@@ -318,10 +331,12 @@ class OdooSubscriberSink:
                 "mailing.subscription",
                 [["list_id", "in", list_ids], ["contact_id.email_normalized", "=", norm], ["opt_out", "=", False]], ["id"])
             if not subs:
-                return "not_found", None
+                return "not_found", None, []
             ids = [s["id"] for s in subs]
             await self.odoo.execute("mailing.subscription", "write", [ids, {"opt_out": True}])
-        return "ok", ",".join(str(i) for i in ids)
+            written = await self.odoo.search_read("mailing.subscription", [["id", "in", ids]],
+                                                  ["id", "list_id", "write_date"])
+        return "ok", ",".join(str(i) for i in ids), [_sub_fact(r) for r in written]
 
     async def health(self) -> str:
         async with _wrap():

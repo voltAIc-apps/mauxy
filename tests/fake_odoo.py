@@ -12,6 +12,7 @@ Test helpers: calls (every execute_kw), fail (queue of injected failures), write
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -32,6 +33,7 @@ class FakeOdoo:
             "res.partner", "res.users", "crm.lead", "utm.source", "utm.medium", "utm.campaign", "mail.blacklist",
             "mailing.list", "mailing.contact", "mailing.subscription")}
         self._next = 1000
+        self._tick = 0  # fake clock of write_date (strictly increasing, deterministic)
         # seed: Ashant (user 7 / partner 70), UTM, lists 1 + 2
         self.add("res.partner", id=70, name="Ashant Chalasani", email="ashant@example.org")
         self.add("res.users", id=7, login="ashant", partner_id=70)
@@ -44,9 +46,14 @@ class FakeOdoo:
 
     # ------------------------------------------------------------------ data helpers
 
+    def stamp(self) -> str:
+        """Next write_date, Odoo format (UTC, seconds)."""
+        self._tick += 1
+        return (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=self._tick)).strftime("%Y-%m-%d %H:%M:%S")
+
     def add(self, model: str, **vals) -> int:
         rid = vals.pop("id", None) or self._new_id()
-        rec = {"id": rid, "active": True, **vals}
+        rec = {"id": rid, "active": True, "write_date": self.stamp(), **vals}
         if "email" in rec and model in ("res.partner", "mailing.contact"):
             rec["email_normalized"] = (rec["email"] or "").strip().lower()
         self.db[model][rid] = rec
@@ -132,7 +139,7 @@ class FakeOdoo:
             return self.add(model, **vals)
         if method == "write":
             for i in args[0]:
-                self.db[model][i].update(args[1])
+                self.db[model][i].update({**args[1], "write_date": self.stamp()})
             return True
         if method == "message_subscribe":
             for i in args[0]:
