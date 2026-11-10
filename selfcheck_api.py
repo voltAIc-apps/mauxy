@@ -4,7 +4,7 @@ Selbst-Check endpoints (simplify-erp.de /:lang/selbst-check, flywheel SPEC-020).
   POST /api/selfcheck            submission: e-mail + salutation + name + optional phone + picks
                                  (mail/call/radar) + answers. name required unless
                                  SELFCHECK_NAME_REQUIRED=false (rollout transition, db-patches/0010);
-                                 salutation (ms / mr / none, stated by the person, never inferred)
+                                 salutation (ms / mr / none) optional: missing -> guessed from the first name
                                  required unless SELFCHECK_SALUTATION_REQUIRED=false (db-patches/0012).
                                  Validated against the vendored rules, stored minimally, ONE
                                  double opt-in mail. Uniform 200 for every contact-specific outcome.
@@ -91,10 +91,10 @@ def env_flag(raw: Optional[str], default: bool = True) -> bool:
 # live website does not send it yet), then the website, then flip to true. Only a MISSING name is
 # tolerated while false; a sent but blank / too long name is always 422.
 SELFCHECK_NAME_REQUIRED = env_flag(os.environ.get("SELFCHECK_NAME_REQUIRED"))
-# Same rollout pattern for the salutation (owner 2026-11-09, db-patches/0012): mauxy with false first,
-# then the website, then true. While false a MISSING salutation is stored as "none"; an unknown value is
-# always 422.
-SELFCHECK_SALUTATION_REQUIRED = env_flag(os.environ.get("SELFCHECK_SALUTATION_REQUIRED"))
+# Salutation (db-patches/0012): optional since 2026-11-10 (owner: guess it from the first name instead of
+# asking); a MISSING salutation is guessed (guess_salutation). true = require the stated value (old form).
+# An unknown value is always 422.
+SELFCHECK_SALUTATION_REQUIRED = env_flag(os.environ.get("SELFCHECK_SALUTATION_REQUIRED"), default=False)
 
 if not SELFCHECK_ALLOWED_ORIGINS:
     logger.warning("SELFCHECK_ALLOWED_ORIGINS is not set -- /api/selfcheck rejects every browser origin")
@@ -168,8 +168,9 @@ def clean_phone(v: str) -> Optional[str]:
 
 # --------------------------------------------------------------------------- salutation / greeting
 
-# Salutation as STATED by the person on the website (owner 2026-11-09): never inferred from the name
-# (no misgendering by guessing). "none" = "Keine Angabe" / not sent -> greeting with the full name.
+# Salutation (owner 2026-11-10, replaces "never inferred" of 2026-11-09): stated by the person when a form
+# sends it, else GUESSED from the first name (guess_salutation). "none" = undecidable -> neutral greeting
+# with the full name ("Guten Tag Vorname Nachname,").
 Salutation = Literal["ms", "mr", "none"]
 SALUTATION_LABEL = {"ms": "Ms", "mr": "Mr"}  # operator mail / CRM description (English); else "not given"
 
@@ -191,7 +192,7 @@ _PARTICLES = {"von", "vom", "zu", "zum", "zur", "van", "de", "der", "den", "del"
 
 def surname(name: str) -> str:
     """Surname for the formal greeting: last whitespace token (+ lower-case particles before it), with the
-    leading academic titles kept in front. A single token is used as is. Never guesses anything else."""
+    leading academic titles kept in front. A single token is used as is."""
     tokens = name.split()
     if len(tokens) <= 1:
         return name.strip()
@@ -204,6 +205,58 @@ def surname(name: str) -> str:
         last.insert(0, tokens[i])
         i -= 1
     return " ".join(titles + last)
+
+
+# typed prefix in the name field ("Frau Dr. Muster") counts as stated
+_PREFIX = {"frau": "ms", "fr.": "ms", "mrs": "ms", "mrs.": "ms", "ms": "ms", "ms.": "ms",
+           "herr": "mr", "hr.": "mr", "mr": "mr", "mr.": "mr"}
+_detector = None  # gender_guesser.Detector, loaded on first use (~45k names, about 1 s)
+
+
+def _gender(first: str) -> str:
+    """gender_guesser verdict for one first name: German data first; a name without German data falls back
+    to the worldwide list (decisive male / female only there, "mostly_*" abroad stays undecided)."""
+    global _detector
+    if _detector is None:
+        import gender_guesser.detector as gg  # GPLv3 dependency (server side only, not distributed)
+        _detector = gg.Detector(case_sensitive=False)
+    g = _detector.get_gender(first, "germany")
+    if g in ("andy", "unknown"):
+        g = _detector.get_gender(first)
+        if g.startswith("mostly_"):
+            return "unknown"
+    return g
+
+
+def guess_salutation(name: Optional[str]) -> str:
+    """ms / mr / none guessed from the first name (owner 2026-11-10: right in the vast majority of cases;
+    undecidable -> none = neutral greeting). Typed prefix (Frau / Herr / Mr / Ms) wins; academic titles
+    are skipped; a double name ("Hans-Peter") is judged as a whole, else by its first part."""
+    tokens = (name or "").split()
+    if not tokens:
+        return "none"
+    pre = _PREFIX.get(tokens[0].lower())
+    if pre:
+        return pre
+    i = 0
+    while i < len(tokens) - 1 and _ACADEMIC.match(tokens[i]):
+        i += 1
+    first = tokens[i].strip(".,")
+    if len(tokens) - i < 2 or len(first) < 2:  # a lone token may be a surname -> no guess
+        return "none"
+    g = _gender(first)
+    if g in ("andy", "unknown") and "-" in first:
+        g = _gender(first.split("-", 1)[0])
+    if g in ("male", "mostly_male"):
+        return "mr"
+    if g in ("female", "mostly_female"):
+        return "ms"
+    return "none"
+
+
+def resolve_salutation(stated: Optional[str], name: Optional[str]) -> str:
+    """Stated ms / mr / none wins; missing -> guessed from the name."""
+    return stated if stated in ("ms", "mr", "none") else guess_salutation(name)
 
 
 def greet(text: str, name: Optional[str], lang: str, salutation: Optional[str] = None) -> str:
@@ -248,7 +301,8 @@ class SelfCheckRequest(BaseModel):
     # first + last name (CRM contact_name, result mail greeting); raw cap here, NAME_MAX after cleaning
     name: Optional[str] = Field(default=None, max_length=400)
     phone: Optional[str] = Field(default=None, max_length=200)
-    # stated by the person (website segmented choice); missing -> 422 or "none" (SELFCHECK_SALUTATION_REQUIRED)
+    # stated (optional); missing -> guessed from the name at submit (guess_salutation), or 422 if
+    # SELFCHECK_SALUTATION_REQUIRED
     salutation: Optional[Salutation] = None
 
     @field_validator("name")
@@ -567,7 +621,7 @@ async def _submit_job(db: aiosqlite.Connection, payload: "SelfCheckRequest", cle
         (_iso(_now()), email, payload.lang, json.dumps(payload.picks), json.dumps(clean, ensure_ascii=False),
          json.dumps(stay) if stay else None, payload.rules_version, int(prog["complete"]),
          " ".join(payload.company.split()) if payload.company else None, site, payload.name, payload.phone,
-         payload.salutation or "none", email, since, MAX_PENDING_PER_EMAIL),
+         resolve_salutation(payload.salutation, payload.name), email, since, MAX_PENDING_PER_EMAIL),
     )
     if cur.rowcount != 1:
         await db.commit()  # end the (empty) implicit transaction

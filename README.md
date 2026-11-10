@@ -464,7 +464,7 @@ the report PDF / rendered images), operator notifications. No second SMTP code a
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/selfcheck` | `{email, salutation, name, phone?, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company?, company_website}`. `name` / `phone`: see below. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
+| `POST /api/selfcheck` | `{email, salutation?, name, phone?, lang, picks[mail,call,radar], answers, stay?, rules_version, consent: true, company?, company_website}`. `name` / `phone`: see below. Origin must be in `SELFCHECK_ALLOWED_ORIGINS` (else 403). Answers validated against the vendored rules (422). One DOI mail listing the picks. Immediate uniform `200 pending_confirmation`; storage + DOI mail run as a job after the response. |
 | `GET /api/selfcheck/confirm?token=` | DOI mail link, read-only: confirmation page with a "Bestätigen" button (API.md "DOI mail links"). |
 | `POST /api/selfcheck/confirm` | The click (form field `token`), single-use. Result mail (pick `mail`), then the outbox: Migration Radar via the subscriber sink (pick `radar`, not blacklisted), `crm.lead` (picks `mail` / `call`; Radar alone = no lead), notification to `SELFCHECK_NOTIFY_TO` (always: quote request, call yes/no, answers, CRM lead id). 303 to `/{lang}/selbst-check?bestaetigt=1` (misconfigured: `=fehler`). Optional field `company` names the lead. |
 | `POST /api/selfcheck/event` | `{event: started|completed|exited_early|submitted, lang}` -> 204. Stores day + event + lang only; global rate-limit key (IP never read), access-log lines dropped. |
@@ -489,10 +489,12 @@ Name + phone (owner request 2026-11-09, db-patches/0010, tests T-SC-160..199):
 
 Salutation (owner request 2026-11-09, db-patches/0012, tests T-SC-200..229 + T-SAL cases):
 
-- `salutation`: `ms` | `mr` | `none`, as STATED by the person (website "Anrede": Frau / Herr / Keine Angabe,
-  required choice, no preselection). Never inferred from the name. Unknown value -> 422.
-- Stored in `selfcheck_submission.salutation` (same retention). Missing while
-  `SELFCHECK_SALUTATION_REQUIRED=false` -> stored `none`; rows of before 0012: NULL (= none).
+- `salutation`: `ms` | `mr` | `none`, optional (owner 2026-11-10: guess, don't ask). Sent = stated, wins.
+  Missing -> guessed from the first name (`selfcheck_api.guess_salutation`, lib `gender-guesser`, GPLv3,
+  server side only): typed prefix Frau / Herr / Mr / Ms wins; academic titles skipped; German name data
+  first, worldwide fallback (decisive male / female only); double names whole, else first part; lone token
+  or undecidable (Kim, unknown names) -> `none` = neutral greeting. Unknown value -> 422.
+- Stored in `selfcheck_submission.salutation` (resolved value, same retention); rows of before 0012: NULL (= none).
 - Result mail greeting (contact's language, plain text literal, HTML part escaped; DOI mail unchanged, no name):
   de `ms` "Sehr geehrte Frau {Nachname}," / `mr` "Sehr geehrter Herr {Nachname}," / `none` "Guten Tag {Name},";
   en `ms` "Dear Ms {Last name}," / `mr` "Dear Mr {Last name}," / `none` "Hello {Name}," (as before).
@@ -502,10 +504,9 @@ Salutation (owner request 2026-11-09, db-patches/0012, tests T-SC-200..229 + T-S
 - `crm.lead.title`: `ms` -> `base.res_partner_title_madam`, `mr` -> `base.res_partner_title_mister`
   (ids via read-only `ir.model.data` search, cached; never created; missing -> no title + warning).
   Operator mail + lead description: "Salutation: Ms / Mr / not given" (English).
-- `/api/lead` kinds with a name (contact, inquiry, webinar, checkout): `salutation` optional, same enum ->
-  title + "Salutation:" line when sent.
-- Rollout switch `SELFCHECK_SALUTATION_REQUIRED` (default `true`): same order as the name: mauxy with
-  `false`, then the website, then `true`.
+- `/api/lead` kinds with a name (contact, inquiry, webinar, checkout): `salutation` optional, same enum,
+  missing -> guessed from the name -> title + "Salutation:" line.
+- `SELFCHECK_SALUTATION_REQUIRED` (default `false` since 2026-11-10): `true` = require the stated value.
 
 Result mail (owner request 2026-11-09, "brand beautified"): `multipart/alternative`, the plain text unchanged
 as the fallback, plus a branded HTML part from the same engine values (`mail_html.selfcheck_result`): greeting
