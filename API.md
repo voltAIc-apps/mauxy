@@ -335,8 +335,8 @@ the per-site key / quiz.
 - `name` required: string, <= 100 chars after cleaning (whitespace collapsed, control / direction
   characters removed), not blank -> else 422.
 - `phone` optional: `^[0-9+()/ -]+$`, at least one digit, <= 40 chars; blank or omitted = none -> else 422.
-- `salutation` required (db-patches/0012): `"ms"` | `"mr"` | `"none"` as chosen by the person ("Anrede":
-  Frau / Herr / Keine Angabe), else 422. Transition `SELFCHECK_SALUTATION_REQUIRED=false`: missing = `"none"`.
+- `salutation` optional (db-patches/0012): `"ms"` | `"mr"` | `"none"`, else 422. Missing -> guessed from the
+  first name (undecidable -> `"none"`); `SELFCHECK_SALUTATION_REQUIRED=true` makes it required.
   Effect: result mail greeting ("Sehr geehrte Frau Dr. Muster," / "Dear Mr Muster,"; none = full name as
   before), `crm.lead.title`, "Salutation:" in operator mail + lead. Optional on `/api/lead` contact /
   inquiry / webinar / checkout (same enum).

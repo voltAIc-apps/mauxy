@@ -204,18 +204,50 @@ def test_t_sal_063_none_no_title_not_given(client, outbox, odoo):
     assert "Salutation: not given" in note["body"]
 
 
-def test_t_sal_064_flag_off_missing_is_none(client, outbox, odoo, monkeypatch):
+def test_t_sal_064_flag_off_missing_is_guessed(client, outbox, odoo, monkeypatch):
+    # owner 2026-11-10: no stated salutation -> guessed from the first name (Bob -> mr)
     monkeypatch.setattr(selfcheck_api, "SELFCHECK_SALUTATION_REQUIRED", False)
     b = body(picks=["mail", "call"], answers=COMPLETE)
     b.pop("salutation")
     submit_confirm(client, outbox, b)
-    assert outbox[1]["body"].startswith("Guten Tag Bob Beispiel,\n")  # as before 0012
+    assert outbox[1]["body"].startswith("Sehr geehrter Herr Beispiel,\n")
+    (lead,) = odoo.leads()
+    assert "Salutation: Mr" in lead["description"]
+    assert rows(client, "SELECT salutation FROM selfcheck_submission") == [{"salutation": "mr"}]
+
+
+def test_t_sal_064b_flag_off_undecidable_is_none(client, outbox, odoo, monkeypatch):
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_SALUTATION_REQUIRED", False)
+    b = body(picks=["mail", "call"], answers=COMPLETE, name="Xqzt Beispiel")
+    b.pop("salutation")
+    submit_confirm(client, outbox, b)
+    assert outbox[1]["body"].startswith("Guten Tag Xqzt Beispiel,\n")
     (lead,) = odoo.leads()
     assert "title" not in lead and "Salutation: not given" in lead["description"]
     assert rows(client, "SELECT salutation FROM selfcheck_submission") == [{"salutation": "none"}]
 
 
+# T-SAL-070..: guess_salutation (gender_guesser, German data first, worldwide fallback)
+@pytest.mark.parametrize("name,expected", [
+    ("Anna Muster", "ms"), ("Max Muster", "mr"), ("Andrea Rossi", "ms"), ("Jürgen Klein", "mr"),
+    ("Ulrike von Muster", "ms"), ("Prof. Dr. Wolfgang Muster", "mr"), ("Dr.-Ing. Birgit Muster", "ms"),
+    ("Hans-Peter Muster", "mr"), ("Marie-Luise Muster", "ms"), ("Mehmet Yilmaz", "mr"), ("Priya Sharma", "ms"),
+    ("Frau Kim Muster", "ms"), ("Herr Kim Muster", "mr"), ("Mr. Ashant Chalasani", "mr"),
+    ("Kim Muster", "none"), ("Ashant Chalasani", "none"), ("Muster", "none"), ("", "none"), (None, "none"),
+    ("A. Muster", "none"),
+])
+def test_t_sal_070_guess(name, expected):
+    assert selfcheck_api.guess_salutation(name) == expected
+
+
+def test_t_sal_071_stated_wins():
+    assert selfcheck_api.resolve_salutation("none", "Max Muster") == "none"
+    assert selfcheck_api.resolve_salutation("ms", "Max Muster") == "ms"
+    assert selfcheck_api.resolve_salutation(None, "Max Muster") == "mr"
+
+
 def test_t_sal_065_lead_alias_follows_the_flag(client, outbox, monkeypatch):
+    monkeypatch.setattr(selfcheck_api, "SELFCHECK_SALUTATION_REQUIRED", True)
     b = body(kind="selfcheck")
     b.pop("salutation")
     assert client.post("/api/lead", headers=ORIGIN, json=b).status_code == 422
@@ -239,10 +271,11 @@ def test_t_sal_066_cta_kinds_optional_salutation(kind, client, outbox, odoo):
     assert lead["title"] == 4 and "Salutation: Mr" in lead["description"]
 
 
-def test_t_sal_067_cta_without_salutation_unchanged(client, outbox, odoo):
+def test_t_sal_067_cta_without_salutation_guessed(client, outbox, odoo):
+    # owner 2026-11-10: no stated salutation -> guessed from the name (Bob Muster -> Mister)
     submit_confirm(client, outbox, copy.deepcopy(LEAD_BASE["contact"]), path="/api/lead")
     (lead,) = odoo.leads()
-    assert "title" not in lead and "Salutation:" not in lead["description"]
+    assert lead.get("title") and "Salutation: Mr" in lead["description"]
 
 
 @respx.mock(assert_all_called=False)
@@ -258,4 +291,4 @@ def test_t_sal_069_patch_0012_and_flag_default(client):
     cols = {r["name"] for r in rows(client, "PRAGMA table_info(selfcheck_submission)")}
     assert "salutation" in cols
     assert (HERE.parent / "db-patches" / "0012_selfcheck_salutation.sql").is_file()
-    assert selfcheck_api.SELFCHECK_SALUTATION_REQUIRED is True  # default when unset (conftest does not set it)
+    assert selfcheck_api.SELFCHECK_SALUTATION_REQUIRED is False  # default when unset (2026-11-10: guessed)

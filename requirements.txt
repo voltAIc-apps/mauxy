@@ -6,3 +6,4 @@ slowapi>=0.1.9,<1.0
 aiosqlite>=0.20,<1.0
 itsdangerous>=2.2,<3.0
 tzdata>=2024.1
+gender-guesser>=0.4,<1.0

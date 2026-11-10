@@ -119,7 +119,7 @@ class _Base(BaseModel):
 
 class _Named(_Base):
     # optional on the CTA kinds (no greeting mail there): crm.lead.title + "Salutation:" line when sent.
-    # Stated by the person, never inferred from the name (owner 2026-11-09).
+    # Optional: stated by the form, else guessed from the first name (owner 2026-11-10).
     salutation: Optional[selfcheck_api.Salutation] = None
 
 
@@ -276,8 +276,9 @@ def lead_for(row, ref: str) -> dict:
                  f"Billing address: {b['street']}, {b['postal_code']} {b['city']}, {b['country']}",
                  f"VAT ID: {d.get('vat_id') or '-'}", "Terms accepted: yes"]
     lines = [f"{head}. Confirmed by double opt-in on {_fmt_date(row['confirmed_at'])} (language {row['lang']}).", ""]
-    if "salutation" in d:  # only when the form sent it (stated by the person)
-        lines.append(f"Salutation: {selfcheck_api.salutation_label(d['salutation'])}")
+    sal = selfcheck_api.resolve_salutation(d.get("salutation"), d.get("name")) if d.get("name") or "salutation" in d else None
+    if sal is not None:  # stated by the form, else guessed from the name (owner 2026-11-10)
+        lines.append(f"Salutation: {selfcheck_api.salutation_label(sal)}")
     for label, key in (("Name", "name"), ("Company", "company"), ("Phone", "phone")):
         if d.get(key):
             lines.append(f"{label}: {d[key]}")
@@ -289,7 +290,7 @@ def lead_for(row, ref: str) -> dict:
     site = brand.lead_site(row["site"])
     lines += ["", f"Source: {brand.label(site, LEAD_WEBSITE_URL)} / Website / campaign {kind}", f"Reference: {ref}"]
     return {"ref": ref, "kind": kind, "campaign": kind, "title": title[:200], "email": row["email"],
-            "contact_name": d.get("name"), "salutation": d.get("salutation"), "partner_name": d.get("company"), "phone": d.get("phone"),
+            "contact_name": d.get("name"), "salutation": sal, "partner_name": d.get("company"), "phone": d.get("phone"),
             "lang": row["lang"], "description": "\n".join(lines)}
 
 
@@ -477,7 +478,7 @@ def build_router(*, limiter, admin_ok: Callable[[Request], bool]) -> APIRouter:
         lead = lead_for(row, lead_sync.new_ref())
         await route_confirmed(db, origin="lead", origin_id=lid, site=site, action="lead", lead=lead, subscribe=subscribe,
                               data={"ref": lead["ref"], "kind": row["kind"], "email": row["email"], "lang": row["lang"],
-                                    "name": d.get("name"), "salutation": d.get("salutation"), "company": d.get("company"),
+                                    "name": d.get("name"), "salutation": lead["salutation"], "company": d.get("company"),
                                     "phone": d.get("phone"),
                                     "newsletter": bool(row["newsletter"]), "page_url": row["page_url"] or ""})
         logger.info("LEAD_CONFIRMED id=%s kind=%s site=%s", lid, row["kind"], site)
