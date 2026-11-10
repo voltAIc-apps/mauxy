@@ -1,0 +1,204 @@
+{
+  "_comment": "Microsoft -> Odoo 5-year comparison (SPEC-022) cases, shared by backend/libs/mscalc.py, website/src/utils/mscalc.ts (tests/scripts/mscalc_parity.mjs) and mauxy (vendored copy, scripts/sync_selfcheck.py; mauxy tests/test_ms_price_mail.py runs gate + mail through the result / operator mail). expect = hand-calculated from the rules file version below (rates as in mscalc.json); when a rate changes, the cases change with it. Keys in expect are compared, others ignored. gate/mail: rules patch customer_mail_figures (bool) + confirm_all (every owner_to_confirm rate set to verified) simulates the owner's release.",
+  "rules": "website/src/data/mscalc.json",
+  "rules_version": "2026-11-10.2",
+  "compute": [
+    {
+      "id": "T-MSC-001",
+      "title": "rules defaults (25 users, 10 customisations, 3 years, no partner cost): Odoo side more expensive, no break-even",
+      "inputs": null,
+      "overrides": null,
+      "expect": {
+        "stay": { "annual": 20790, "total": 103950 },
+        "move": { "annual": 20970, "days": 46, "one_off": { "low": 40500, "mid": 50600, "high": 70800 }, "total": { "low": 145350, "mid": 155450, "high": 175650 } },
+        "savings": { "low": -71700, "mid": -51500, "high": -41400 },
+        "break_even": { "low": null, "mid": null, "high": null }
+      }
+    },
+    {
+      "id": "T-MSC-002",
+      "title": "NAV with heavy customisations, pending BC upgrade quote 80k, 40 Office seats",
+      "inputs": { "users": 40, "partner_year": 30000, "ms_one_off": 80000, "customisations": 40, "history_years": 5, "office_seats": 40 },
+      "overrides": null,
+      "expect": {
+        "stay": { "annual": 66178, "total": 410888 },
+        "move": { "annual": 34632, "days": 114, "one_off": { "low": 100300, "mid": 125400, "high": 175600 }, "total": { "low": 273460, "mid": 298560, "high": 348760 } },
+        "savings": { "low": 62128, "mid": 112328, "high": 137428 },
+        "break_even": { "low": 8, "mid": 18, "high": 37 },
+        "cumulative": [
+          { "year": 1, "stay": 146178, "move": 160032 },
+          { "year": 2, "stay": 212355, "move": 194664 },
+          { "year": 3, "stay": 278533, "move": 229296 },
+          { "year": 4, "stay": 344710, "move": 263928 },
+          { "year": 5, "stay": 410888, "move": 298560 }
+        ]
+      }
+    },
+    {
+      "id": "T-MSC-003",
+      "title": "Business Central with known annual licence total (replaces users x rate)",
+      "inputs": { "users": 30, "ms_licence_total_year": 50000, "partner_year": 20000, "customisations": 15, "history_years": 2, "office_seats": 0 },
+      "overrides": null,
+      "expect": {
+        "stay": { "annual": 70000, "total": 350000 },
+        "move": { "annual": 24564, "days": 55, "one_off": { "low": 48400, "mid": 60500, "high": 84700 }, "total": { "low": 171220, "mid": 183320, "high": 207520 } },
+        "savings": { "low": 142480, "mid": 166680, "high": 178780 },
+        "break_even": { "low": 13, "mid": 16, "high": 23 }
+      }
+    },
+    {
+      "id": "T-MSC-004",
+      "title": "office/SharePoint only (0 ERP users, 50 seats): no Odoo licence, hosting or ERP days",
+      "inputs": { "users": 0, "office_seats": 50 },
+      "overrides": null,
+      "expect": {
+        "stay": { "annual": 3642, "total": 18210 },
+        "move": { "annual": 3600, "days": 5.5, "one_off": { "low": 4800, "mid": 6100, "high": 8500 }, "total": { "low": 22800, "mid": 24100, "high": 26500 } },
+        "savings": { "low": -8290, "mid": -5890, "high": -4590 },
+        "break_even": { "low": null, "mid": null, "high": null }
+      }
+    },
+    {
+      "id": "T-MSC-005",
+      "title": "nothing to compare (0 users, 0 seats) -> null",
+      "inputs": { "users": 0, "office_seats": 0 },
+      "overrides": null,
+      "expect": null
+    },
+    {
+      "id": "T-MSC-006",
+      "title": "invalid inputs (negative, string, bool, null) count as 0 -> null when users and seats end at 0",
+      "inputs": { "users": -5, "office_seats": "10", "partner_year": true, "customisations": null },
+      "overrides": null,
+      "expect": null
+    },
+    {
+      "id": "T-MSC-007",
+      "title": "limits: users capped at 5000, history at 40, ints floored (2.7 customisations -> 2)",
+      "inputs": { "users": 999999, "customisations": 2.7, "history_years": 100, "office_seats": 0 },
+      "overrides": null,
+      "expect": {
+        "inputs": { "users": 5000, "ms_licence_total_year": 0, "partner_year": 0, "ms_one_off": 0, "customisations": 2, "history_years": 40, "office_seats": 0 },
+        "move": { "days": 564 }
+      }
+    },
+    {
+      "id": "T-MSC-008",
+      "title": "valid overrides apply (Odoo licence 30, Microsoft +5 % per year)",
+      "inputs": { "users": 10, "partner_year": 10000, "customisations": 0, "history_years": 0, "office_seats": 0 },
+      "overrides": { "odoo_licence_user_month": 30, "ms_increase_pct": 5 },
+      "expect": {
+        "rates_subset": { "odoo_licence_user_month": 30, "ms_increase_pct": 5, "day_rate": 1100 },
+        "stay": { "annual": 18316, "total": 101207 },
+        "move": { "annual": 8400, "days": 21, "one_off": { "low": 18500, "mid": 23100, "high": 32300 }, "total": { "low": 60500, "mid": 65100, "high": 74300 } },
+        "break_even": { "low": 22, "mid": 27, "high": 36 }
+      }
+    },
+    {
+      "id": "T-MSC-009",
+      "title": "invalid overrides ignored (below min, above max, string, bool)",
+      "inputs": { "users": 10 },
+      "overrides": { "day_rate": -1, "ms_erp_licence_user_month": 5000, "odoo_hosting_month": "100", "base_days": true },
+      "expect": {
+        "rates_subset": { "day_rate": 1100, "ms_erp_licence_user_month": 69.3, "odoo_hosting_month": 250, "base_days": 20 }
+      }
+    },
+    {
+      "id": "T-MSC-010",
+      "title": "pending Microsoft project larger than the migration: break-even in month 1",
+      "inputs": { "users": 20, "partner_year": 20000, "ms_one_off": 200000, "customisations": 5, "history_years": 2, "office_seats": 0 },
+      "overrides": null,
+      "expect": {
+        "move": { "one_off": { "low": 29900, "mid": 37400, "high": 52400 } },
+        "break_even": { "low": 1, "mid": 1, "high": 1 }
+      }
+    },
+    {
+      "id": "T-MSC-011",
+      "title": "rounding of the one-off is half up like Math.round (mid 50 -> 100, low 40 -> 0, high 70 -> 100)",
+      "inputs": { "users": 1, "customisations": 0, "history_years": 0, "office_seats": 0 },
+      "overrides": { "base_days": 0, "day_rate": 50 },
+      "expect": {
+        "move": { "days": 1, "one_off": { "low": 0, "mid": 100, "high": 100 } }
+      }
+    },
+    {
+      "id": "T-MSC-012",
+      "title": "users 1 counts as one started block of 10 users",
+      "inputs": { "users": 1, "customisations": 0, "history_years": 0, "office_seats": 0 },
+      "overrides": null,
+      "expect": {
+        "move": { "days": 21, "annual": 3719 }
+      }
+    }
+  ],
+  "format": [
+    { "id": "T-MSC-040", "n": 1200000, "de": "1.200.000 €", "en": "€1,200,000" },
+    { "id": "T-MSC-041", "n": -51500, "de": "-51.500 €", "en": "-€51,500" },
+    { "id": "T-MSC-042", "n": 0.5, "de": "1 €", "en": "€1" }
+  ],
+  "break_even_label": [
+    { "id": "T-MSC-045", "month": 18, "years": 5, "de": "Monat 18 (Jahr 2)", "en": "month 18 (year 2)" },
+    { "id": "T-MSC-046", "month": 12, "years": 5, "de": "Monat 12 (Jahr 1)", "en": "month 12 (year 1)" },
+    { "id": "T-MSC-047", "month": null, "years": 5, "de": "nicht innerhalb von 5 Jahren", "en": "not within 5 years" }
+  ],
+  "from_stay": [
+    { "id": "T-MSC-070", "title": "every Selbst-Check stay field mapped (= T-MSC-002 inputs)",
+      "stay": { "users": 40, "support": 30000, "offer": 80000, "customisations": 40, "history_years": 5, "office_seats": 40 },
+      "expect": { "users": 40, "ms_licence_total_year": 0, "partner_year": 30000, "ms_one_off": 80000, "customisations": 40, "history_years": 5, "office_seats": 40 } },
+    { "id": "T-MSC-071", "title": "nothing given: zero, customisations + history = cautious defaults",
+      "stay": {},
+      "expect": { "users": 0, "ms_licence_total_year": 0, "partner_year": 0, "ms_one_off": 0, "customisations": 10, "history_years": 3, "office_seats": 0 } },
+    { "id": "T-MSC-072", "title": "licence total given, 0 customisations stays 0 (not the default)",
+      "stay": { "users": 12, "licence": 15000, "customisations": 0 },
+      "expect": { "users": 12, "ms_licence_total_year": 15000, "partner_year": 0, "ms_one_off": 0, "customisations": 0, "history_years": 3, "office_seats": 0 } }
+  ],
+  "applies": [
+    { "id": "T-MSC-075", "answers": { "system": ["ms"] }, "stay": { "users": 10 }, "expect": true },
+    { "id": "T-MSC-076", "answers": { "system": ["ms", "excel"] }, "stay": { "office_seats": 5 }, "expect": true },
+    { "id": "T-MSC-077", "answers": { "system": ["ecc"] }, "stay": { "users": 10 }, "expect": false },
+    { "id": "T-MSC-078", "answers": { "system": ["ms"] }, "stay": null, "expect": false },
+    { "id": "T-MSC-079", "answers": {}, "stay": { "users": 10 }, "expect": false }
+  ],
+  "gate": [
+    { "id": "T-MSC-080", "title": "rules file as shipped: placeholders open, switch off -> no figures", "patch": {}, "expect": false },
+    { "id": "T-MSC-081", "title": "switch on, but rates still owner_to_confirm -> no figures", "patch": { "customer_mail_figures": true }, "expect": false },
+    { "id": "T-MSC-082", "title": "all rates confirmed, switch still off -> no figures", "patch": { "confirm_all": true }, "expect": false },
+    { "id": "T-MSC-083", "title": "all rates confirmed and switch on -> figures", "patch": { "customer_mail_figures": true, "confirm_all": true }, "expect": true }
+  ],
+  "mail": [
+    { "id": "T-MSC-090", "title": "gate closed (as shipped): customer gets the neutral sentence, operator the flagged figures",
+      "patch": {}, "lang": "de",
+      "stay": { "users": 40, "support": 30000, "offer": 80000, "customisations": 40, "history_years": 5, "office_seats": 40 },
+      "title_expect": "Microsoft oder Odoo: Kosten über 5 Jahre",
+      "lines": ["Den Vergleich über 5 Jahre (bleiben oder wechseln) rechne ich mit Ihren Angaben und sende ihn Ihnen persönlich."],
+      "operator": "Microsoft -> Odoo 5y UNCONFIRMED RATES (13 owner_to_confirm): stay €410,888; move €273,460-€348,760 (mid €298,560); migration €100,300-€175,600 (114 days); break-even month 8 (year 1) / month 18 (year 2) / month 37 (year 4); customer mail: neutral sentence (gate closed)" },
+    { "id": "T-MSC-091", "title": "gate closed, English", "patch": { "customer_mail_figures": true }, "lang": "en",
+      "stay": { "users": 40, "support": 30000, "offer": 80000, "customisations": 40, "history_years": 5, "office_seats": 40 },
+      "title_expect": "Microsoft or Odoo: cost over 5 years",
+      "lines": ["I will work out the 5-year comparison (stay or move) from your figures and send it to you personally."],
+      "operator": "Microsoft -> Odoo 5y UNCONFIRMED RATES (13 owner_to_confirm): stay €410,888; move €273,460-€348,760 (mid €298,560); migration €100,300-€175,600 (114 days); break-even month 8 (year 1) / month 18 (year 2) / month 37 (year 4); customer mail: neutral sentence (gate closed)" },
+    { "id": "T-MSC-092", "title": "gate open: figures of T-MSC-002 in German", "patch": { "customer_mail_figures": true, "confirm_all": true }, "lang": "de",
+      "stay": { "users": 40, "support": 30000, "offer": 80000, "customisations": 40, "history_years": 5, "office_seats": 40 },
+      "title_expect": "Microsoft oder Odoo: Kosten über 5 Jahre",
+      "lines": [
+        "Bleiben: 410.888 € in 5 Jahren (66.178 € pro Jahr).",
+        "Wechsel zu Odoo: 273.460 € bis 348.760 € in 5 Jahren (34.632 € pro Jahr laufend).",
+        "Davon einmalig für den Wechsel: 100.300 € bis 175.600 € (etwa 114 Projekttage).",
+        "Der Wechsel rechnet sich ab Monat 18 (Jahr 2) (Spanne: Monat 8 (Jahr 1) bis Monat 37 (Jahr 4)).",
+        "Richtwerte netto in Euro, kein Angebot. Nicht enthalten: interne Arbeitszeit, Hardware, Parallelbetrieb."
+      ],
+      "operator": "Microsoft -> Odoo 5y: stay €410,888; move €273,460-€348,760 (mid €298,560); migration €100,300-€175,600 (114 days); break-even month 8 (year 1) / month 18 (year 2) / month 37 (year 4); customer mail: figures" },
+    { "id": "T-MSC-093", "title": "gate open, English, no break-even (= T-MSC-001 defaults)", "patch": { "customer_mail_figures": true, "confirm_all": true }, "lang": "en",
+      "stay": { "users": 25 },
+      "title_expect": "Microsoft or Odoo: cost over 5 years",
+      "lines": [
+        "Staying: €103,950 over 5 years (€20,790 per year).",
+        "Moving to Odoo: €145,350 to €175,650 over 5 years (€20,970 per year running).",
+        "Of this, one-off for the move: €40,500 to €70,800 (about 46 project days).",
+        "With these figures the move does not pay off within 5 years.",
+        "Guide values, net in euros, not a quote. Not included: internal staff time, hardware, parallel run."
+      ],
+      "operator": "Microsoft -> Odoo 5y: stay €103,950; move €145,350-€175,650 (mid €155,450); migration €40,500-€70,800 (46 days); break-even not within 5 years / not within 5 years / not within 5 years; customer mail: figures" }
+  ]
+}
