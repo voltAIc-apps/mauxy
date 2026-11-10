@@ -29,6 +29,14 @@ Nothing is written to any sink (Odoo / Mautic) before the confirmation. Retentio
 deleted after SELFCHECK_PENDING_DAYS (7), confirmed ones after SELFCHECK_RETENTION_DAYS (90).
 Rules + engine are vendored from flywheel (vendor/selfcheck, scripts/sync_selfcheck.py there).
 
+Microsoft -> Odoo comparison (flywheel SPEC-022, owner decision 2026-11-10 / D-065): the website shows no
+prices; a Selbst-Check with system "ms" sends extra optional stay fields (customisations, history_years,
+office_seats; limits from the vendored mscalc.json). After the click the vendored engine
+(vendor/selfcheck/mscalc.py) computes the 5-year comparison: result mail block (contact's language,
+plain text + HTML) and one English line in the operator mail + crm.lead. Customer figures only when
+mscalc.mail_figures_allowed (owner switch on AND no rate owner_to_confirm); otherwise the neutral
+sentence "the comparison follows personally". Old website payloads stay valid (all new fields optional).
+
 Per site (db-patches/0006): site from the Origin (brand.site_for_origin), stored with the submission;
 brand = mail sender, the vendored signature swapped for the site's mail footer (simplify-erp seed =
 the same signature), website base of links / redirects, confirmation page. Routing (routing.py,
@@ -60,12 +68,16 @@ import jobs
 import lead_sync
 import mail_html
 import mailer
+from vendor.selfcheck import mscalc
 from vendor.selfcheck import selfcheck as engine
 
 logger = logging.getLogger("mauxy.selfcheck")
 
 EVENT_PATH = "/api/selfcheck/event"
 RULES = engine.load_rules(os.environ.get("SELFCHECK_RULES_FILE") or None)
+MSCALC = mscalc.load_rules(os.environ.get("MSCALC_RULES_FILE") or None)  # Microsoft -> Odoo comparison (SPEC-022)
+_MS_LIMIT = {m["input"]: MSCALC["limits"][d["limit"]] for m in MSCALC["selfcheck"]["fields"].values()
+             for d in MSCALC["inputs"] if d["id"] == m["input"]}
 
 _raw = os.environ.get("SELFCHECK_ALLOWED_ORIGINS", "")
 SELFCHECK_ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _raw.split(",") if o.strip()]
@@ -283,6 +295,11 @@ class StayInputs(BaseModel):
     support: Optional[float] = Field(default=None, ge=0, le=RULES["stay_cost"]["max_amount"])
     offer: Optional[float] = Field(default=None, ge=0, le=RULES["stay_cost"]["max_amount"])
     users: Optional[float] = Field(default=None, ge=0, le=RULES["stay_cost"]["max_users"])
+    # Microsoft -> Odoo comparison (SPEC-022): optional whole counts, limits = vendored mscalc.json
+    # (rollout: an old website never sends them; strict ints, so 2.5 or "3" is a 422, never coerced)
+    customisations: Optional[int] = Field(default=None, ge=0, le=_MS_LIMIT["customisations"], strict=True)
+    history_years: Optional[int] = Field(default=None, ge=0, le=_MS_LIMIT["history_years"], strict=True)
+    office_seats: Optional[int] = Field(default=None, ge=0, le=_MS_LIMIT["office_seats"], strict=True)
 
 
 class SelfCheckRequest(BaseModel):
@@ -401,6 +418,28 @@ def _split_signature(text: str, site: Optional[str], lang: str) -> tuple[str, li
     return core, footer.split("\n")
 
 
+def ms_comparison(row) -> Optional[dict]:
+    """Microsoft -> Odoo 5-year comparison of a submission (vendored mscalc), or None: not system 'ms',
+    no stay figures, nothing to compare."""
+    answers = json.loads(row["answers"])
+    stay = json.loads(row["stay"]) if row["stay"] else None
+    return mscalc.compare_selfcheck(MSCALC, answers, stay)
+
+
+def _with_ms_block(result: str, lang: str, title: str, lines: list[str]) -> str:
+    """Plain text: the comparison block goes right before 'Ihre Antworten' (after the stay costs),
+    as in the HTML part; no answers label found -> appended."""
+    block = "\n".join([title, *lines])
+    label = RULES["mail"]["result"]["labels"]["answers"][lang] + "\n"
+    marker = "\n\n" + label
+    if result.startswith(label):  # partial answers, no stay costs: the answers come first
+        return f"{block}\n\n{result}"
+    if marker in result:
+        head, _, tail = result.partition(marker)
+        return f"{head}\n\n{block}{marker}{tail}"
+    return f"{result}\n\n{block}"
+
+
 def result_mail(row: aiosqlite.Row) -> tuple[str, str, Optional[str], list]:
     """(subject, plain text, branded HTML or None, inline images). Plain text = the mail of before the
     HTML part, unchanged; the HTML twin renders the same engine values (mail_html.selfcheck_result).
@@ -416,6 +455,11 @@ def result_mail(row: aiosqlite.Row) -> tuple[str, str, Optional[str], list]:
         answered=prog["answered"], total=prog["total"], url=url)
     head = greet(head, row["name"], lang, row["salutation"])
     result = engine.result_text(RULES, answers, lang, stay)
+    # Microsoft -> Odoo: figures only through the gate (mscalc.mail_block), else the neutral sentence
+    ms = mscalc.compare_selfcheck(MSCALC, answers, stay)
+    ms_title, ms_lines = mscalc.mail_block(MSCALC, ms, lang) if ms else ("", [])
+    if ms:
+        result = _with_ms_block(result, lang, ms_title, ms_lines)
     outro = m["outro"][lang].format(url=url)
     body = "\n\n".join([head, result, outro])
     subject = m["subject"][lang]
@@ -442,7 +486,8 @@ def result_mail(row: aiosqlite.Row) -> tuple[str, str, Optional[str], list]:
         "answered": prog["answered"], "total": prog["total"],
         "precision_word": RULES["precision"]["words"][prog["precision"]["level"]][lang],
         "ev": engine.evaluate(RULES, answers, lang) if prog["complete"] else None, "labels": labels,
-        "stay_lines": stay_lines, "answers": engine.answer_lines(RULES, answers, lang),
+        "stay_lines": stay_lines, "ms_title": ms_title, "ms_lines": ms_lines,
+        "answers": engine.answer_lines(RULES, answers, lang),
         "outro": [x for x in outro_core.split("\n\n") if x], "footer_lines": footer_lines,
     }
     html_part, images = mail_html.selfcheck_result(b, lang, parts)
@@ -483,6 +528,9 @@ def _summary(row, radar_result: str, mail_sent: Optional[bool]) -> tuple[str, li
     if mail_sent is not None:
         state = "sent" if mail_sent else (NOT_CHOSEN if "mail" not in picks else "FAILED, please send it by hand")
         lines.append(f"Result mail to the person ({row['lang']}): {state}")
+    ms = ms_comparison(row)
+    if ms:  # figures always for the owner, flagged "UNCONFIRMED RATES" while placeholders are open
+        lines.append(mscalc.operator_line(MSCALC, ms))
     return short, lines
 
 

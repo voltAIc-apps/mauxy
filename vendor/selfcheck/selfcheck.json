@@ -1,6 +1,6 @@
 {
   "_comment": "Selbst-Check (flywheel SPEC-020): SINGLE SOURCE of questions, options, groups and evaluation rules. Read by the page (src/utils/selfcheck.ts), by backend/libs/selfcheck.py (flywheel) and, vendored via scripts/sync_selfcheck.py, by mauxy (/api/selfcheck). Change rules here only; parity cases in tests/cases/selfcheck_cases.json. Conditions: {q, eq|in|has|count_gte|only} or {any:[...]}/{all:[...]}; an unanswered question never matches. Article links are knowledge-page slugs (src/data/knowledge/), never prices.",
-  "version": "2026-11-08.1",
+  "version": "2026-11-10.1",
   "website": "https://simplify-erp.de",
   "route": "/selbst-check",
   "minutes_per_question": 0.3,
@@ -34,7 +34,8 @@
       "options": [
         { "id": "ecc", "label": { "de": "SAP ECC / R/3", "en": "SAP ECC / R/3" } },
         { "id": "b1", "label": { "de": "SAP Business One", "en": "SAP Business One" } },
-        { "id": "other", "label": { "de": "Anderes ERP (Navision, Sage, proALPHA, abas, Eigenbau)", "en": "Another ERP (Navision, Sage, proALPHA, abas, in-house)" } },
+        { "id": "ms", "label": { "de": "Microsoft Dynamics (NAV, Business Central, GP, SL, AX)", "en": "Microsoft Dynamics (NAV, Business Central, GP, SL, AX)" } },
+        { "id": "other", "label": { "de": "Anderes ERP (Sage, proALPHA, abas, Eigenbau)", "en": "Another ERP (Sage, proALPHA, abas, in-house)" } },
         { "id": "excel", "label": { "de": "Excel-Listen und DATEV", "en": "Excel lists and DATEV" } }
       ]
     },
@@ -305,6 +306,7 @@
     "system_names": {
       "ecc": { "de": "SAP ECC / R/3", "en": "SAP ECC / R/3" },
       "b1": { "de": "SAP Business One", "en": "SAP Business One" },
+      "ms": { "de": "Microsoft Dynamics", "en": "Microsoft Dynamics" },
       "other": { "de": "Anderes ERP", "en": "Another ERP" },
       "excel": { "de": "Excel und DATEV", "en": "Excel and DATEV" }
     },
@@ -318,7 +320,7 @@
     "areas": { "de": "{n} Bereiche", "en": "{n} areas" }
   },
   "stay_cost": {
-    "_comment": "Stage 2, reader's own inputs only (EUR). cost_5y = years * (licence + support) + offer; per_user_year = (licence + support) / users. No numbers of ours.",
+    "_comment": "Stage 2, reader's own inputs only (EUR). cost_5y = years * (licence + support) + offer; per_user_year = (licence + support) / users. No numbers of ours. System 'ms' (Microsoft Dynamics, SPEC-022): the stage also asks the extra fields of mscalc.json selfcheck.fields (labels + limits there) and the page shows no figure; mauxy mails the 5-year comparison after the double opt-in (gated, D-065).",
     "years": 5,
     "max_amount": 100000000,
     "max_users": 100000

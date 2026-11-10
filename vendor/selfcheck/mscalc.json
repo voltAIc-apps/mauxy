@@ -1,0 +1,364 @@
+{
+  "_comment": "Microsoft -> Odoo 5-year comparison (flywheel SPEC-022). Single source of rules for src/utils/mscalc.ts and the Python twin backend/libs/mscalc.py (parity cases tests/cases/mscalc_cases.json, T-MSC-0xx), vendored into mauxy by scripts/sync_selfcheck.py. Owner decision 2026-11-10 (D-065): the page shows NO computed prices; the visitor enters the figures in the embedded Selbst-Check (stay stage, field map 'selfcheck' below), mauxy computes the comparison after the double opt-in and mails it. Every rate is a named assumption with a source and a status: verified = list price read on the official page (url + accessed), owner_to_confirm = Simplify-ERP placeholder (keeps /microsoft-to-odoo held, T-MSC-060, and keeps every figure out of the customer mail, T-MSC-080..), neutral = calculation default. Customer mail figures only when customer_mail_figures is true AND no rate is owner_to_confirm. EUR, net (zzgl. MwSt.).",
+  "version": "2026-11-10.2",
+  "route": "/microsoft-to-odoo",
+  "currency": "EUR",
+  "years": 5,
+  "round_one_off_to": 100,
+  "customer_mail_figures": false,
+  "selfcheck": {
+    "_comment": "Embedded Selbst-Check (selfcheck.json): the comparison applies when the answer 'system' has system_option. fields: stay field of the Selbst-Check -> calculator input; missing 'zero' = 0, 'default' = the input's default (cautious estimate when the visitor leaves it empty). Labels of the fields = the inputs' labels below.",
+    "system_option": "ms",
+    "fields": {
+      "users": { "input": "users", "missing": "zero" },
+      "licence": { "input": "ms_licence_total_year", "missing": "zero" },
+      "support": { "input": "partner_year", "missing": "zero" },
+      "offer": { "input": "ms_one_off", "missing": "zero" },
+      "customisations": { "input": "customisations", "missing": "default" },
+      "history_years": { "input": "history_years", "missing": "default" },
+      "office_seats": { "input": "office_seats", "missing": "zero" }
+    }
+  },
+  "mail": {
+    "_comment": "Result mail block (mauxy, contact's language) and operator / CRM line (English). {placeholders} are filled server-side from the engine result only. pending = the neutral sentence while the gate is closed.",
+    "title": { "de": "Microsoft oder Odoo: Kosten über {years} Jahre", "en": "Microsoft or Odoo: cost over {years} years" },
+    "pending": { "de": "Den Vergleich über {years} Jahre (bleiben oder wechseln) rechne ich mit Ihren Angaben und sende ihn Ihnen persönlich.", "en": "I will work out the {years}-year comparison (stay or move) from your figures and send it to you personally." },
+    "lines": {
+      "stay": { "de": "Bleiben: {stay_total} in {years} Jahren ({stay_annual} pro Jahr).", "en": "Staying: {stay_total} over {years} years ({stay_annual} per year)." },
+      "move": { "de": "Wechsel zu Odoo: {move_low} bis {move_high} in {years} Jahren ({move_annual} pro Jahr laufend).", "en": "Moving to Odoo: {move_low} to {move_high} over {years} years ({move_annual} per year running)." },
+      "one_off": { "de": "Davon einmalig für den Wechsel: {one_off_low} bis {one_off_high} (etwa {days} Projekttage).", "en": "Of this, one-off for the move: {one_off_low} to {one_off_high} (about {days} project days)." },
+      "break_even": { "de": "Der Wechsel rechnet sich ab {break_even_mid} (Spanne: {break_even_low} bis {break_even_high}).", "en": "The move pays off from {break_even_mid} (range: {break_even_low} to {break_even_high})." },
+      "break_even_none": { "de": "Mit diesen Angaben rechnet sich der Wechsel nicht innerhalb von {years} Jahren.", "en": "With these figures the move does not pay off within {years} years." },
+      "note": { "de": "Richtwerte netto in Euro, kein Angebot. Nicht enthalten: interne Arbeitszeit, Hardware, Parallelbetrieb.", "en": "Guide values, net in euros, not a quote. Not included: internal staff time, hardware, parallel run." }
+    },
+    "operator": "Microsoft -> Odoo {years}y{flag}: stay {stay_total}; move {move_low}-{move_high} (mid {move_mid}); migration {one_off_low}-{one_off_high} ({days} days); break-even {break_even_low} / {break_even_mid} / {break_even_high}; customer mail: {customer}",
+    "unconfirmed_flag": " UNCONFIRMED RATES ({n} owner_to_confirm)"
+  },
+  "limits": {
+    "users": 5000,
+    "amount": 10000000,
+    "customisations": 500,
+    "history_years": 40,
+    "office_seats": 10000
+  },
+  "inputs": [
+    {
+      "id": "users",
+      "kind": "int",
+      "default": 25,
+      "limit": "users",
+      "label": { "de": "ERP-Nutzer", "en": "ERP users" },
+      "help": { "de": "Benannte Nutzer, die heute im Microsoft-ERP arbeiten. 0 = nur Office/SharePoint rechnen.", "en": "Named users working in the Microsoft ERP today. 0 = office/SharePoint only." }
+    },
+    {
+      "id": "ms_licence_total_year",
+      "kind": "amount",
+      "default": 0,
+      "limit": "amount",
+      "label": { "de": "Microsoft-ERP-Lizenzen gesamt pro Jahr (optional)", "en": "Microsoft ERP licences in total per year (optional)" },
+      "help": { "de": "Wenn Sie den Jahresbetrag kennen (Lizenzen bzw. Wartung/Enhancement Plan), tragen Sie ihn hier ein. Sonst rechnen wir mit Nutzer x Microsoft-Listenpreis je Nutzer und Monat.", "en": "If you know the annual amount (licences or maintenance/enhancement plan), enter it here. Otherwise we use users x Microsoft list price per user and month." }
+    },
+    {
+      "id": "partner_year",
+      "kind": "amount",
+      "default": 0,
+      "limit": "amount",
+      "label": { "de": "Partner, Support und Wartung pro Jahr", "en": "Partner, support and maintenance per year" },
+      "help": { "de": "Was Sie Ihrem Microsoft-Partner jährlich zahlen: Support, Updates, Anpassungspflege, Hosting.", "en": "What you pay your Microsoft partner per year: support, updates, upkeep of customisations, hosting." }
+    },
+    {
+      "id": "ms_one_off",
+      "kind": "amount",
+      "default": 0,
+      "limit": "amount",
+      "label": { "de": "Anstehendes Projekt im Microsoft-Umfeld (einmalig, optional)", "en": "Upcoming project on the Microsoft side (one-off, optional)" },
+      "help": { "de": "Zum Beispiel ein Upgrade von NAV auf Business Central, wenn das Angebot schon vorliegt.", "en": "For example an upgrade from NAV to Business Central, if you already have the quote." }
+    },
+    {
+      "id": "customisations",
+      "kind": "int",
+      "default": 10,
+      "limit": "customisations",
+      "label": { "de": "Anpassungen und Add-ons", "en": "Customisations and add-ons" },
+      "help": { "de": "Eigene Objekte, Erweiterungen, Branchen-Add-ons, Berichte und Schnittstellen, grob gezählt.", "en": "Own objects, extensions, industry add-ons, reports and interfaces, roughly counted." }
+    },
+    {
+      "id": "history_years",
+      "kind": "int",
+      "default": 3,
+      "limit": "history_years",
+      "label": { "de": "Jahre Historie für die Übernahme", "en": "Years of history to take over" },
+      "help": { "de": "Wie viele Jahre Bewegungsdaten ins neue System sollen. Ältere Jahre bleiben im Archiv (§ 147 AO).", "en": "How many years of transaction data should move. Older years stay in the archive (§ 147 AO)." }
+    },
+    {
+      "id": "office_seats",
+      "kind": "int",
+      "default": 0,
+      "limit": "office_seats",
+      "label": { "de": "Office- und SharePoint-Arbeitsplätze, die wechseln", "en": "Office and SharePoint seats that move" },
+      "help": { "de": "Arbeitsplätze, die von Microsoft 365 (Office, SharePoint) auf OnlyOffice mit Nextcloud wechseln. 0 = nicht rechnen.", "en": "Seats moving from Microsoft 365 (Office, SharePoint) to OnlyOffice with Nextcloud. 0 = leave out." }
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "ms_erp_licence_user_month",
+      "side": "stay",
+      "unit": "eur_user_month",
+      "value": 69.3,
+      "min": 0,
+      "max": 1000,
+      "status": "verified",
+      "label": { "de": "Microsoft-ERP-Lizenz je Nutzer und Monat", "en": "Microsoft ERP licence per user and month" },
+      "source": {
+        "text": { "de": "Listenpreis Business Central Essentials laut Microsoft: 69,30 € Benutzer/Monat, jährliche Abrechnung, zzgl. MwSt. Premium: 95,30 €.", "en": "List price of Business Central Essentials according to Microsoft: EUR 69.30 per user/month, billed annually, net. Premium: EUR 95.30." },
+        "url": "https://www.microsoft.com/de-de/dynamics-365/products/business-central/pricing",
+        "accessed": "2026-11-10"
+      }
+    },
+    {
+      "id": "ms_office_seat_month",
+      "side": "stay",
+      "unit": "eur_seat_month",
+      "value": 6.07,
+      "min": 0,
+      "max": 200,
+      "status": "verified",
+      "label": { "de": "Microsoft 365 je Arbeitsplatz und Monat", "en": "Microsoft 365 per seat and month" },
+      "source": {
+        "text": { "de": "Kleinster Plan mit SharePoint und Exchange laut Microsoft: Microsoft 365 Business Basic 6,07 € Benutzer/Monat, jährliche Abrechnung, zzgl. MwSt. Tragen Sie den Preis Ihres Plans ein.", "en": "Smallest plan with SharePoint and Exchange according to Microsoft: Microsoft 365 Business Basic EUR 6.07 per user/month, billed annually, net. Enter the price of your plan." },
+        "url": "https://www.microsoft.com/de-de/microsoft-365/business/microsoft-365-plans-and-pricing",
+        "accessed": "2026-11-10"
+      }
+    },
+    {
+      "id": "ms_increase_pct",
+      "side": "stay",
+      "unit": "pct_year",
+      "value": 0,
+      "min": 0,
+      "max": 30,
+      "status": "neutral",
+      "label": { "de": "Preissteigerung Microsoft pro Jahr", "en": "Microsoft price increase per year" },
+      "source": {
+        "text": { "de": "Rechenannahme: 0 % (keine Steigerung). Setzen Sie Ihren Erfahrungswert ein.", "en": "Calculation default: 0 % (no increase). Enter your own experience." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "odoo_licence_user_month",
+      "side": "move",
+      "unit": "eur_user_month",
+      "value": 44.9,
+      "min": 0,
+      "max": 500,
+      "status": "owner_to_confirm",
+      "label": { "de": "Odoo-Enterprise-Lizenz je Nutzer und Monat", "en": "Odoo Enterprise licence per user and month" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP (Odoo-Partner), Plan Custom; odoo.com nennt 35,90 € und 44,90 € je Nutzer und Monat.", "en": "Simplify-ERP guide value (Odoo partner), Custom plan; odoo.com lists EUR 35.90 and EUR 44.90 per user and month." },
+        "url": "https://www.odoo.com/de_DE/pricing",
+        "accessed": "2026-11-10"
+      }
+    },
+    {
+      "id": "odoo_hosting_month",
+      "side": "move",
+      "unit": "eur_month",
+      "value": 250,
+      "min": 0,
+      "max": 20000,
+      "status": "owner_to_confirm",
+      "label": { "de": "Betrieb Odoo (Hosting, Backups) pro Monat", "en": "Running Odoo (hosting, backups) per month" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "odoo_support_user_month",
+      "side": "move",
+      "unit": "eur_user_month",
+      "value": 15,
+      "min": 0,
+      "max": 500,
+      "status": "owner_to_confirm",
+      "label": { "de": "Betreuung und Updates je Nutzer und Monat", "en": "Support and updates per user and month" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "onlyoffice_seat_month",
+      "side": "move",
+      "unit": "eur_seat_month",
+      "value": 6,
+      "min": 0,
+      "max": 200,
+      "status": "owner_to_confirm",
+      "label": { "de": "OnlyOffice mit Nextcloud je Arbeitsplatz und Monat", "en": "OnlyOffice with Nextcloud per seat and month" },
+      "source": {
+        "text": { "de": "Richtwert für Betrieb in der Private Cloud (Re:Cloud), inklusive Speicher.", "en": "Guide value for running it in the private cloud (Re:Cloud), storage included." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "odoo_increase_pct",
+      "side": "move",
+      "unit": "pct_year",
+      "value": 0,
+      "min": 0,
+      "max": 30,
+      "status": "neutral",
+      "label": { "de": "Preissteigerung Odoo und Betrieb pro Jahr", "en": "Odoo and running cost increase per year" },
+      "source": {
+        "text": { "de": "Rechenannahme: 0 % (keine Steigerung).", "en": "Calculation default: 0 % (no increase)." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "day_rate",
+      "side": "migration",
+      "unit": "eur_day",
+      "value": 1100,
+      "min": 0,
+      "max": 5000,
+      "status": "owner_to_confirm",
+      "label": { "de": "Tagessatz Projekt", "en": "Project day rate" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "base_days",
+      "side": "migration",
+      "unit": "days",
+      "value": 20,
+      "min": 0,
+      "max": 1000,
+      "status": "owner_to_confirm",
+      "label": { "de": "Grundaufwand ERP-Wechsel (Bestandsaufnahme, Einrichtung, Buchhaltung, Go-live)", "en": "Base effort ERP move (inventory, setup, accounting, go-live)" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP, in Tagen.", "en": "Simplify-ERP guide value, in days." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "days_per_customisation",
+      "side": "migration",
+      "unit": "days",
+      "value": 2,
+      "min": 0,
+      "max": 50,
+      "status": "owner_to_confirm",
+      "label": { "de": "Tage je Anpassung (prüfen, Standard oder Neubau)", "en": "Days per customisation (check, standard or rebuild)" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP, Mittel aus Ersatz durch Standard und Neubau.", "en": "Simplify-ERP guide value, average of replacing by standard and rebuilding." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "days_per_history_year",
+      "side": "migration",
+      "unit": "days",
+      "value": 1,
+      "min": 0,
+      "max": 50,
+      "status": "owner_to_confirm",
+      "label": { "de": "Tage je Jahr Historie (Datenübernahme mit Prüfung)", "en": "Days per year of history (data transfer with checks)" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "days_per_10_users",
+      "side": "migration",
+      "unit": "days",
+      "value": 1,
+      "min": 0,
+      "max": 50,
+      "status": "owner_to_confirm",
+      "label": { "de": "Tage je angefangene 10 Nutzer (Schulung, Rechte)", "en": "Days per started 10 users (training, access rights)" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "office_base_days",
+      "side": "migration",
+      "unit": "days",
+      "value": 3,
+      "min": 0,
+      "max": 500,
+      "status": "owner_to_confirm",
+      "label": { "de": "Grundaufwand Office/SharePoint-Umzug", "en": "Base effort office/SharePoint move" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP, in Tagen.", "en": "Simplify-ERP guide value, in days." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "office_days_per_seat",
+      "side": "migration",
+      "unit": "days",
+      "value": 0.05,
+      "min": 0,
+      "max": 5,
+      "status": "owner_to_confirm",
+      "label": { "de": "Tage je Arbeitsplatz (Dateien, Rechte, Einweisung)", "en": "Days per seat (files, permissions, introduction)" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "range_low_pct",
+      "side": "migration",
+      "unit": "pct",
+      "value": 80,
+      "min": 10,
+      "max": 100,
+      "status": "owner_to_confirm",
+      "label": { "de": "Spanne untere Grenze (% des Mittelwerts)", "en": "Range lower bound (% of the mid value)" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    },
+    {
+      "id": "range_high_pct",
+      "side": "migration",
+      "unit": "pct",
+      "value": 140,
+      "min": 100,
+      "max": 400,
+      "status": "owner_to_confirm",
+      "label": { "de": "Spanne obere Grenze (% des Mittelwerts)", "en": "Range upper bound (% of the mid value)" },
+      "source": {
+        "text": { "de": "Richtwert Simplify-ERP.", "en": "Simplify-ERP guide value." },
+        "url": null,
+        "accessed": null
+      }
+    }
+  ],
+  "statuses": {
+    "verified": { "de": "Listenpreis, Quelle geprüft", "en": "List price, source checked" },
+    "owner_to_confirm": { "de": "Richtwert, vorläufig", "en": "Guide value, provisional" },
+    "neutral": { "de": "Rechenannahme", "en": "Calculation default" }
+  }
+}

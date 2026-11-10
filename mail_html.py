@@ -410,6 +410,7 @@ def selfcheck_result(brand, lang: str, p: dict) -> tuple[Optional[str], list[mai
     `p` (built by selfcheck_api.result_parts from the rules engine; the plain text uses the same values):
       subject, greeting, intro (paragraphs after the greeting), url, base, complete, answered, total,
       precision_word, ev (engine.evaluate or None), labels (rules mail labels for lang), stay_lines,
+      ms_title + ms_lines (Microsoft -> Odoo comparison, SPEC-022; gated in mscalc.mail_block, optional),
       answers (engine.answer_lines), outro, footer_lines
     """
     if brand is None:
@@ -526,6 +527,11 @@ def selfcheck_result(brand, lang: str, p: dict) -> tuple[Optional[str], list[mai
         out.append(h2(ids, "stay-title", lab["stay"]))
         for i, line in enumerate(p["stay_lines"]):
             out.append(text_html(ids, f"stay{i}", line, {}, pal))
+
+    if p.get("ms_lines"):  # same lines as the plain text (figures or the neutral sentence)
+        out.append(h2(ids, "ms-title", p["ms_title"]))
+        for i, line in enumerate(p["ms_lines"]):
+            out.append(text_html(ids, f"ms{i}", line, {}, pal))
 
     out.append(f'<div id="{ids("cta")}" style="margin:28px 0 0">{button(ids, "button", t["button"], url, pal)}</div>')
 

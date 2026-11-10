@@ -519,7 +519,24 @@ The DOI mail gets the same frame (paragraphs + "Bestätigen" button + the link a
 because attachments to an unconfirmed address are refused (mailer policy) -> wordmark header.
 Preview: `tests/venv/bin/python` + `selfcheck_api.result_mail(row)` / `doi_mail(...)`.
 
-Rules: `vendor/selfcheck/` is a copy of flywheel `backend/libs/selfcheck.py` + `website/src/data/selfcheck.json`,
+Microsoft -> Odoo comparison (flywheel SPEC-022, owner decision 2026-11-10 / D-065: "price comparison will be
+emailed after a self-check"; tests T-MSC-080..093 shared with flywheel, T-MSC-100..112 here):
+
+- Request: `stay` may also carry `customisations`, `history_years`, `office_seats` (whole numbers, optional,
+  limits from the vendored `mscalc.json`: 500 / 40 / 10000; 2.5 or "3" -> 422). Old payloads stay valid.
+  The website sends them only for answer `system: ["ms"]`; amounts never sit in browser storage.
+- After the click, for `system` with `ms` and stay figures: `vendor/selfcheck/mscalc.py` computes 5 years stay vs
+  move (migration range, break-even month). Result mail (pick `mail`): block "Microsoft oder Odoo: Kosten über 5
+  Jahre" before "Ihre Antworten", plain text + HTML, contact's language. Operator mail + crm.lead description: one
+  English line `Microsoft -> Odoo 5y ...`.
+- Gate (`mscalc.mail_figures_allowed`): customer figures only when `customer_mail_figures` is true in
+  `mscalc.json` AND no rate is `owner_to_confirm`. Otherwise the customer gets the neutral sentence "Den Vergleich
+  ... sende ich Ihnen persönlich"; the operator line still has the figures, marked `UNCONFIRMED RATES (n owner_to_confirm)`.
+  Release = owner confirms the rates + flips the switch in flywheel, then sync + redeploy mauxy.
+- Rollout: deploy mauxy first (it accepts the new fields and the new `system` option `ms`), then the website.
+
+Rules: `vendor/selfcheck/` is a copy of flywheel `backend/libs/selfcheck.py` + `website/src/data/selfcheck.json`
+(+ `mscalc.py`, `mscalc.json`, `mscalc_cases.json`),
 refreshed with `python scripts/sync_selfcheck.py --mauxy <this repo>` in flywheel. Retention: pending
 7 days, confirmed 90 days (`SELFCHECK_*_DAYS`). Local dry run: `MAIL_MODE=console` prints mails instead of sending.
 
