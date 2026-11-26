@@ -2,6 +2,7 @@
   "_comment": "Selbst-Check (flywheel SPEC-020): SINGLE SOURCE of questions, options, groups and evaluation rules. Read by the page (src/utils/selfcheck.ts), by backend/libs/selfcheck.py (flywheel) and, vendored via scripts/sync_selfcheck.py, by mauxy (/api/selfcheck). Change rules here only; parity cases in tests/cases/selfcheck_cases.json. Conditions: {q, eq|in|has|count_gte|only} or {any:[...]}/{all:[...]}; an unanswered question never matches. Article links are knowledge-page slugs (src/data/knowledge/), never prices.",
   "version": "2026-11-10.1",
   "website": "https://simplify-erp.de",
+  "knowledge_route": "/blog",
   "route": "/selbst-check",
   "minutes_per_question": 0.3,
   "precision": {
