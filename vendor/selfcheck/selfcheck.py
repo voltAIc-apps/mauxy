@@ -330,7 +330,8 @@ def result_text(rules: dict, answers: Answers, lang: str = "de", stay: dict | No
         for r in ev["risks"]:
             lines.append(f"{r['n']}. {r['title']}: {r['rule']}")
             if r["article"]:
-                lines.append(f"   {lab['read'][lang]}: {base}/wissen/{r['article']}")
+                # knowledge article in the Wissensblog (selfcheck.json knowledge_route, /blog)
+                lines.append(f"   {lab['read'][lang]}: {base}{rules.get('knowledge_route', '/blog')}/{r['article']}")
         lines += ["", lab["waves"][lang]]
         lines += [f"{lab['wave'][lang]} {w['n']}: {w['title']} ({w['items']})" for w in ev["waves"]]
     sc = stay_cost(rules, stay)

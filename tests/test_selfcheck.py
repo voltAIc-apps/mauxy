@@ -115,8 +115,8 @@ def test_t_sc_120_one_doi_then_result_radar_and_notification(respx_mock, client,
 
     result = next(m for m in outbox[1:] if m["to"] == "bob@example.com")
     assert "Der Wechsel ist machbar" in result["body"]
-    assert "https://site.test/de/wissen/" not in result["body"]  # article links use the rules website
-    assert "https://simplify-erp.de/de/wissen/ist-prozesse-aufnehmen-ohne-sie-im-neuen-system-nachzubauen" in result["body"]
+    assert "https://site.test/de/blog/" not in result["body"]  # article links use the rules website
+    assert "https://simplify-erp.de/de/blog/ist-prozesse-aufnehmen-ohne-sie-im-neuen-system-nachzubauen" in result["body"]
     assert "750.000 €" in result["body"]
     note = next(m for m in outbox if m["to"] == "owner@site.test")
     assert "Introduction call (Meetly): yes" in note["body"] and "Indicative quote: yes" in note["body"]
